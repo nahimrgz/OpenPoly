@@ -31,6 +31,7 @@ def _closed(
     qty: float = 10.0,
     entry: float = 0.50,
     position_id: int = 1,
+    close_reason: str = "take_profit",
 ) -> PositionRecord:
     return PositionRecord(
         id=position_id,
@@ -43,7 +44,7 @@ def _closed(
         status="closed",
         opened_at=100.0,
         closed_at=200.0,
-        close_reason="take_profit",
+        close_reason=close_reason,
         realized_pnl=realized_pnl,
         entry_p_model=p_model,
         entry_confidence="medium",
@@ -177,3 +178,39 @@ def test_return_is_measured_against_the_opened_cost_basis_not_the_residual(store
     bucket = next(b for b in buckets if b.lower == 0.7)
     assert bucket.count == 1
     assert bucket.mean_return == pytest.approx(0.2925)
+
+
+# ---------- reconciled closes carry no measurable outcome ----------
+
+
+def test_reconciled_closes_are_excluded() -> None:
+    """A reconciled close records ``realized_pnl = 0`` by construction: the
+    position was exited outside the ledger and the real exit price cannot be
+    attributed back to it (see ``ReconciliationMonitor``). Counting that zero
+    scores every such trade as a loss, so a bucket full of reconciled rows
+    reads as a badly calibrated model rather than as missing data."""
+    positions = [
+        _closed(p_model=0.85, realized_pnl=0.0, position_id=1, close_reason="reconciled"),
+        _closed(p_model=0.85, realized_pnl=0.0, position_id=2, close_reason="reconciled"),
+        _closed(p_model=0.85, realized_pnl=5.0, position_id=3),
+    ]
+    buckets = calibration_report(positions)
+    top = [b for b in buckets if b.lower == 0.8][0]
+    assert top.count == 1
+    assert top.win_rate == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "close_reason", ["settlement", "take_profit", "stop_loss", "peak_drawdown", "manual"]
+)
+def test_real_close_reasons_are_counted(close_reason: str) -> None:
+    positions = [_closed(p_model=0.85, realized_pnl=5.0, close_reason=close_reason)]
+    top = [b for b in calibration_report(positions) if b.lower == 0.8][0]
+    assert top.count == 1
+
+
+def test_a_null_close_reason_is_still_counted() -> None:
+    """Only ``reconciled`` is fabricated; an unlabelled close is not."""
+    positions = [_closed(p_model=0.85, realized_pnl=5.0, close_reason=None)]
+    top = [b for b in calibration_report(positions) if b.lower == 0.8][0]
+    assert top.count == 1

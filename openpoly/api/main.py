@@ -27,8 +27,15 @@ from openpoly.api.news_routes import router as news_router
 from openpoly.api.portfolio_routes import router as portfolio_router
 from openpoly.api.runtime_routes import router as runtime_router
 from openpoly.api.secrets_routes import router as secrets_router
+from openpoly.api.security import (
+    API_TOKEN_ENV,
+    HostAllowlistMiddleware,
+    api_token_ok,
+    log_startup_security_state,
+)
 from openpoly.api.wallet_routes import router as wallet_router
 from openpoly.db.engine import get_session_factory
+from openpoly.db.manager import DatabaseConfig
 from openpoly.db.manager import manager as database_manager
 from openpoly.embedding.manager import manager as embedding_manager
 from openpoly.execution import executor
@@ -40,7 +47,7 @@ from openpoly.runtime.exit_monitor import exit_monitor
 from openpoly.runtime.settlement_monitor import settlement_monitor
 from openpoly.runtime import reconciliation_monitor as _recon_mod
 from openpoly.runtime.reconciliation_monitor import ReconciliationMonitor
-from openpoly.runtime.orchestrator import get_orchestrator
+from openpoly.runtime.orchestrator import _canvas_config, get_orchestrator
 from openpoly.sections._registry import CatalogEntry, scan
 from openpoly.sections.news_source.tradingnews_ws import TradingNewsWSConfig
 from openpoly.wallet.runtime_state import runtime_state
@@ -106,19 +113,61 @@ async def _autostart_sources() -> None:
         logger.exception("news_source autostart failed")
 
 
+def _demote_restored_live_without_token() -> None:
+    """Re-check the restored exec mode against the API's authentication.
+
+    ``runtime.json`` outlives the process, so ``exec_mode: "live"`` comes back
+    on every restart — including the restart where the token env var went
+    missing (unit file edited, secret rotated away, container redeployed
+    without it). The mode switch refuses live without a usable token; a restore
+    that skipped that check would put real funds behind an open API precisely
+    when nobody is watching. Demote to paper and persist it, so the operator
+    has to fix the token and flip the switch deliberately. The demotion fails
+    closed: if persistence fails, the in-memory mode is still forced to paper.
+    """
+    if runtime_state.exec_mode != "live" or api_token_ok():
+        return
+    logger.error(
+        "restored exec_mode=live but %s is unset or unusable — forcing paper "
+        "mode: live trading behind an unauthenticated API is refused",
+        API_TOKEN_ENV,
+    )
+    try:
+        runtime_state.set_mode("paper")
+    except Exception:  # noqa: BLE001 — startup must survive an unwritable state file
+        # Fail closed: persistence failed, but the dispatcher routes on the
+        # in-memory mode, so leaving it at "live" would trade real funds behind
+        # an unauthenticated API. Force paper without touching disk; runtime.json
+        # still says live, which only means this demotion re-runs on the next boot.
+        runtime_state.set_mode("paper", persist=False)
+        logger.critical(
+            "could not persist the forced paper mode; this process is running "
+            "paper in memory but runtime.json still says live and the demotion "
+            "will re-run at the next boot — fix %s or runtime.json before "
+            "trusting this process with live mode",
+            API_TOKEN_ENV,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Startup: wire the pipeline. Manager forwards each fresh NewsItem
     # via its sync ``_on_item`` hook → orchestrator.enqueue → worker.
+    # Say once whether the API is authenticated — an unset token is a working
+    # loopback default, not a silent one (see openpoly.api.security).
+    log_startup_security_state()
     # Wallet + exec_mode state — read first so the dispatcher routes to the
     # correct executor at the moment the orchestrator starts dispatching.
     runtime_state.load()
+    _demote_restored_live_without_token()
     orch = get_orchestrator()
     news_source_manager.set_pipeline_hook(orch.enqueue)
     await orch.start()
     # Persistence — the database section's manager owns the engine + the two
-    # write-behind writers (order-book sampling loop + news stream).
-    await database_manager.start()
+    # write-behind writers (order-book sampling loop + news stream). Its config
+    # comes from the canvas like every other section's, so the retention window
+    # the operator set is the one the prune loop uses.
+    await database_manager.start(config=_canvas_config(DatabaseConfig, "database"))
     # Executor — inject a PortfolioStore now the DB engine + tables are up;
     # entry fills and exit sells write fill / position through it.
     portfolio = PortfolioStore(get_session_factory())
@@ -197,6 +246,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="openPoly", version="0.0.0", lifespan=lifespan)
+# Host allowlist first, before routing: a request under a name this backend was
+# never meant to answer to is refused whatever it was going to ask for. No CORS
+# middleware on purpose — the frontend is same-origin through Vite's proxy, and
+# a permissive allowance would hand back what this middleware takes away.
+app.add_middleware(HostAllowlistMiddleware)
 app.include_router(news_router)
 app.include_router(market_router)
 app.include_router(inspect_router)

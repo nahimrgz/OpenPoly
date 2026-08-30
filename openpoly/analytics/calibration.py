@@ -25,6 +25,16 @@ from openpoly.portfolio import PositionRecord
 # by construction (the entry section picks the side p_model favours).
 BUCKET_EDGES: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 
+# Close reasons whose ``realized_pnl`` is not a measured outcome. A
+# ``reconciled`` close books 0 by construction — the position was exited
+# outside the ledger and the real exit price cannot be attributed back to it
+# (see ``ReconciliationMonitor``) — so scoring it counts a trade whose result
+# is unknown as a loss, and a run of them reads as a miscalibrated model
+# rather than as missing data. Every other reason (``settlement``,
+# ``take_profit``, ``stop_loss``, ``peak_drawdown``, manual) closed at a price
+# that actually happened and is counted.
+UNMEASURED_CLOSE_REASONS: frozenset[str] = frozenset({"reconciled"})
+
 
 @dataclass(frozen=True)
 class CalibrationBucket:
@@ -78,9 +88,11 @@ def calibration_report(
 ) -> list[CalibrationBucket]:
     """Bucket closed, labelled positions by held-side probability.
 
-    Excluded: still-open positions (no outcome yet) and positions without an
+    Excluded: still-open positions (no outcome yet), positions without an
     ``entry_p_model`` (opened manually, by reconciliation, or before the column
-    existed) — counting either would bias the very number being measured.
+    existed), and positions closed for a reason in
+    ``UNMEASURED_CLOSE_REASONS`` — counting any of them would bias the very
+    number being measured.
 
     ``cost_basis`` maps position id → what was paid to open it, from
     ``PortfolioStore.buy_cost_basis``. It is what ``mean_return`` divides by,
@@ -102,6 +114,8 @@ def calibration_report(
 
     for record in positions:
         if record.status != "closed" or record.realized_pnl is None:
+            continue
+        if record.close_reason in UNMEASURED_CLOSE_REASONS:
             continue
         probability = _held_side_probability(record)
         if probability is None:

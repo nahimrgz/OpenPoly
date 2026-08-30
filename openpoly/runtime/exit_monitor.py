@@ -365,10 +365,15 @@ class ExitMonitor:
             watch.setdefault(held.token_id, []).append(held.position_id)
         self._watch = watch
         # Drop the unmarkable / dust markers for anything no longer open, so
-        # neither set can grow across the process lifetime.
+        # neither set can grow across the process lifetime. The peak dict is
+        # pruned on the same line and for a stronger reason: ``_close`` drops a
+        # peak only for the positions *this* monitor closed, and the settlement
+        # and reconciliation monitors close positions behind its back — every
+        # one of those left an entry here forever.
         open_ids = {held.position_id for held in opens}
         self._unmarkable &= open_ids
         self._dust &= open_ids
+        self._peak = {pid: peak for pid, peak in self._peak.items() if pid in open_ids}
         blocked = 0
         for held in opens:
             try:
@@ -504,13 +509,30 @@ class ExitMonitor:
         finally:
             clear_closing(held.position_id)
         if result.filled and result.price is not None:
-            realized = (result.price - held.avg_entry_price) * held.qty
-            # Position is closed; drop its peak so a future re-entry on the
-            # same position_id (shouldn't happen, but be safe) starts fresh,
-            # and stop observing its token so a book delivered before the next
-            # sweep cannot resurrect the entry.
-            self._peak.pop(held.position_id, None)
-            self._unwatch(held.token_id, held.position_id)
+            # A sell is not necessarily the whole position: an IOC order fills
+            # against whatever depth was resting, and ``record_sell`` reduces
+            # ``qty`` and leaves the row open when the residual is still
+            # sellable. Realizing against ``held.qty`` therefore booked the
+            # gain on shares that were never sold.
+            sold_qty = result.qty if result.qty is not None else held.qty
+            realized = (result.price - held.avg_entry_price) * sold_qty
+            # "Still open" is the authoritative test for a partial, not
+            # ``sold_qty < held.qty``: a sell leaving a sub-0.01 residue is a
+            # *full* close (see ``PortfolioStore.record_sell``), and treating
+            # it as partial would strand a peak for a closed position. The
+            # cheap comparison guards the DB read for the common full fill.
+            partial = sold_qty < held.qty and self._still_open(held.position_id)
+            if not partial:
+                # Position is closed; drop its peak so a future re-entry on the
+                # same position_id (shouldn't happen, but be safe) starts fresh,
+                # and stop observing its token so a book delivered before the
+                # next sweep cannot resurrect the entry.
+                self._peak.pop(held.position_id, None)
+                self._unwatch(held.token_id, held.position_id)
+            # Partial: the remainder is still an open position with a trailing
+            # stop, so its peak and its book subscription are kept — resetting
+            # them would re-seed the stop at the next tick's mark and throw
+            # away the run-up the position has already had.
             self._log(
                 held,
                 ts,

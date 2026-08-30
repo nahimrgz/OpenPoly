@@ -19,9 +19,16 @@ def _test_db_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     # Keep the lifespan from opening real news / market connections — tests
     # that exercise it drive the managers explicitly.
     os.environ["OPENPOLY_AUTOSTART_SOURCES"] = "0"
+    # The Host allowlist (openpoly.api.security) refuses anything that is not
+    # loopback or explicitly allowed. The two hostnames the test clients use —
+    # ``testserver`` (Starlette's TestClient default) and ``test`` (the httpx
+    # ASGITransport base_url) — are allowed here rather than in the production
+    # default, which must stay strict.
+    os.environ["OPENPOLY_ALLOWED_HOSTS"] = "testserver,test"
     yield
     os.environ.pop("OPENPOLY_DB_URL", None)
     os.environ.pop("OPENPOLY_AUTOSTART_SOURCES", None)
+    os.environ.pop("OPENPOLY_ALLOWED_HOSTS", None)
 
 
 @pytest.fixture(autouse=True)

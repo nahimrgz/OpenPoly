@@ -13,9 +13,10 @@ for a sentinel value to prevent regressions.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
+from openpoly.api.security import require_api_token
 from openpoly.news.secret_store import (
     InvalidName,
     NameNotFound,
@@ -44,7 +45,9 @@ class ListSecretsResponse(BaseModel):
     entries: list[SecretEntryResponse]
 
 
-@router.post("/local", response_model=CreateSecretResponse)
+@router.post(
+    "/local", response_model=CreateSecretResponse, dependencies=[Depends(require_api_token)]
+)
 async def create_local(req: CreateSecretRequest) -> CreateSecretResponse:
     try:
         entry = await get_store().set(req.name, req.value)
@@ -67,7 +70,7 @@ def list_local(prefix: str | None = None) -> ListSecretsResponse:
     )
 
 
-@router.delete("/local/{name:path}", status_code=204)
+@router.delete("/local/{name:path}", status_code=204, dependencies=[Depends(require_api_token)])
 async def delete_local(name: str) -> Response:
     try:
         await get_store().delete(name)

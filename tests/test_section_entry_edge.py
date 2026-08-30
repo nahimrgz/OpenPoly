@@ -911,3 +911,45 @@ def test_intent_carries_the_raw_p_model_on_a_no_side() -> None:
 
 def test_section_version_bumped_for_the_sizing_knob() -> None:
     assert EdgeThresholdEntryV0.SECTION_VERSION == "0.4.0"
+
+
+def test_multiplier_is_skipped_when_the_portfolio_is_unavailable() -> None:
+    """``heat_cap_usd`` is what bounds a scaled order. With no portfolio to
+    read, the open exposure is unknown — so the cap cannot bound anything, and
+    a 2x multiplier would size *past* a cap the operator set precisely to stop
+    that. Fall back to the base size and say why."""
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(heat_cap_usd=100.0, size_edge_multiplier_max=3.0),
+        portfolio_provider=lambda: None,
+    )
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(10.0 / 0.50)
+    assert "size_multiplier" not in out.signals
+    assert out.signals["size_multiplier_skipped"] == "portfolio_unavailable"
+
+
+def test_no_skipped_signal_when_the_heat_cap_is_off() -> None:
+    """Without a heat cap there is nothing for the open exposure to bound, so
+    an absent portfolio is not a reason to refuse the multiplier."""
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(heat_cap_usd=0.0, size_edge_multiplier_max=3.0),
+        portfolio_provider=lambda: None,
+    )
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(2 * 10.0 / 0.50)
+    assert "size_multiplier_skipped" not in out.signals
+
+
+def test_no_skipped_signal_when_scaling_is_off() -> None:
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(heat_cap_usd=100.0),
+        portfolio_provider=lambda: None,
+    )
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert "size_multiplier_skipped" not in out.signals

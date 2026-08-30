@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 # A single SQLite file, relative to the working directory.
@@ -63,10 +63,24 @@ def make_session_factory(engine: Engine) -> sessionmaker[Session]:
 def init_db(engine: Engine) -> None:
     """Create all registered tables that do not yet exist.
 
-    Single-schema, paper-stage table bootstrap. Alembic migrations are deferred
-    until schema evolution on a live database actually matters.
+    An **empty** database is stamped to the latest schema version afterwards:
+    ``create_all`` builds every table at its current shape, so no migration has
+    anything left to do and recording that fact is what keeps a fresh install
+    from re-running the whole history (see ``openpoly.db.migrations``).
+
+    A database that already holds tables is left unstamped — it may predate any
+    given migration, and only ``run_migrations`` can decide. ``create_all``
+    still runs, because it is what adds tables introduced since that database
+    was created; it just cannot alter the ones already there.
     """
+    # Imported here, not at module scope: migrations imports ``Base`` from this
+    # module, so a top-level import would be circular.
+    from openpoly.db.migrations import stamp_version
+
+    fresh = not inspect(engine).get_table_names()
     Base.metadata.create_all(engine)
+    if fresh:
+        stamp_version(engine)
 
 
 # Process-wide engine — lazily created, shared by the app lifespan (write-behind

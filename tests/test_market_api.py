@@ -331,3 +331,39 @@ async def test_wallet_positions_value_bad_shape_is_none():
         value = await fetch_wallet_positions_value("0xFUNDER", client=client)
 
     assert value is None
+
+
+async def test_held_condition_sides_ignores_unsellable_dust():
+    """A residue below the venue's 0.01-share size precision is not a holding.
+
+    ``PortfolioStore.record_sell`` closes a position whose residual falls under
+    ``MIN_SELLABLE_QTY``, because no order can ever clear it. The indexer still
+    reports that residue, so the reconciliation monitor's reverse diff saw a
+    holding with no open position behind it and raised
+    ``untracked_onchain_holding`` for a position that was correctly closed.
+    """
+    from openpoly.portfolio.store import MIN_SELLABLE_QTY
+
+    payload = [
+        {"conditionId": "0xaaa", "outcome": "Yes", "size": 0.004},  # dust — excluded
+        {"conditionId": "0xbbb", "outcome": "No", "size": MIN_SELLABLE_QTY},  # exactly at
+        {"conditionId": "0xccc", "outcome": "Yes", "size": 12.0},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with _mock_client(handler) as client:
+        held = await fetch_held_condition_sides("0xFUNDER", client=client)
+
+    assert held == {("0xbbb", "no"), ("0xccc", "yes")}
+
+
+async def test_held_condition_sides_min_size_is_overridable():
+    payload = [{"conditionId": "0xaaa", "outcome": "Yes", "size": 5.0}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with _mock_client(handler) as client:
+        assert await fetch_held_condition_sides("0xF", client=client, min_size=10.0) == set()

@@ -75,6 +75,10 @@ For live trading you need at least `OPENPOLY_POLYMARKET_PK` and
 `OPENPOLY_AUTOSTART_SOURCES=0` is recommended on memory-constrained hosts so the
 embedding model (~500MB) doesn't load at boot.
 
+Set `OPENPOLY_API_TOKEN` too — on a shared VPS the loopback port is reachable by
+every other process and by anyone else on the tunnel, and **live mode is refused
+without it**. See [Securing the API](./README.md#securing-the-api).
+
 Create `~/.openpoly/runtime.json` (chmod 600) — wallet config + exec mode:
 
 ```json
@@ -169,6 +173,10 @@ ssh openpoly-vps 'journalctl -u openpoly -n 50 --no-pager'
 
 ## Bringing up live trading
 
+0. Set `OPENPOLY_API_TOKEN` in `/opt/openpoly/.env` and restart — the switch to
+   live is refused with 403 `api_token_required` while the API is
+   unauthenticated. Send it as `X-OpenPoly-Token` on every mutating call (the
+   Swagger UI's "Try it out" lets you add the header per request).
 1. Confirm a clean paper boot (smoke test above).
 2. Open the Swagger UI over the tunnel → `POST /api/system/mode` `{"mode":"live"}`.
 3. Preflight runs: derives API creds and checks pUSD balance + V2 allowances.

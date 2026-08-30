@@ -356,7 +356,9 @@ class EdgeThresholdEntryV0:
                         signals=signals,
                     )
 
-        notional = self._scaled_notional(edge, open_cost)
+        notional, size_skip_reason = self._scaled_notional(edge, open_cost)
+        if size_skip_reason is not None:
+            signals["size_multiplier_skipped"] = size_skip_reason
         multiplier = notional / self.config.order_size_usd
         if multiplier != 1.0:
             signals["size_multiplier"] = round(multiplier, 4)
@@ -374,8 +376,13 @@ class EdgeThresholdEntryV0:
         )
         return SectionOutput(payload=intent, verdict="ok", signals=signals)
 
-    def _scaled_notional(self, edge: float, open_cost: float | None) -> float:
+    def _scaled_notional(self, edge: float, open_cost: float | None) -> tuple[float, str | None]:
         """Order notional in USD — ``order_size_usd``, optionally scaled by edge.
+
+        Returns ``(notional, skipped_reason)``; ``skipped_reason`` is non-None
+        only when a multiplier was available but deliberately not applied, so
+        the caller can surface it as a signal rather than leaving an unexplained
+        base-size order.
 
         The multiplier is ``clamp(edge / min_edge, 1.0, size_edge_multiplier_max)``
         and never shrinks an order: at the default cap of 1.0 this returns
@@ -389,18 +396,26 @@ class EdgeThresholdEntryV0:
         the cap's existing job is to gate on exposure already taken (that
         pre-check is unchanged), not to shrink the base order — so a config
         with the knob at its 1.0 default behaves exactly as it did.
+
+        When the cap is on but ``open_cost`` is unknown (no portfolio to read),
+        the multiplier is refused outright rather than applied unbounded. The
+        cap is the only thing standing between a 3x multiplier and 3x the
+        intended exposure, and "the portfolio was unreadable" is exactly the
+        moment not to take the larger position on trust.
         """
         base = self.config.order_size_usd
         cap = self.config.size_edge_multiplier_max
         if cap <= 1.0 or self.config.min_edge <= 0.0:
-            return base
-        multiplier = max(1.0, min(edge / self.config.min_edge, cap))
+            return base, None
         heat_cap = self.config.heat_cap_usd
+        if heat_cap > 0 and open_cost is None:
+            return base, "portfolio_unavailable"
+        multiplier = max(1.0, min(edge / self.config.min_edge, cap))
         if heat_cap > 0 and open_cost is not None:
             headroom = heat_cap - open_cost
             if headroom < base * multiplier:
                 multiplier = max(1.0, headroom / base)
-        return base * multiplier
+        return base * multiplier, None
 
     @staticmethod
     def CONTRACT_TEST() -> None:

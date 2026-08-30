@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 import openpoly.api.wallet_routes as wallet_routes
 from openpoly.api.main import app
 from openpoly.api.portfolio_routes import get_portfolio_store
+from openpoly.api.security import API_TOKEN_HEADER
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.portfolio import PortfolioStore
 from openpoly.wallet.runtime_state import RuntimeState, WalletSpec
@@ -23,6 +24,9 @@ STANDARD_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
 NEGRISK_V2 = "0xe2222d279d744050d28e00520010520000310F59"
 MAX_UINT = str(2**256 - 1)
 
+# Shared secret the fixture configures so the live switch clears its token gate.
+TEST_API_TOKEN = "mode-switch-test-token"
+
 
 @pytest.fixture
 def env(
@@ -30,6 +34,13 @@ def env(
 ) -> tuple[TestClient, PortfolioStore, RuntimeState]:
     monkeypatch.setenv("OPENPOLY_RUNTIME_STATE", str(tmp_path / "runtime.json"))
     monkeypatch.setenv("OPENPOLY_POLYMARKET_PK", TEST_PRIVKEY)
+    # Live mode is refused outright while the API has no shared secret (see
+    # openpoly.api.security). These tests are about the *wallet* preflight, so
+    # the token gate is satisfied here; the gate itself is covered in
+    # tests/test_api_security.py. The header is not needed on top of it — the
+    # per-route dependency compares only when a token is configured, and the
+    # client below sends it.
+    monkeypatch.setenv("OPENPOLY_API_TOKEN", TEST_API_TOKEN)
 
     engine = make_engine(f"sqlite:///{tmp_path}/portfolio.db")
     init_db(engine)
@@ -40,7 +51,11 @@ def env(
     rs.load()
     monkeypatch.setattr(wallet_routes, "runtime_state", rs)
 
-    yield TestClient(app), store, rs
+    yield (
+        TestClient(app, headers={API_TOKEN_HEADER: TEST_API_TOKEN}),
+        store,
+        rs,
+    )
 
     app.dependency_overrides.clear()
     engine.dispose()

@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from openpoly.api.portfolio_routes import get_portfolio_store
+from openpoly.api.security import API_TOKEN_ENV, api_token_ok, require_api_token
 from openpoly.execution import executor
 from openpoly.execution.live_executor import build_live_executor
 from openpoly.markets.polymarket_api import fetch_wallet_positions_value
@@ -129,7 +130,11 @@ def get_wallet_config() -> WalletConfigResponse:
     )
 
 
-@router.put("/api/wallet/config", response_model=WalletConfigResponse)
+@router.put(
+    "/api/wallet/config",
+    response_model=WalletConfigResponse,
+    dependencies=[Depends(require_api_token)],
+)
 def put_wallet_config(body: PutWalletConfigRequest) -> WalletConfigResponse:
     _validate_ref_format(body.private_key_ref)
     _validate_address(body.funder_address, "funder_address")
@@ -153,8 +158,11 @@ def put_wallet_config(body: PutWalletConfigRequest) -> WalletConfigResponse:
             funder_address=body.funder_address,
         )
     )
-    logger.info(
-        "wallet config updated; signer=%s funder=%s",
+    # Same split as the live-executor factory: the event at INFO, the wallet
+    # identifiers at DEBUG (see openpoly/execution/live_executor.py).
+    logger.info("wallet config updated")
+    logger.debug(
+        "wallet config bound: signer=%s funder=%s",
         signer,
         body.funder_address[:10] + "…",
     )
@@ -174,7 +182,9 @@ class SetModeResponse(BaseModel):
     mode: Literal["paper", "live"]
 
 
-@router.post("/api/system/mode", response_model=SetModeResponse)
+@router.post(
+    "/api/system/mode", response_model=SetModeResponse, dependencies=[Depends(require_api_token)]
+)
 def set_mode(
     body: SetModeRequest,
     store: PortfolioStore = Depends(get_portfolio_store),
@@ -182,6 +192,25 @@ def set_mode(
     target = body.mode
     if target == runtime_state.exec_mode:
         return SetModeResponse(mode=target)
+
+    # Live mode is the point where an unauthenticated API stops being a
+    # development convenience and starts being a way for anything that can
+    # reach this socket to spend real funds. Refuse it outright rather than
+    # letting the operator discover the exposure afterwards. Checked before
+    # every other precondition: no amount of correct wallet config makes an
+    # open endpoint acceptable here.
+    if target == "live" and not api_token_ok():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "api_token_required",
+                "message": (
+                    f"set {API_TOKEN_ENV} to a value that resolves to a non-empty "
+                    "secret before switching to live mode — live trading behind "
+                    "an unauthenticated API is refused"
+                ),
+            },
+        )
 
     open_positions = store.get_open_positions()
     if open_positions:

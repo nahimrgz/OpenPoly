@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from openpoly.api.security import require_api_token
 from openpoly.analytics.calibration import calibration_report
 from openpoly.db.engine import get_session_factory
 from openpoly.execution import executor
@@ -82,7 +83,7 @@ def list_fills(
     return {"fills": [asdict(f) for f in rows]}
 
 
-@router.post("/positions/{position_id}/close")
+@router.post("/positions/{position_id}/close", dependencies=[Depends(require_api_token)])
 async def close_position(
     position_id: int,
     store: PortfolioStore = Depends(get_portfolio_store),
@@ -92,6 +93,11 @@ async def close_position(
     the exit monitor already has a sell in flight for it. The response body is
     the ``ExecResult`` — ``filled`` is False (with a ``skip_reason``) when the
     order book has no bid liquidity right now.
+
+    A fill is capped by the level-1 bid's depth, so ``filled`` alone does not
+    mean the position is gone: the body carries ``partial`` (and, when partial,
+    ``remaining_qty``) so "sold 10 of 25, 15 still on the book" is not reported
+    as a completed exit.
 
     Async, and it never awaits between the open-position lookup and the
     synchronous ``execute_sell`` — so the close is atomic with respect to the
@@ -124,10 +130,27 @@ async def close_position(
         result = executor.execute_sell(held, close_reason="manual", ts=time.time(), trigger=None)
     finally:
         clear_closing(position_id)
-    return asdict(result)
+    body = asdict(result)
+    if result.filled:
+        # "Still open" is the authoritative test, not ``qty < held.qty``: a
+        # sell leaving a sub-0.01 residue closes the row outright (see
+        # ``PortfolioStore.record_sell``), and that is a completed exit.
+        remaining = _remaining_qty(store, position_id)
+        body["partial"] = remaining is not None
+        if remaining is not None:
+            body["remaining_qty"] = remaining
+    return body
 
 
-@router.post("/positions/close-all")
+def _remaining_qty(store: PortfolioStore, position_id: int) -> float | None:
+    """Open qty left on ``position_id`` after a sell, or None when it is flat."""
+    record = store.get_position(position_id)
+    if record is None or record.status != "open":
+        return None
+    return record.qty
+
+
+@router.post("/positions/close-all", dependencies=[Depends(require_api_token)])
 async def close_all_positions(
     store: PortfolioStore = Depends(get_portfolio_store),
 ) -> dict[str, Any]:
@@ -143,14 +166,28 @@ async def close_all_positions(
     monitor is already selling (see ``closing_registry``) are skipped with
     ``exit_in_flight`` and reported in ``details`` rather than sold twice; each
     position this route does sell is claimed for the duration.
+
+    A per-position ``ok`` means **flat**, not "the order went through": a sell
+    capped by the level-1 bid's depth leaves the rest of the position on the
+    book, and that is counted under ``partial``, never under ``filled``. Bulk
+    close is the button an operator presses to be out of the market, so a
+    summary that counted a half-sold position as closed would be answering a
+    different question than the one being asked.
     """
     opens = store.get_open_positions()
     if not opens:
-        return {"attempted": 0, "filled": 0, "skipped": 0, "errored": 0, "details": []}
+        return {
+            "attempted": 0,
+            "filled": 0,
+            "partial": 0,
+            "skipped": 0,
+            "errored": 0,
+            "details": [],
+        }
 
     now = time.time()
     details: list[dict[str, Any]] = []
-    filled = skipped = errored = 0
+    filled = partial = skipped = errored = 0
     for held in opens:
         entry: dict[str, Any] = {
             "position_id": held.position_id,
@@ -172,10 +209,16 @@ async def close_all_positions(
             errored += 1
         else:
             if result.filled:
-                entry["ok"] = True
                 entry["price"] = result.price
                 entry["qty"] = result.qty
-                filled += 1
+                remaining = _remaining_qty(store, held.position_id)
+                entry["partial"] = remaining is not None
+                entry["ok"] = remaining is None
+                if remaining is None:
+                    filled += 1
+                else:
+                    entry["remaining_qty"] = remaining
+                    partial += 1
             else:
                 entry["ok"] = False
                 entry["skip_reason"] = result.skip_reason
@@ -186,6 +229,7 @@ async def close_all_positions(
     return {
         "attempted": len(opens),
         "filled": filled,
+        "partial": partial,
         "skipped": skipped,
         "errored": errored,
         "details": details,

@@ -937,3 +937,46 @@ def test_live_buy_persists_the_entry_signals_from_the_intent(store) -> None:
     assert rec.entry_p_model == 0.61
     assert rec.entry_confidence == "medium"
     assert rec.entry_edge == 0.11
+
+
+def test_buy_refuses_when_the_ctf_balance_is_unparseable(store) -> None:
+    """A balance field that is present but not a number is *unknown*, not zero.
+
+    Returning 0 made the pre-order baseline look successfully read, so the
+    ``ctf_balance_unavailable`` guard never fired — and a lost response after a
+    real fill would then be confirmed against a fabricated baseline of 0,
+    inventing a fill delta out of the first successful read.
+    """
+
+    class _GarbageBalance:
+        def __init__(self) -> None:
+            self.posted: list[dict] = []
+
+        def update_balance_allowance(self, params) -> None:
+            pass
+
+        def get_balance_allowance(self, params):
+            return {"balance": "not-a-number", "allowances": {}}
+
+        def create_and_post_order(self, *a, **k):
+            raise AssertionError("must not post without a baseline")
+
+    _populate(_market("m1"))
+    clob = _GarbageBalance()
+    r = LiveExecutor(portfolio=store, clob_client=clob).execute_buy(_intent(), news_id="n", ts=1.0)
+
+    assert r.filled is False
+    assert r.skip_reason == "ctf_balance_unavailable"
+    assert clob.posted == []
+
+
+def test_read_ctf_balance_raw_returns_none_for_a_missing_balance_field(store) -> None:
+    class _NoBalanceKey:
+        def update_balance_allowance(self, params) -> None:
+            pass
+
+        def get_balance_allowance(self, params):
+            return {"balance": None, "allowances": {}}
+
+    le = LiveExecutor(portfolio=store, clob_client=_NoBalanceKey())
+    assert le._read_ctf_balance_raw("tok") is None

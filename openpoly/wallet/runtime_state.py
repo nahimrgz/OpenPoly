@@ -100,12 +100,22 @@ class RuntimeState:
             self._exec_mode = "paper"
             self._wallet = None
 
-    def set_mode(self, mode: ExecMode) -> None:
+    def set_mode(self, mode: ExecMode, *, persist: bool = True) -> None:
         # Save-then-mutate: a disk failure must leave in-memory state matching
         # what is on disk, so callers retrying with a different mode don't see
         # phantom success (spec §9: "if the PUT disk write fails → do not mutate in-memory state").
+        #
+        # ``persist=False`` is the fail-closed escape hatch for a safety
+        # demotion (startup forcing paper). There the in-memory mode is the
+        # thing that must change — the dispatcher routes on it — and rolling it
+        # back because the file could not be written would keep the process
+        # trading live. Disk is left alone, so the demotion simply re-runs on
+        # the next boot.
         if mode not in _VALID_MODES:
             raise ValueError(f"unknown exec mode: {mode!r}")
+        if not persist:
+            self._exec_mode = mode
+            return
         prev = self._exec_mode
         self._exec_mode = mode
         try:

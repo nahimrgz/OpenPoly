@@ -149,7 +149,15 @@ class LiveExecutor:
 
     def _read_ctf_balance_raw(self, token_id: str) -> int | None:
         """Refresh + read the wallet's CTF balance for ``token_id`` (raw 1e6
-        units). None when the read fails — callers treat that as 'unknown'."""
+        units). None when the read fails — callers treat that as 'unknown'.
+
+        A balance field that is absent, null, or not a number is *unknown*, not
+        zero. Returning 0 for it defeated the ``ctf_balance_unavailable`` guard
+        entirely: the caller saw a successfully read baseline of 0, posted the
+        order, and — if the response was then lost — confirmed the fill against
+        a baseline that had never been read, turning the first parseable read
+        into an invented fill delta.
+        """
         try:
             self._clob.update_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
@@ -157,9 +165,10 @@ class LiveExecutor:
             ba = self._clob.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
             )
-            return int(ba.get("balance", 0))
-        except (TypeError, ValueError):
-            return 0
+            return int(ba.get("balance"))  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            logger.warning("CTF balance unparseable for %s: %s", token_id, exc)
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("CTF balance read failed: %s", exc)
             return None
@@ -525,10 +534,17 @@ def build_live_executor(
     )
     creds = clob.derive_api_key()
     clob.set_api_creds(creds)
-    logger.info(
-        "live executor ready: signer=%s funder=%s api_key=%s",
+    # The event is INFO; its payload is not. The L2 API key is a live trading
+    # credential and never appears at any level — a prefix of a credential is
+    # still a piece of one, and it bought nothing that "ready" does not say.
+    # The signer / funder addresses are public on chain but still identify the
+    # operator's wallet, so they sit at DEBUG: reachable when someone is
+    # deliberately debugging, absent from the log file and from every pasted
+    # snippet by default.
+    logger.info("live executor ready")
+    logger.debug(
+        "live executor bound: signer=%s funder=%s",
         clob.get_address(),
         wallet.funder_address[:10] + "…",
-        creds.api_key[:8] + "…",
     )
     return LiveExecutor(portfolio=portfolio, clob_client=clob)

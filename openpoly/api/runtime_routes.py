@@ -21,9 +21,10 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ValidationError
 
+from openpoly.api.security import require_api_token
 from openpoly.llm import LLMClient, LLMError
 from openpoly.runtime.orchestrator import get_orchestrator
 from openpoly.runtime.section_log import (
@@ -102,7 +103,9 @@ class AnalyzerTestResponse(BaseModel):
     latency_ms: int | None = None
 
 
-@router.post("/analyzer/test", response_model=AnalyzerTestResponse)
+@router.post(
+    "/analyzer/test", response_model=AnalyzerTestResponse, dependencies=[Depends(require_api_token)]
+)
 def test_analyzer(req: AnalyzerTestRequest) -> AnalyzerTestResponse:
     """Verify the analyzer's LLM config with one minimal forced tool call.
 

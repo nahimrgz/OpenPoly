@@ -14,9 +14,19 @@ class OrderBookSnapshot(Base):
     A time series: one row per market per book-sampling cycle. ``bids_json`` /
     ``asks_json`` hold ``[[price, size], ...]`` best-first — the depth ladder,
     not a quote snapshot (size is what makes walk-book / slippage answerable).
+
+    This is the one table that grows without bound (every token, every sampling
+    cycle, forever), so it carries the retention prune (see
+    ``DatabaseManager.prune_order_books``) and a composite
+    ``(token_id, recorded_at)`` index: every reader that matters filters on
+    both — peak bootstrap and the per-token history route — and the prune
+    deletes by ``recorded_at``. The plain ``token_id`` index is kept because
+    dropping it would rewrite the table on existing databases for no gain; the
+    composite one supersedes it for these queries.
     """
 
     __tablename__ = "order_book_snapshot"
+    __table_args__ = (Index("ix_order_book_snapshot_token_recorded", "token_id", "recorded_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     token_id: Mapped[str] = mapped_column(index=True)

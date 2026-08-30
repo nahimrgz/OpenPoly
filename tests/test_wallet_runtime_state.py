@@ -116,6 +116,36 @@ def test_set_mode_disk_failure_does_not_mutate_memory(
     assert rs.exec_mode == "paper"  # rolled back
 
 
+def test_set_mode_without_persist_skips_disk_and_keeps_memory(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``persist=False`` is the fail-closed seam for a safety demotion: the
+    in-memory mode is what the dispatcher routes on, so it must land even when
+    the state file cannot be written. Disk stays untouched (and still says
+    live), which is what makes the demotion re-run on the next boot."""
+    state_path.write_text(json.dumps({"wallet": None, "exec_mode": "live", "updated_at": 1.0}))
+    rs = RuntimeState()
+    rs.load()
+    assert rs.exec_mode == "live"
+
+    def boom(self: RuntimeState) -> None:
+        raise OSError("simulated read-only filesystem")
+
+    monkeypatch.setattr(RuntimeState, "_save", boom)
+    rs.set_mode("paper", persist=False)
+
+    assert rs.exec_mode == "paper"
+    assert json.loads(state_path.read_text())["exec_mode"] == "live"
+
+
+def test_set_mode_without_persist_still_rejects_unknown(state_path: Path) -> None:
+    rs = RuntimeState()
+    rs.load()
+    with pytest.raises(ValueError):
+        rs.set_mode("chaos", persist=False)  # type: ignore[arg-type]
+    assert rs.exec_mode == "paper"
+
+
 def test_set_wallet_disk_failure_does_not_mutate_memory(
     state_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

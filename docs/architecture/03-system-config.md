@@ -37,6 +37,12 @@ The store treats `local:` names as flat, opaque keys. `/` is still permitted, bu
 - File at `~/.openpoly/secrets.json`, chmod `0o600`. Override path via env `OPENPOLY_SECRET_STORE`.
 - **Plaintext at rest**. Same-user processes can read. Acceptable for grain-scale paper; mainnet should swap this for an OS-keychain backed store (`keychain:` scheme).
 - Backend HTTP **must bind loopback** — no public exposure of the store.
+- Loopback is not on its own an authorization boundary: every other process on
+  the host can reach it. Set `OPENPOLY_API_TOKEN` so the secret-store write
+  routes (`POST` / `DELETE /api/secrets/local`) require the `X-OpenPoly-Token`
+  header, and `OPENPOLY_ALLOWED_HOSTS` if the backend is reached through a name
+  other than loopback. See [Securing the API](../deploy/README.md#securing-the-api).
+  The token itself may be a `*_ref`, so it can live in the same store.
 - Endpoints **never return secret values**; only names + `created_at` (enforced by Pydantic response models + grep tests).
 - Section impls never see the resolved value either — runtime injects the initialized client (per capability injection in [02-strategy-sections.md](02-strategy-sections.md)).
 

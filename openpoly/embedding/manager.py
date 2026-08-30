@@ -112,7 +112,10 @@ class EmbeddingManager:
                 self._store = MarketEmbeddingStore(session_factory)
             if self._store is not None:
                 await self._load_cache()
-            self._stop.clear()
+            # Recreate the Event each start so it binds to the current event
+            # loop (the singleton outlives loops in tests); mirrors the other
+            # runtime monitors.
+            self._stop = asyncio.Event()
             self._task = asyncio.create_task(self._warm_loop())
             self._state = "running"
 

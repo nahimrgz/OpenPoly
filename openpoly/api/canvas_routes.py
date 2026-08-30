@@ -28,8 +28,9 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
+from openpoly.api.security import require_api_token
 from openpoly.runtime.canvas_store import (
     load_template_with_rev,
     save_template,
@@ -63,7 +64,7 @@ def get_canvas_template(response: Response) -> dict[str, Any]:
     return {**template, "rev": rev}
 
 
-@router.put("/api/canvas/template")
+@router.put("/api/canvas/template", dependencies=[Depends(require_api_token)])
 async def put_canvas_template(
     body: dict[str, Any],
     response: Response,

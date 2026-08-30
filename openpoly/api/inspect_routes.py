@@ -172,5 +172,7 @@ def inspect_order_book_history(
 def inspect_db_status(
     db: DatabaseManager = Depends(get_database_manager),
 ) -> dict[str, Any]:
-    """Persistence-layer status — table row counts + write-behind writer stats."""
+    """Persistence-layer status — table row counts, write-behind writer stats,
+    and the retention block (``pruned_rows`` / ``last_prune_at``), which is the
+    only outward sign the order-book prune is still running."""
     return db.status()

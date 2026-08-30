@@ -1038,3 +1038,142 @@ async def test_dust_marker_is_pruned_when_the_position_stops_being_open() -> Non
     pf._positions = []
     await m._tick_once()
     assert m._dust == set()
+
+
+# ---------- partial fills (a sell that did not clear the position) ----------
+
+
+class _PartialFillPortfolio(_FakePortfolio):
+    """A store that behaves like the real one on a partial sell.
+
+    ``record_sell`` reduces ``qty`` and leaves the row OPEN when the residual
+    is still sellable — the plain ``_FakePortfolio`` reports every position as
+    open forever, which cannot distinguish a partial close from a full one.
+    """
+
+    def __init__(self, positions: list[HeldPosition], *, sold_qty: float) -> None:
+        super().__init__(positions)
+        self._sold = sold_qty
+
+    def apply_sell(self, position_id: int) -> None:
+        for index, p in enumerate(self._positions):
+            if p.position_id != position_id:
+                continue
+            residual = p.qty - self._sold
+            if residual < 0.01:
+                self._positions.pop(index)
+            else:
+                self._positions[index] = HeldPosition(
+                    position_id=p.position_id,
+                    market_id=p.market_id,
+                    side=p.side,
+                    token_id=p.token_id,
+                    condition_id=p.condition_id,
+                    qty=residual,
+                    avg_entry_price=p.avg_entry_price,
+                    opened_at=p.opened_at,
+                )
+            return
+
+
+class _PartialExecutor(_FakeExecutor):
+    """Fills ``sold_qty`` of the position and tells the store about it."""
+
+    def __init__(self, portfolio: _PartialFillPortfolio, *, price: float, sold_qty: float) -> None:
+        super().__init__(result=ExecResult.ok(price=price, qty=sold_qty, position_id=1))
+        self._portfolio = portfolio
+        self._sold = sold_qty
+
+    def execute_sell(self, position, *, close_reason, ts, trigger):  # type: ignore[override]
+        result = super().execute_sell(position, close_reason=close_reason, ts=ts, trigger=trigger)
+        self._portfolio.apply_sell(position.position_id)
+        return result
+
+
+async def test_partial_fill_realizes_only_the_sold_quantity() -> None:
+    """Realized PnL was computed against ``held.qty`` — the whole position —
+    even when the sell only cleared part of it, overstating every partial exit
+    in the log."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    pf = _PartialFillPortfolio([_held(1, "t1", avg=0.40, qty=20.0)], sold_qty=8.0)
+    m = _monitor(pf, _PartialExecutor(pf, price=0.55, sold_qty=8.0))
+
+    await m._tick_once()
+
+    entry = exit_log.entries()[-1]
+    assert entry.verdict == "ok"
+    assert entry.realized_pnl == pytest.approx((0.55 - 0.40) * 8.0)
+
+
+async def test_partial_fill_keeps_tracking_the_remainder() -> None:
+    """The remainder is still an open position with a trailing stop; dropping
+    its peak and unwatching its token resets that stop to the next tick's mark
+    and loses the run-up the position already had."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    pf = _PartialFillPortfolio([_held(1, "t1", avg=0.40, qty=20.0)], sold_qty=8.0)
+    m = _monitor(pf, _PartialExecutor(pf, price=0.55, sold_qty=8.0))
+
+    await m._tick_once()
+
+    assert m._peak[1] == pytest.approx(0.55)
+    assert m._watch["t1"] == [1]
+
+
+async def test_full_fill_still_drops_the_peak_and_unwatches() -> None:
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    pf = _PartialFillPortfolio([_held(1, "t1", avg=0.40, qty=20.0)], sold_qty=20.0)
+    m = _monitor(pf, _PartialExecutor(pf, price=0.55, sold_qty=20.0))
+
+    await m._tick_once()
+
+    assert 1 not in m._peak
+    assert "t1" not in m._watch
+    assert exit_log.entries()[-1].realized_pnl == pytest.approx((0.55 - 0.40) * 20.0)
+
+
+async def test_dust_residual_close_is_not_treated_as_partial() -> None:
+    """A sell that leaves less than one hundredth of a share closes the row
+    (see ``PortfolioStore.record_sell``) even though ``result.qty`` is under
+    ``held.qty`` — that is a full close, and its peak must be dropped."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    pf = _PartialFillPortfolio([_held(1, "t1", avg=0.40, qty=20.0)], sold_qty=19.995)
+    m = _monitor(pf, _PartialExecutor(pf, price=0.55, sold_qty=19.995))
+
+    await m._tick_once()
+
+    assert 1 not in m._peak
+    assert "t1" not in m._watch
+
+
+# ---------- peak pruning ----------
+
+
+async def test_peak_entries_for_closed_positions_are_pruned_each_tick() -> None:
+    """A position closed by the settlement or reconciliation monitor never
+    passes through ``_close``, so its peak was never dropped — the dict grew
+    for the life of the process. It is pruned against the open set like the
+    ``_unmarkable`` / ``_dust`` markers."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.41)])
+    pf = _FakePortfolio([_held(1, "t1", avg=0.40)])
+    m = _monitor(pf, _FakeExecutor())
+
+    await m._tick_once()
+    m._peak[99] = 0.9  # closed elsewhere; never seen by _close
+    assert m._peak[1] == pytest.approx(0.41)
+
+    await m._tick_once()
+    assert 99 not in m._peak
+    assert m._peak[1] == pytest.approx(0.41)
+
+
+async def test_peak_is_dropped_when_the_position_stops_being_open() -> None:
+    market_source_manager.store.set_order_books([_book("t1", bid=0.41)])
+    pf = _FakePortfolio([_held(1, "t1", avg=0.40)])
+    m = _monitor(pf, _FakeExecutor())
+
+    await m._tick_once()
+    assert 1 in m._peak
+
+    pf._positions = []
+    await m._tick_once()
+    assert m._peak == {}

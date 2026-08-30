@@ -23,7 +23,7 @@ from typing import Any
 from urllib.parse import quote
 
 import websockets
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from websockets.exceptions import (
     InvalidStatus,
@@ -31,6 +31,7 @@ from websockets.exceptions import (
     WebSocketException,
 )
 
+from openpoly.api.security import require_api_token
 from openpoly.news.manager import manager as news_source_manager
 from openpoly.news.secrets import SecretsError, resolve as resolve_secret
 
@@ -51,7 +52,7 @@ class NewsTestResponse(BaseModel):
     latency_ms: int | None = None
 
 
-@router.post("/test", response_model=NewsTestResponse)
+@router.post("/test", response_model=NewsTestResponse, dependencies=[Depends(require_api_token)])
 async def test_connection(req: NewsTestRequest) -> NewsTestResponse:
     try:
         api_key = resolve_secret(req.api_key_ref)
@@ -137,7 +138,9 @@ def _build_payload() -> SnapshotPayload:
     return SnapshotPayload(**snap, events=events, recent_messages=recent_messages)
 
 
-@router.post("/source/start", response_model=NewsSourceResponse)
+@router.post(
+    "/source/start", response_model=NewsSourceResponse, dependencies=[Depends(require_api_token)]
+)
 async def start_source(req: NewsSourceStartRequest) -> NewsSourceResponse:
     # Fast-fail on secret resolution before bothering the manager / source.
     try:
@@ -159,7 +162,9 @@ async def start_source(req: NewsSourceStartRequest) -> NewsSourceResponse:
     return NewsSourceResponse(ok=True, snapshot=_build_payload())
 
 
-@router.post("/source/stop", response_model=NewsSourceResponse)
+@router.post(
+    "/source/stop", response_model=NewsSourceResponse, dependencies=[Depends(require_api_token)]
+)
 async def stop_source() -> NewsSourceResponse:
     await news_source_manager.stop()
     return NewsSourceResponse(ok=True, snapshot=_build_payload())

@@ -124,7 +124,14 @@ def test_close_all_with_no_open_returns_noop(env) -> None:
     r = client.post("/api/positions/close-all")
     assert r.status_code == 200
     body = r.json()
-    assert body == {"attempted": 0, "filled": 0, "skipped": 0, "errored": 0, "details": []}
+    assert body == {
+        "attempted": 0,
+        "filled": 0,
+        "partial": 0,
+        "skipped": 0,
+        "errored": 0,
+        "details": [],
+    }
 
 
 def test_close_all_three_positions_all_succeed(env) -> None:
@@ -273,3 +280,77 @@ def test_close_all_skips_positions_with_an_in_flight_exit(env) -> None:
     assert by_id[p2.position_id]["skip_reason"] == "exit_in_flight"
     assert store.get_position(p1.position_id).status == "closed"
     assert store.get_position(p2.position_id).status == "open"
+
+
+# ---------- partial fills (the bid could not absorb the whole position) ----------
+
+
+def _thin_book(token_id: str, bid: float, size: float) -> OrderBook:
+    return OrderBook(
+        token_id=token_id,
+        ts=1.0,
+        bids=[(bid, size)],
+        asks=[(bid + 0.02, 100.0)],
+    )
+
+
+def test_close_reports_a_partial_fill(env) -> None:
+    """A 25-share position into a 10-share bid sells 10 and stays open. The
+    response said ``filled: true`` and nothing else — indistinguishable from a
+    completed exit, so the operator had no way to know 15 shares were still on
+    the book."""
+    store, client = env
+    held = _open(store)  # qty 25
+    market_source_manager.store.set_order_books([_thin_book("t1", bid=0.55, size=10.0)])
+
+    body = client.post(f"/api/positions/{held.position_id}/close").json()
+
+    assert body["filled"] is True
+    assert body["partial"] is True
+    assert body["qty"] == pytest.approx(10.0)
+    assert body["remaining_qty"] == pytest.approx(15.0)
+    assert store.get_position(held.position_id).status == "open"
+
+
+def test_close_reports_a_full_fill_as_not_partial(env) -> None:
+    store, client = env
+    held = _open(store)
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+
+    body = client.post(f"/api/positions/{held.position_id}/close").json()
+
+    assert body["filled"] is True
+    assert body["partial"] is False
+    assert "remaining_qty" not in body
+
+
+def test_close_all_counts_partials_separately(env) -> None:
+    store, client = env
+    p1 = _open(store, token_id="t1", market_id="m1")  # fully absorbed
+    p2 = _open(store, token_id="t2", market_id="m2")  # thin bid → partial
+    market_source_manager.store.set_order_books(
+        [
+            _book("t1", bid=0.55),
+            _thin_book("t2", bid=0.50, size=10.0),
+        ]
+    )
+
+    body = client.post("/api/positions/close-all").json()
+
+    assert body["attempted"] == 2
+    assert body["filled"] == 1
+    assert body["partial"] == 1
+    assert body["skipped"] == 0
+    by_id = {d["position_id"]: d for d in body["details"]}
+    # ``ok`` means flat: a position with 15 shares still on the book is not.
+    assert by_id[p1.position_id]["ok"] is True
+    assert by_id[p2.position_id]["ok"] is False
+    assert by_id[p2.position_id]["partial"] is True
+    assert by_id[p2.position_id]["remaining_qty"] == pytest.approx(15.0)
+    assert store.get_position(p2.position_id).status == "open"
+
+
+def test_close_all_noop_body_carries_the_partial_counter(env) -> None:
+    _store, client = env
+    body = client.post("/api/positions/close-all").json()
+    assert body["partial"] == 0

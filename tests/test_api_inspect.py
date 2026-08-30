@@ -218,6 +218,42 @@ def test_inspect_db_status_unstarted_manager():
     assert body["writers"] == {"order_book": None, "news": None}
 
 
+def test_inspect_db_status_exposes_pruned_rows(tmp_path):
+    """Retention has to be observable from outside: a prune that silently
+    stopped otherwise looks exactly like a table that is simply growing."""
+    import time
+
+    from openpoly.db.engine import init_db, make_engine, make_session_factory
+    from openpoly.db.manager import DatabaseConfig
+    from openpoly.db.tables import OrderBookSnapshot
+
+    now = time.time()
+    engine = make_engine(f"sqlite:///{tmp_path}/prune.db")
+    init_db(engine)
+    with make_session_factory(engine)() as session:
+        session.add(
+            OrderBookSnapshot(
+                token_id="t",
+                recorded_at=now - 40 * 86400.0,
+                bids_json="[]",
+                asks_json="[]",
+            )
+        )
+        session.commit()
+    mgr = DatabaseManager()
+    mgr.configure(engine, DatabaseConfig(order_book_retention_days=7.0))
+    mgr.prune_order_books(now=now)
+
+    app.dependency_overrides[get_database_manager] = lambda: mgr
+    try:
+        body = TestClient(app).get("/api/inspect/db-status").json()
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+    assert body["retention"]["pruned_rows"] == 1
+    assert body["retention"]["retention_days"] == 7.0
+
+
 # ---------- /api/inspect/order-books/{token_id} ----------
 
 

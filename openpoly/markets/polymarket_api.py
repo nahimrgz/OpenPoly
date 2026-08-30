@@ -22,6 +22,7 @@ from openpoly.markets.models import (
     parse_clob_book,
     parse_price_history,
 )
+from openpoly.portfolio.store import MIN_SELLABLE_QTY
 
 logger = logging.getLogger(__name__)
 
@@ -192,15 +193,21 @@ async def fetch_held_condition_sides(
     base_url: str = DATA_API_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
     client: httpx.AsyncClient | None = None,
+    min_size: float = MIN_SELLABLE_QTY,
 ) -> set[tuple[str, str]]:
     """Return the ``(condition_id, side)`` pairs the wallet holds on-chain.
 
     Reads the Polymarket data-api ``/positions`` indexer for ``funder`` — it is
     authoritative on what the wallet actually holds and accounts for neg-risk
     wrapping (raw ``balanceOf`` on a token id does not). ``side`` is the held
-    outcome lowercased (``yes`` / ``no``). Only positions with a positive size
-    are included; flat (size 0) ones are omitted so the reconciliation monitor
-    treats them as exited.
+    outcome lowercased (``yes`` / ``no``).
+
+    A position counts as held only at ``min_size`` shares or more, which
+    defaults to the venue's size precision (``MIN_SELLABLE_QTY``). Anything
+    under that is a residue no order can ever clear: ``record_sell`` closes the
+    ledger position when the remainder falls below it, so reporting the residue
+    as a holding made the reconciliation monitor's reverse diff raise
+    ``untracked_onchain_holding`` against a position that was closed correctly.
     """
     raw = await _get_json(
         f"{base_url}/positions",
@@ -220,7 +227,7 @@ async def fetch_held_condition_sides(
             size = float(pos.get("size") or 0)
         except (TypeError, ValueError):
             size = 0.0
-        if not cid or not isinstance(outcome, str) or size <= 0:
+        if not cid or not isinstance(outcome, str) or size < min_size:
             continue
         held.add((str(cid), outcome.strip().lower()))
     return held

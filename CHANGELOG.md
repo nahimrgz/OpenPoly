@@ -10,6 +10,82 @@ Dates are US-style (MM/DD/YYYY).
 
 ---
 
+## 08/30/2026 — Phase 3: what counts as a real outcome, and who is allowed to trade
+
+Nothing here changes an entry or exit threshold. What changed is which numbers
+the system is willing to *believe* about its own trades, and the conditions
+under which it is willing to trade at all.
+
+**A partial sell realizes a partial gain.** The exit monitor computed realized
+P&L as `(fill_price − entry) × held.qty` — the whole position — on every filled
+sell, including one that only cleared part of it. An IOC order fills against
+whatever depth was resting, and `record_sell` reduces `qty` and leaves the row
+open when the residual is still sellable, so a sell of 8 of 20 shares was
+logged as if all 20 had gone. It now realizes `result.qty`, and — the more
+consequential half — it stops treating the position as finished: the remainder
+is still an open position with a trailing stop, so its peak and its book
+subscription are kept. Dropping them re-seeded the stop at the next tick's mark
+and threw away the run-up the position had already had. "Still open after the
+sell" is the test, not `qty < held.qty`: a sell leaving a sub-0.01 residue
+closes the row outright, and that is a completed exit.
+
+**"Closed" has to mean flat.** The manual close routes reported `filled: true`
+for a sell capped by bid depth — indistinguishable from a completed exit, with
+15 of 25 shares still on the book and no way for the operator to know. The
+single close now answers `partial` (and `remaining_qty` when it is), and
+close-all counts partials under their own counter with `ok` meaning *flat*,
+never merely "the order went through". Bulk close is the button pressed to be
+out of the market; a summary that counted a half-sold position as closed was
+answering a different question than the one being asked.
+
+**A fabricated zero is not evidence.** The calibration report bucketed every
+closed position with an `entry_p_model`, including ones closed as `reconciled`
+— whose realized P&L is recorded as exactly 0 by construction, because the
+position was exited outside the ledger and the real exit price cannot be
+attributed back to it. Counting that zero scores a trade whose result is
+unknown as a loss, so a run of reconciled closes reads as a miscalibrated model
+rather than as missing data — and calibration is the gate that decides whether
+`size_edge_multiplier_max` may ever rise above 1.0. Reconciled closes are now
+excluded; `settlement`, `take_profit`, `stop_loss`, `peak_drawdown` and manual
+closes all closed at a price that actually happened and still count.
+
+**Sizing above the base order requires a readable portfolio.** `heat_cap_usd`
+is the only thing bounding an edge-scaled order. When the portfolio could not
+be read the open exposure was unknown, the cap bound nothing, and a 3x
+multiplier sized straight past the ceiling the operator set precisely to stop
+that. The multiplier is now refused in that case — base size, with
+`size_multiplier_skipped: portfolio_unavailable` in the signals. "The portfolio
+was unreadable" is exactly the moment not to take the larger position on trust.
+
+**An unreadable balance is unknown, not zero.** The pre-order CTF balance read
+returned 0 when the venue's balance field was present but unparseable, which
+defeated the `ctf_balance_unavailable` guard added on 08/30: the caller saw a
+successfully read baseline of 0 and posted the order. It now returns unknown
+and the buy refuses, which is what that guard was for. In the other direction,
+sub-0.01-share residues are no longer counted as on-chain holdings at all — the
+reconciliation monitor's reverse diff was raising `untracked_onchain_holding`
+against positions `record_sell` had correctly closed, which is the fastest way
+to train an operator to ignore a warning that matters.
+
+**Live trading now requires an authenticated API.** Every mutating route
+(POST / PUT / DELETE / PATCH) is guarded by an optional shared secret
+(`X-OpenPoly-Token`, from `OPENPOLY_API_TOKEN`); reads stay open. Leaving it
+unset keeps loopback development working and logs one warning — but the switch
+to live mode is **refused outright** (403 `api_token_required`). Loopback is
+not an authorization boundary: every other process on the host can reach it,
+and real funds behind an unauthenticated endpoint is not a state anyone should
+reach by omission. A `Host` allowlist backs it up, refusing any name that is
+not loopback or explicitly allowed (421), which is what turns the DNS-rebinding
+path into a rejection rather than a mode switch. See
+[docs/deploy](docs/deploy/README.md#securing-the-api).
+
+**Order-book history is now pruned, and the window is a strategy parameter.**
+`order_book_snapshot` grew without bound; it is kept for 7 days by default.
+That number is not arbitrary: peak bootstrap rebuilds a position's trailing
+stop from the snapshots taken since it opened, so the retention window has to
+outlive the longest position the strategy will hold. Shorten it and a
+long-held winner comes back from a restart with its peak reset to entry.
+
 ## 08/30/2026 — Execution integrity, and sizing that has to earn the right
 
 Three beliefs changed about the gap between what the system *records* and what

@@ -146,6 +146,13 @@ class ReconciliationMonitor:
         # cancel failed, or an external transfer). Alert loudly, but NEVER
         # auto-open: the cost basis is unknown and auto-created positions would
         # confuse entry dedup. A human decides what to do with it.
+        #
+        # What counts as "holds" is the fetcher's call, and it excludes anything
+        # under ``MIN_SELLABLE_QTY`` (see ``fetch_held_condition_sides``): a
+        # sub-0.01-share residue left behind by ``record_sell`` closing a
+        # position is not an untracked holding, it is the rounding the close
+        # deliberately dropped, and alerting on it trains the operator to
+        # ignore this warning.
         known = {(p.condition_id, p.side) for p in opens}
         for cid, side in sorted(held - known):
             if (cid, side) in self._alerted:

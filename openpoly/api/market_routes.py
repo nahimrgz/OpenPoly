@@ -15,9 +15,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+from openpoly.api.security import require_api_token
 from openpoly.markets.manager import MarketSourceConfig
 from openpoly.markets.manager import manager as market_source_manager
 
@@ -51,7 +52,9 @@ def _build_payload() -> MarketSnapshotPayload:
     return MarketSnapshotPayload(**snap, events=events)
 
 
-@router.post("/source/start", response_model=MarketSourceResponse)
+@router.post(
+    "/source/start", response_model=MarketSourceResponse, dependencies=[Depends(require_api_token)]
+)
 async def start_source(
     config: MarketSourceConfig | None = None,
 ) -> MarketSourceResponse:
@@ -65,7 +68,9 @@ async def start_source(
     return MarketSourceResponse(ok=True, snapshot=_build_payload())
 
 
-@router.post("/source/stop", response_model=MarketSourceResponse)
+@router.post(
+    "/source/stop", response_model=MarketSourceResponse, dependencies=[Depends(require_api_token)]
+)
 async def stop_source() -> MarketSourceResponse:
     await market_source_manager.stop()
     return MarketSourceResponse(ok=True, snapshot=_build_payload())

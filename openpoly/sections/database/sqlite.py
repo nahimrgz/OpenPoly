@@ -22,6 +22,13 @@ class SqliteDatabase:
     Config = DatabaseConfig
 
     def __init__(self, config: DatabaseConfig) -> None:
+        # Construction is deliberately side-effect free. The manager is a
+        # process-wide singleton, and sections get constructed incidentally —
+        # the registry's ``CONTRACT_TEST`` builds one with *default* config on
+        # every catalog scan. Pushing the config into the manager from here
+        # would let that scan silently revert the operator's retention window.
+        # The canvas value reaches the prune loop through the lifespan wiring
+        # (``database_manager.start(config=...)`` in ``openpoly.api.main``).
         self.config = config
 
     def run(self, input: SectionInput) -> SectionOutput:
