@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/apiClient'
 import {
   defaultConfigForType,
   MOCK_RUNTIME_CATALOG,
@@ -194,7 +195,7 @@ export async function pushTemplateToBackend(
   if (expectedRev !== null) headers['If-Match'] = expectedRev
   let r: Response
   try {
-    r = await fetch(BACKEND_TEMPLATE_URL, {
+    r = await apiFetch(BACKEND_TEMPLATE_URL, {
       method: 'PUT',
       headers,
       body: JSON.stringify(template),

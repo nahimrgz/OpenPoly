@@ -6,6 +6,8 @@
  * non-URL-safe characters, but never encode the slash separator itself.
  */
 
+import { apiFetch } from '../lib/apiClient'
+
 export type StoredKey = {
   name: string
   created_at: number
@@ -41,7 +43,7 @@ async function readErrorDetail(r: Response): Promise<string> {
 }
 
 export async function createKey(name: string, value: string): Promise<StoredKey> {
-  const r = await fetch(BASE, {
+  const r = await apiFetch(BASE, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, value }),
@@ -55,7 +57,7 @@ export async function createKey(name: string, value: string): Promise<StoredKey>
 }
 
 export async function deleteKey(name: string): Promise<void> {
-  const r = await fetch(`${BASE}/${encodePath(name)}`, { method: 'DELETE' })
+  const r = await apiFetch(`${BASE}/${encodePath(name)}`, { method: 'DELETE' })
   // 204 No Content on success; 404 if missing.
   if (!r.ok && r.status !== 204) {
     throw new Error(`HTTP ${r.status}`)

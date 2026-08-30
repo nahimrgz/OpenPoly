@@ -20,23 +20,22 @@ corrigendum §C.SliceE.
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
 import time
-from typing import Awaitable, Literal, Protocol
+from typing import Awaitable, Protocol
 
 from openpoly.markets.models import normalize_gamma_market
 from openpoly.markets.polymarket_api import fetch_markets_by_condition_id
 from openpoly.portfolio import HeldPosition, PortfolioStore
 from openpoly.runtime.closing_registry import is_closing
 from openpoly.runtime.section_log import SettlementDecision, settlement_log
+from openpoly.runtime.tick_loop import State, TickLoopMonitor
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TICK_INTERVAL_SECONDS = 300  # 5 min — settlement isn't latency-sensitive
 
-State = Literal["stopped", "running"]
+__all__ = ["SettlementMonitor", "State", "settlement_monitor"]
 
 
 class _MarketFetcher(Protocol):
@@ -66,8 +65,14 @@ def _settlement_price_for_side(outcome_prices: tuple[float, float], side: str) -
     return None
 
 
-class SettlementMonitor:
-    """Timer-driven loop that closes resolved-market positions at 0/1."""
+class SettlementMonitor(TickLoopMonitor):
+    """Timer-driven loop that closes resolved-market positions at 0/1.
+
+    Lifecycle (start / stop / the loop itself) comes from ``TickLoopMonitor``;
+    everything below is settlement's own work.
+    """
+
+    LOG_NAME = "settlement monitor"
 
     def __init__(
         self,
@@ -75,57 +80,13 @@ class SettlementMonitor:
         fetcher: _MarketFetcher = fetch_markets_by_condition_id,
         tick_interval_seconds: int = DEFAULT_TICK_INTERVAL_SECONDS,
     ) -> None:
+        super().__init__(tick_interval_seconds=tick_interval_seconds)
         self._fetcher = fetcher
-        self._tick_interval = tick_interval_seconds
         self._portfolio: PortfolioStore | None = None
-        self._stop = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
-        self._state: State = "stopped"
-
-    @property
-    def state(self) -> State:
-        return self._state
 
     def configure(self, portfolio: PortfolioStore) -> None:
         """Inject PortfolioStore — FastAPI lifespan calls once DB is up."""
         self._portfolio = portfolio
-
-    # ---------- lifecycle ----------
-
-    async def start(self) -> None:
-        if self._task is not None and not self._task.done():
-            return
-        self._state = "running"
-        # Recreate the Event each start so it binds to the current loop —
-        # this module singleton may be start()ed across distinct loops in tests.
-        self._stop = asyncio.Event()
-        self._task = asyncio.create_task(self._tick_loop())
-
-    async def stop(self) -> None:
-        if self._task is None:
-            self._state = "stopped"
-            return
-        self._stop.set()
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._task = None
-            self._state = "stopped"
-
-    # ---------- loop ----------
-
-    async def _tick_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await self._tick_once()
-            except Exception:  # noqa: BLE001 — loop must survive any tick error
-                logger.exception("settlement monitor: tick failed")
-            await asyncio.sleep(0)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=self._tick_interval)
 
     # ---------- tick ----------
 

@@ -1,3 +1,5 @@
+import { apiFetch } from '../../lib/apiClient'
+
 export type LLMTestResult = {
   ok: boolean
   error: string | null
@@ -20,7 +22,7 @@ export async function testLLMConnection(args: {
 }): Promise<LLMTestResult> {
   let resp: Response
   try {
-    resp = await fetch(ENDPOINT, {
+    resp = await apiFetch(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(args),

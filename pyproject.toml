@@ -30,6 +30,8 @@ Issues = "https://github.com/KoNananachan/OpenPoly/issues"
 
 [dependency-groups]
 dev = [
+    "mypy>=1.14",
+    "pre-commit>=4.0",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff==0.15.13",
@@ -51,3 +53,15 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+# Lenient on purpose. mypy is being introduced onto a codebase that was never
+# written against it, so it runs as a NON-BLOCKING CI step (see
+# .github/workflows/ci.yml): its job right now is to report, not to gate. The
+# third-party surface (py-clob-client, sentence-transformers, web3) ships no
+# usable stubs, hence ignore_missing_imports; tightening any of this is a
+# deliberate later step, taken once the current error count is worked down.
+[tool.mypy]
+python_version = "3.12"
+files = ["openpoly"]
+ignore_missing_imports = true
+warn_unused_configs = true

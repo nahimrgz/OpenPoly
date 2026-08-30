@@ -413,6 +413,8 @@ const exitLogResponse: ExitLogResponse = {
 const closeAllResult: CloseAllResult = {
   attempted: 2,
   filled: 2,
+  // No demo position is left half-sold; a real bulk close can report some.
+  partial: 0,
   skipped: 0,
   errored: 0,
   details: positions
@@ -422,6 +424,7 @@ const closeAllResult: CloseAllResult = {
       market_id: p.market_id,
       side: p.side,
       ok: true,
+      partial: false,
       price: p.avg_entry_price,
       qty: p.qty,
     })),

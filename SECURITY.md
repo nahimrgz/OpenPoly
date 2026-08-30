@@ -32,6 +32,17 @@ and coordinated disclosure.
   the explicit opt-in.
 - **Dependencies** — known-vulnerable third-party packages.
 
+### Dependencies
+
+One pin is worth calling out explicitly: `pyproject.toml` holds
+`py-clob-client-v2==1.0.1rc1`. The Polymarket V2 client has no GA release yet,
+and it is the dependency that builds, signs, and submits real orders — a
+pre-release in that position is a standing risk, not a detail. **Adopt the GA
+release as soon as it ships**, and re-run the live smoke test against it before
+trusting it with funds. Until then, treat the RC's behavior as unpinned by any
+stability guarantee, and pin the exact version (never a range) so an
+unreviewed RC cannot arrive through a routine install.
+
 ## What's *not* a vulnerability
 
 - **Trading losses.** openPoly is a high-risk trading framework; losing money is

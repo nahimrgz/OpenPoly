@@ -14,13 +14,14 @@ The frontend is a Vite dev server that proxies API calls to the backend.
 ```bash
 # from frontend/
 yarn install
-VITE_API_PROXY_TARGET=http://127.0.0.1:18000 yarn dev
+yarn dev
 ```
 
-`VITE_API_PROXY_TARGET` points the dev server at your backend. In the default
-same-machine setup that is the local backend on `127.0.0.1:18000`; for the
-geoblock / separated-deployment setup it points at your SSH tunnel. See
-[`docs/deploy/`](../docs/deploy/) for both.
+The dev server proxies `/api` to `http://127.0.0.1:8000` by default, so no
+environment variable is needed when the backend runs on the same machine.
+`VITE_API_PROXY_TARGET` overrides the target — e.g.
+`VITE_API_PROXY_TARGET=http://127.0.0.1:18000 yarn dev` for the geoblock /
+separated-deployment SSH tunnel. See [`docs/deploy/`](../docs/deploy/) for both.
 
 ## Scripts
 
@@ -30,7 +31,13 @@ geoblock / separated-deployment setup it points at your SSH tunnel. See
 | `yarn build` | Type-check (`tsc -b`) + production build |
 | `yarn typecheck` | Type-check only, no emit |
 | `yarn lint` | ESLint |
+| `yarn test` | Vitest unit suite (`vitest run`) |
 | `yarn format` | Prettier write |
+
+Tests live next to the module they cover (`src/canvas/store.test.ts`). Vitest
+runs in the `node` environment — no jsdom — so the suite covers logic modules
+(state transitions, (de)serialization, the API client) rather than rendering.
+`src/testing/` holds the shared stubs, e.g. the in-memory `localStorage`.
 
 ## Layout
 

@@ -9,6 +9,8 @@
  */
 import { create } from 'zustand'
 
+import { apiFetch } from '../lib/apiClient'
+
 export type ExecMode = 'paper' | 'live'
 
 export type WalletConfig = {
@@ -27,21 +29,40 @@ export type SwitchModeResult =
       message?: string
     }
 
+/**
+ * One line of `POST /api/positions/close-all`'s `details`.
+ *
+ * `ok` means **flat** — the position is gone. A sell capped by the level-1
+ * bid's depth leaves the rest on the book and comes back as `ok: false` with
+ * `partial: true` and the `remaining_qty` still open, which is neither a
+ * success nor a failure: nothing went wrong, the position is just not closed
+ * yet. It is deliberately distinct from `skip_reason` (never sold) and `error`
+ * (the sell threw).
+ */
+export type CloseAllDetail = {
+  position_id: number
+  market_id: string
+  side: string
+  ok: boolean
+  /** True when the sell filled but left an open remainder. */
+  partial?: boolean
+  /** Shares still open — present only when `partial` is true. */
+  remaining_qty?: number
+  price?: number
+  qty?: number
+  skip_reason?: string
+  error?: string
+}
+
 export type CloseAllResult = {
   attempted: number
+  /** Positions that ended flat. Partials are NOT counted here. */
   filled: number
+  /** Positions whose sell filled but left a remainder on the book. */
+  partial: number
   skipped: number
   errored: number
-  details: {
-    position_id: number
-    market_id: string
-    side: string
-    ok: boolean
-    price?: number
-    qty?: number
-    skip_reason?: string
-    error?: string
-  }[]
+  details: CloseAllDetail[]
 }
 
 type WalletStore = {
@@ -100,7 +121,7 @@ export const useWalletStore = create<WalletStore>((set) => ({
   },
 
   async saveWallet(private_key_ref, funder_address) {
-    const r = await fetch('/api/wallet/config', {
+    const r = await apiFetch('/api/wallet/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ private_key_ref, funder_address }),
@@ -111,7 +132,7 @@ export const useWalletStore = create<WalletStore>((set) => ({
   },
 
   async switchMode(target) {
-    const r = await fetch('/api/system/mode', {
+    const r = await apiFetch('/api/system/mode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: target }),
@@ -132,7 +153,7 @@ export const useWalletStore = create<WalletStore>((set) => ({
   },
 
   async closeAllOpenPositions() {
-    const r = await fetch('/api/positions/close-all', { method: 'POST' })
+    const r = await apiFetch('/api/positions/close-all', { method: 'POST' })
     const result = await jsonOr<CloseAllResult>(r)
     const remaining = Math.max(
       0,

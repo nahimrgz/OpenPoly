@@ -51,11 +51,30 @@ uv run ruff format .
 # Frontend (from frontend/)
 yarn typecheck
 yarn lint
+yarn test
 ```
 
 CI **blocks merges** on `ruff check` + `pytest` (backend) and `yarn typecheck` +
-`yarn lint` (frontend). `ruff format` is **not** a CI gate — run it locally to
-keep formatting consistent, but it won't fail your PR.
+`yarn lint` + `yarn test` (frontend). `ruff format` is **not** a CI gate — run it
+locally to keep formatting consistent, but it won't fail your PR. `mypy` runs in
+CI too, also **non-blocking**: the codebase predates it, so it reports rather
+than gates. Don't add new errors to files you touch; see `[tool.mypy]` in
+`pyproject.toml`.
+
+### Pre-commit hooks (optional but recommended)
+
+`.pre-commit-config.yaml` wires the two ruff commands above onto staged files,
+so a PR never fails CI on a lint error you could have caught locally. It runs
+them through `uv run`, using the ruff version already pinned in `pyproject.toml`
+— one pin, no second version to keep in sync.
+
+```bash
+uv run pre-commit install       # once, per clone
+uv run pre-commit run --all-files
+```
+
+The format hook rewrites files in place and fails the commit when it changes
+something; re-stage and commit again.
 
 If you added a **section**, also:
 

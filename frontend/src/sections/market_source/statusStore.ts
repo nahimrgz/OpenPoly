@@ -9,6 +9,8 @@
  */
 import { create } from 'zustand'
 
+import { apiFetch } from '../../lib/apiClient'
+
 export type SourceState = 'stopped' | 'running' | 'error'
 
 export type LogEvent = {
@@ -99,7 +101,7 @@ export const useMarketSourceStatusStore = create<StoreState>((set, get) => ({
     return inflight
   },
   start: async (config) => {
-    const r = await fetch(START_ENDPOINT, {
+    const r = await apiFetch(START_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
@@ -110,7 +112,7 @@ export const useMarketSourceStatusStore = create<StoreState>((set, get) => ({
     return body
   },
   stop: async () => {
-    const r = await fetch(STOP_ENDPOINT, { method: 'POST' })
+    const r = await apiFetch(STOP_ENDPOINT, { method: 'POST' })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const body = (await r.json()) as ApiResponse
     set({ snapshot: body.snapshot, status: 'ready', error: null })

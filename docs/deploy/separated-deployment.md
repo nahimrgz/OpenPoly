@@ -175,8 +175,10 @@ ssh openpoly-vps 'journalctl -u openpoly -n 50 --no-pager'
 
 0. Set `OPENPOLY_API_TOKEN` in `/opt/openpoly/.env` and restart — the switch to
    live is refused with 403 `api_token_required` while the API is
-   unauthenticated. Send it as `X-OpenPoly-Token` on every mutating call (the
-   Swagger UI's "Try it out" lets you add the header per request).
+   unauthenticated. Use an ASCII-only value. Send it as `X-OpenPoly-Token` on
+   every mutating call (the Swagger UI's "Try it out" lets you add the header
+   per request); in the web UI, paste it into **Keys → API token** once and it
+   is attached for you.
 1. Confirm a clean paper boot (smoke test above).
 2. Open the Swagger UI over the tunnel → `POST /api/system/mode` `{"mode":"live"}`.
 3. Preflight runs: derives API creds and checks pUSD balance + V2 allowances.

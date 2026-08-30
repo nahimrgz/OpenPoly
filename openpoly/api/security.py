@@ -1,4 +1,4 @@
-"""API hardening — shared-secret token on mutating routes + Host allowlist.
+"""API hardening — shared-secret token, Host allowlist, cross-origin write guard.
 
 The backend is designed to bind loopback (see ``docs/deploy``), and that was
 the whole of its access control: every route was open to anything that could
@@ -10,7 +10,7 @@ SSH tunnel, and any web page the operator has open that can be talked into
 issuing a cross-origin request to ``127.0.0.1`` under a hostname that resolves
 there (DNS rebinding).
 
-Two independent guards, because they answer different questions:
+Three independent guards, because they answer different questions:
 
 * **Token** — *who is calling?* An optional shared secret in the
   ``X-OpenPoly-Token`` header, checked by a dependency on every route that
@@ -20,6 +20,24 @@ Two independent guards, because they answer different questions:
   induced to send a request to a loopback service, but it cannot forge the
   ``Host`` header. Refusing every host that is not loopback or explicitly
   allowed is what makes the rebinding path a 421 instead of a live-mode switch.
+* **Cross-origin write guard** — *whose page issued this?* The Host allowlist
+  admits loopback by design, and a body-less ``POST`` is a CORS *simple
+  request*: the browser sends it, and only refuses the caller sight of the
+  *response*. ``fetch('http://127.0.0.1:8000/api/positions/close-all',
+  {method:'POST'})`` from any page the operator has open therefore reaches the
+  route and bulk-closes the book, with the token unset (the loopback default)
+  or — worse — with it set, because a browser attaches no header it was not
+  asked to and the request still runs if the token is unset. The response never
+  reaching the attacker does not undo the sell. So every mutating request that
+  a browser labels cross-origin is refused before it reaches a route:
+  ``Sec-Fetch-Site: cross-site`` is refused outright without consulting the
+  ``Origin``; ``same-origin`` and ``none`` pass; ``same-site`` and any value
+  this module does not know settle nothing and fall through to the ``Origin``,
+  which must name the same authority — host **and** port — as the request's own
+  ``Host``, or be listed in ``OPENPOLY_ALLOWED_HOSTS``. Loopback is *not*
+  admitted port-free on that fall-through: it is the one authority every local
+  page shares, so a free pass there is what would let ``localhost:3000`` drive
+  ``localhost:8000``. See ``cross_origin_write_refusal`` for the exact order.
 
 Leaving the token unset keeps the local development workflow (backend on
 127.0.0.1, Vite proxy in front of it) working exactly as before — but it is
@@ -50,6 +68,23 @@ logger = logging.getLogger(__name__)
 API_TOKEN_ENV = "OPENPOLY_API_TOKEN"
 API_TOKEN_HEADER = "X-OpenPoly-Token"
 ALLOWED_HOSTS_ENV = "OPENPOLY_ALLOWED_HOSTS"
+
+# Fetch-metadata + Origin, the two headers a browser attaches to a cross-origin
+# write. Lower-case because Starlette's ``Headers`` lookup is case-insensitive
+# but the constants are also used in log lines and tests.
+SEC_FETCH_SITE_HEADER = "sec-fetch-site"
+SEC_FETCH_SITE_CROSS = "cross-site"
+ORIGIN_HEADER = "origin"
+
+# The only ``Sec-Fetch-Site`` values that name *this* origin. ``same-site`` is
+# deliberately absent: it means "same registrable domain", which every
+# ``localhost:<port>`` shares with every other, so it vouches for nothing a
+# mutating request can be trusted on. It falls through to the Origin check.
+SEC_FETCH_SITE_SELF = frozenset({"same-origin", "none"})
+
+# Ports implied by a scheme, so ``http://host`` and ``Host: host`` compare equal.
+_DEFAULT_PORTS = {"http": "80", "https": "443"}
+_IMPLIED_PORTS = frozenset(_DEFAULT_PORTS.values())
 
 # HTTP methods that change state. Everything here is guarded; GET / HEAD /
 # OPTIONS are not.
@@ -239,13 +274,163 @@ def host_allowed(raw_host: str) -> bool:
     return host in allowed_hosts()
 
 
+# ---------- cross-origin write guard ----------
+
+
+def _split_authority(raw: str) -> tuple[str, str | None] | None:
+    """``host[:port]`` → ``(hostname, port or None)``, or ``None`` for no host.
+
+    Shares ``_hostname``'s spelling of an IPv6 literal, so ``[::1]:8000`` splits
+    into ``("[::1]", "8000")`` and a bare ``::1`` keeps all of its colons.
+    """
+    value = raw.strip().lower()
+    host = _hostname(value)
+    if not host:
+        return None
+    rest = value[len(host) :]
+    if rest.startswith(":"):
+        port = rest[1:]
+        return (host, port) if port else (host, None)
+    return host, None
+
+
+def _origin_authority(raw_origin: str) -> tuple[str, str | None] | None:
+    """``Origin`` header → ``(hostname, port)``, the port filled in from the
+    scheme when the header omits it. ``None`` when the value names no origin.
+
+    ``null`` — what a sandboxed iframe, a ``data:`` document and some redirect
+    chains send — and any syntactically broken value both yield ``None``. The
+    header was present and does not name an origin this backend serves, which
+    is a refusal; treating it as "no Origin at all" would make the sandbox the
+    way around the guard.
+    """
+    value = raw_origin.strip()
+    if not value or value.lower() == "null":
+        return None
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        return None
+    parts = _split_authority(rest.split("/", 1)[0])
+    if parts is None:
+        return None
+    host, port = parts
+    return host, port if port is not None else _DEFAULT_PORTS.get(scheme.strip().lower())
+
+
+def _same_authority(origin_parts: tuple[str, str | None], raw_host: str) -> bool:
+    """Whether an Origin and the request's ``Host`` name the same authority.
+
+    Host and port both, which is the whole point: ``localhost:3000`` and
+    ``localhost:8000`` are one *site* but two *origins*, and only the origin
+    boundary is the one a page cannot cross.
+    """
+    host_parts = _split_authority(raw_host)
+    if host_parts is None:
+        return False
+    if origin_parts[0] != host_parts[0]:
+        return False
+    if host_parts[1] is None:
+        # No port on the Host header: the request arrived on the scheme's
+        # default port, so an Origin naming that default is the same origin.
+        return origin_parts[1] is None or origin_parts[1] in _IMPLIED_PORTS
+    return origin_parts[1] == host_parts[1]
+
+
+def _origin_allowlisted(origin_parts: tuple[str, str | None]) -> bool:
+    """Whether ``OPENPOLY_ALLOWED_HOSTS`` names this origin explicitly.
+
+    Only the operator's own entries count — loopback is *not* implied here the
+    way it is for the ``Host`` check. Loopback is the one authority every local
+    page shares, so admitting it by default is what let a page on
+    ``localhost:3000`` write to ``localhost:8000``. An entry may be a bare host
+    (any port of it) or ``host:port`` (that origin only).
+    """
+    entries = {part.strip().lower() for part in os.environ.get(ALLOWED_HOSTS_ENV, "").split(",")}
+    if _ALLOWLIST_WILDCARD in entries:
+        return True
+    host, port = origin_parts
+    if host in entries:
+        return True
+    return port is not None and f"{host}:{port}" in entries
+
+
+def cross_origin_write_refusal(method: str, headers: Headers) -> str | None:
+    """Why this mutating request is refused, or ``None`` when it may proceed.
+
+    Read the two headers in the order of how much they know:
+
+    1. ``Sec-Fetch-Site`` is set by the browser and cannot be set by page
+       script. ``cross-site`` is the browser saying, unforgeably, that the
+       initiator was another site — refuse, without consulting the Origin.
+       ``same-origin`` and ``none`` (a typed-in URL) name this very origin and
+       settle the question the other way. ``same-site`` settles nothing: it
+       only says the registrable domain matches, and *every* ``localhost:<port>``
+       is same-site with every other, so a page on a dev server one port over
+       would otherwise drive this backend. It — and any value this code does not
+       know — falls through to the Origin check below. Failing open on an
+       unknown label would make the next header value the browsers add a hole.
+    2. ``Origin`` decides the fall-through and is the only signal older clients
+       send. It passes when it names the same authority (host **and** port,
+       with a scheme's default port implied) as the request's own ``Host``, or
+       when the operator listed it in ``OPENPOLY_ALLOWED_HOSTS``.
+
+    Neither header present → pass. That is ``curl``, a systemd timer, a Python
+    client, an old browser — none of which carry a hostile page's authority.
+    The guard's job is to stop a *browser* being used as a confused deputy, and
+    a browser always sends at least one of the two on a cross-origin write.
+
+    The reason is returned rather than a bare bool because the two refusals are
+    fixed differently, and a 403 that names the wrong knob sends the operator
+    to edit a setting that would not have changed the answer.
+    """
+    if method.upper() not in MUTATING_METHODS:
+        return None
+    site = headers.get(SEC_FETCH_SITE_HEADER)
+    if site is not None:
+        value = site.strip().lower()
+        if value == SEC_FETCH_SITE_CROSS:
+            return (
+                "this browser labelled the request cross-site "
+                "(Sec-Fetch-Site: cross-site): a page on another site may not "
+                "issue state changes here. Drive this backend from its own UI, "
+                "or from a client that is not a browser."
+            )
+        if value in SEC_FETCH_SITE_SELF:
+            return None
+    origin = headers.get(ORIGIN_HEADER)
+    if origin is None:
+        return None
+    parts = _origin_authority(origin)
+    if parts is not None and (
+        _same_authority(parts, headers.get("host", "")) or _origin_allowlisted(parts)
+    ):
+        return None
+    return (
+        "mutating requests must come from this backend's own origin (host and "
+        f"port both). Origin {origin.strip()[:100]!r} does not match Host "
+        f"{headers.get('host', '')[:100]!r}; add that origin's host — or "
+        f"host:port — to {ALLOWED_HOSTS_ENV} if it is meant to drive this "
+        "backend."
+    )
+
+
+def cross_origin_write(method: str, headers: Headers) -> bool:
+    """Whether this request is a state change issued from another origin."""
+    return cross_origin_write_refusal(method, headers) is not None
+
+
 class HostAllowlistMiddleware:
-    """Reject requests whose ``Host`` is neither loopback nor allowlisted.
+    """Reject a request whose ``Host`` is neither loopback nor allowlisted, and
+    any mutating request a browser labels cross-origin.
 
     A plain ASGI middleware rather than ``BaseHTTPMiddleware``: it has to run
     before anything else touches the request, and it never needs the body.
-    Answers **421 Misdirected Request** — the status that means "this server is
-    not the one for that authority", which is precisely the situation.
+
+    Two different refusals, because they are two different mistakes.
+    **421 Misdirected Request** means "this server is not the one for that
+    authority" — the DNS-rebinding shape. **403 Forbidden** means "this server
+    is the right one, but that page may not write to it" — the cross-site
+    ``fetch`` shape, which reaches a correct Host by design.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -255,22 +440,42 @@ class HostAllowlistMiddleware:
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
-        raw_host = Headers(scope=scope).get("host", "")
-        if host_allowed(raw_host):
-            await self.app(scope, receive, send)
+        headers = Headers(scope=scope)
+        raw_host = headers.get("host", "")
+        if not host_allowed(raw_host):
+            logger.warning("rejected request with disallowed Host header: %r", raw_host[:100])
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            response = JSONResponse(
+                {
+                    "error": "host_not_allowed",
+                    "message": (
+                        f"Host {_hostname(raw_host)!r} is not allowed; add it to "
+                        f"{ALLOWED_HOSTS_ENV} if this backend is meant to serve it"
+                    ),
+                },
+                status_code=421,
+            )
+            await response(scope, receive, send)
             return
-        logger.warning("rejected request with disallowed Host header: %r", raw_host[:100])
-        if scope["type"] == "websocket":
-            await send({"type": "websocket.close", "code": 1008})
-            return
-        response = JSONResponse(
-            {
-                "error": "host_not_allowed",
-                "message": (
-                    f"Host {_hostname(raw_host)!r} is not allowed; add it to "
-                    f"{ALLOWED_HOSTS_ENV} if this backend is meant to serve it"
-                ),
-            },
-            status_code=421,
-        )
-        await response(scope, receive, send)
+        if scope["type"] == "http":
+            refusal = cross_origin_write_refusal(scope.get("method", ""), headers)
+            if refusal is not None:
+                logger.warning(
+                    "rejected cross-origin %s %s (Origin=%r, Sec-Fetch-Site=%r)",
+                    scope.get("method", ""),
+                    scope.get("path", ""),
+                    headers.get(ORIGIN_HEADER, "")[:100],
+                    headers.get(SEC_FETCH_SITE_HEADER, "")[:40],
+                )
+                # The body carries the reason for *this* decision: the two
+                # refusal paths are fixed differently, and the allowlist cannot
+                # undo a cross-site label.
+                response = JSONResponse(
+                    {"error": "cross_origin_write", "message": refusal},
+                    status_code=403,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)

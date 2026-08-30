@@ -39,7 +39,7 @@ paper→live, `PUT /api/wallet/config` repoints the signing key, and
 that can open a socket to the loopback port, which includes every other process
 on the host and anything sharing your SSH tunnel.
 
-Two guards now sit in front of that, answering different questions.
+Three guards now sit in front of that, answering different questions.
 
 ### `OPENPOLY_API_TOKEN` — who is calling
 
@@ -75,11 +75,21 @@ Leaving it unset keeps the local development loop exactly as it was. It cannot
 be left unset for live trading: real funds behind an unauthenticated endpoint is
 not a state anyone should reach by omission, so the switch is refused outright.
 
-> **Web UI caveat.** The frontend does not yet attach the header, so with a
-> token configured its mutating actions (canvas save, manual close, mode switch)
-> will get 401. Either run the UI against a backend with the token unset, or
-> drive the gated routes from `curl` / the Swagger UI. Reads — the canvas,
-> Inspector, positions, logs — are unaffected either way.
+> **Use ASCII characters only.** An HTTP header value cannot carry a code point
+> above `U+00FF`, and the browser's `fetch` throws a `TypeError` rather than
+> sending one — so a token with an accent or an emoji in it turns *every*
+> mutating request from the web UI into a client-side crash, not a 401. The
+> backend compares UTF-8 bytes and would accept such a token from `curl`, which
+> makes the failure look like a UI bug rather than a token you cannot type. Keep
+> it to printable ASCII; `secrets.token_urlsafe` above already does.
+
+**Setting it in the web UI.** Open **Keys → API token** and paste the same value
+you gave the backend. It is stored in that browser's `localStorage` (key
+`openpoly_api_token`) and attached as `X-OpenPoly-Token` to mutating requests
+only — reads keep the shape they always had. It lives in the browser rather than
+in the backend secret store because it is the credential *for* that store, so it
+cannot be kept behind it. Each browser needs its own copy; clearing site data
+clears it.
 
 ### `OPENPOLY_ALLOWED_HOSTS` — what name they used
 
@@ -94,14 +104,78 @@ rejection instead of a live-mode switch.
 OPENPOLY_ALLOWED_HOSTS=openpoly.internal.example.com
 ```
 
-The default loopback and SSH-tunnel setups need no entry: Vite's proxy forwards
-the browser's own `Host`, which is `localhost:5173` or `127.0.0.1:5173`. If you
+The default loopback and SSH-tunnel setups need no entry: Vite's proxy is
+configured with `changeOrigin: false` (`frontend/vite.config.ts`), so it
+forwards the browser's own `Host` — `localhost:5173` or `127.0.0.1:5173` —
+rather than rewriting it to the proxy target. That is deliberate, and the
+`Origin` section below says why. If you
 run the dev server with `--host` and open the UI from another machine on the
 LAN, that machine's URL becomes the Host and you must add it here. `*` disables
-the check; make that a deliberate choice, not a default. There is deliberately **no
+the check; make that a deliberate choice, not a default. The `Host` check
+matches on hostname alone, so an entry that pins a port (`host:port`, see the
+`Origin` section below) counts only for the `Origin` check — list the bare
+hostname as well if the backend is also *reached* under that name. There is deliberately **no
 CORS allowance** — the frontend is same-origin through Vite's proxy, and a
 permissive `Access-Control-Allow-Origin` would hand back exactly what the Host
 allowlist takes away.
+
+### Origin / `Sec-Fetch-Site` — whose page issued this
+
+The Host allowlist admits loopback by design, and a body-less `POST` is a CORS
+*simple request*: the browser sends it and only refuses the caller sight of the
+**response**. So this, from any page you happen to have open —
+
+```js
+fetch('http://127.0.0.1:8000/api/positions/close-all', { method: 'POST' })
+```
+
+— used to reach the route and bulk-close the book. The attacker never saw the
+answer, which does not undo the sell. The token is no defence either: a browser
+attaches no header it was not asked to, and with the token unset (the loopback
+default) nothing was being checked at all.
+
+Every **mutating** request that does not come from this backend's own origin is
+therefore refused with **403 `cross_origin_write`**, before it reaches any
+route:
+
+- `Sec-Fetch-Site: cross-site` → refused outright. The browser sets this header
+  and page script cannot. The `Origin` is not consulted, so the allowlist below
+  cannot undo this refusal — the 403 body says so.
+- `Sec-Fetch-Site: same-origin` or `none` (a typed-in URL) → allowed. Both name
+  this very origin.
+- `Sec-Fetch-Site: same-site`, any value not listed above, or no fetch metadata
+  at all → decided by the `Origin`. **`same-site` is not `same-origin`**: it
+  only means the registrable domain matches, and every `localhost:<port>` is
+  same-site with every other one, so a page served by any dev server or local
+  tool on `localhost:3000` would otherwise be able to drive the backend on
+  `localhost:8000` with the token unset.
+- An `Origin` is allowed when it names the **same authority — host *and* port**
+  — as the request's own `Host` (a scheme's default port is implied on both
+  sides, so `https://host` matches `Host: host`), or when the operator listed
+  it in `OPENPOLY_ALLOWED_HOSTS`. Anything else is refused, including
+  `Origin: null` (sandboxed iframe, `data:` document), which counts as refused
+  rather than absent. Loopback gets no free pass here: it is the one authority
+  every local page shares.
+- **Neither header present → allowed.** `curl`, a systemd timer and a Python
+  client carry no hostile page's authority, and the guard exists to stop a
+  browser being used as a confused deputy. Scripted use is unaffected.
+
+Reads are not guarded: a cross-origin `GET` leaks nothing the browser will hand
+back anyway.
+
+`OPENPOLY_ALLOWED_HOSTS` is the escape hatch for a UI served from somewhere
+else. An entry may be a bare host (`openpoly.internal.example.com` — admits it
+as an `Origin` on any port) or pin the port (`openpoly.internal.example.com:5173`,
+`localhost:3000` — admits that origin only). The default Vite setup needs no
+entry: the proxy forwards the browser's own `Host` (`changeOrigin: false` in
+`frontend/vite.config.ts`), so a canvas save arrives with `Origin:
+http://localhost:5173` against `Host: localhost:5173` and is same-authority on
+the `Origin` check alone. Vite's `'/api': target` shorthand would instead
+normalize to `changeOrigin: true` and rewrite the `Host` to the proxy target,
+which only stays working for browsers that send `Sec-Fetch-Site: same-origin`
+— a client without fetch metadata would be 403'd on every mutation. If you put
+your own reverse proxy in front of the backend, either preserve the browser's
+`Host` the same way or add the UI's origin to `OPENPOLY_ALLOWED_HOSTS`.
 
 ## Disk growth
 

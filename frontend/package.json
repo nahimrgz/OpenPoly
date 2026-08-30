@@ -15,6 +15,7 @@
     "build": "tsc -b && vite build",
     "demo:build": "vite build --config vite.config.demo.ts",
     "lint": "eslint .",
+    "test": "vitest run",
     "typecheck": "tsc -b --noEmit",
     "format": "prettier --write .",
     "preview": "vite preview"
@@ -47,6 +48,7 @@
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
     "vite": "^8.0.12",
-    "vite-plugin-singlefile": "^2.3.3"
+    "vite-plugin-singlefile": "^2.3.3",
+    "vitest": "^4.1.11"
   }
 }

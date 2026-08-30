@@ -5,6 +5,7 @@
  * so secrets can be managed without leaving the canvas. Opened from the
  * CanvasTopBar "Keys" button; backdrop click closes.
  */
+import { ApiTokenPanel } from '../setting/ApiTokenPanel'
 import { StoredKeysPanel } from '../setting/StoredKeysPanel'
 import { WalletPanel } from '../setting/WalletPanel'
 
@@ -41,6 +42,7 @@ export function KeysDrawer({
           </button>
         </div>
         <div className="p-5 flex flex-col gap-5">
+          <ApiTokenPanel />
           <WalletPanel />
           <StoredKeysPanel />
         </div>

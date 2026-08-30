@@ -10,6 +10,69 @@ Dates are US-style (MM/DD/YYYY).
 
 ---
 
+## 08/30/2026 — Phase 4: the canvas can now tell you the truth about the strategy
+
+Phase 4 is mostly engineering — a test framework, a base class, docs, hooks —
+and that is out of scope for this file. Three of its changes are not, because
+they change what the operator is told about the strategy, and what a page in
+another tab is allowed to do to it.
+
+**The canvas' offline catalog was advertising a strategy that no longer
+exists.** `frontend/src/sections/catalog.ts` carries a fallback copy of the
+section catalog, used whenever the backend is unreachable, and
+`defaultConfigForType` seeds a new node's config from it. It still described
+`exit` at v0.1.0 as two knobs — `take_profit_pct` and `stop_loss_pct` — which
+is the strategy as it stood before the trailing lock existed. An operator
+reading that panel saw a system that takes profit at +20% and has no trailing
+behaviour at all, when the shipped exit (v0.3.0) has take-profit **off**, arms
+a trailing lock at +30% of cost basis, and floors the trail at two ticks or the
+live spread. `entry` was three versions stale in the same way: no
+`size_edge_multiplier_max`, no `heat_cap_usd`, none of the A4 kill switches.
+Both entries are now mirrored field-for-field from the pydantic Configs,
+defaults and descriptions included, at the versions actually running.
+
+**A bulk close that half-worked said it had failed.** `POST
+/api/positions/close-all` started reporting partials under their own counter in
+Phase 3, but the mode-switch dialog still folded them into `skipped + errored`
+— and because a partial carries neither a `skip_reason` nor an `error`, it
+rendered as `1 failed (unknown)`. The operator pressing "close all" to be out
+of the market was told the sell had not happened when it had, on the one screen
+where that question is the entire point. Partials now read as *N partially
+closed, remainder open*, with the residual share count, and only genuine skips
+and errors count as failures.
+
+**Any web page could close your book.** A body-less `POST` is a CORS *simple
+request*: the browser issues it for real and only withholds the response. The
+Host allowlist admits loopback by design, so
+`fetch('http://127.0.0.1:8000/api/positions/close-all', {method:'POST'})` from
+any page the operator happened to have open reached the route and sold
+everything — with the API token unset (the loopback default), and equally with
+it set, because a browser attaches no header it was not asked to. Never seeing
+the response does not undo the sell. Every mutating request a browser labels
+cross-origin is now refused **403 cross_origin_write** before it reaches a
+route. `Sec-Fetch-Site: cross-site` is refused outright, without consulting the
+`Origin`; `same-origin` and `none` settle it the other way. `same-site` — and
+any value this code does not know — settles nothing and falls through to the
+`Origin`, which must name the **same authority, host *and* port**, as the
+request's own `Host`, or be listed in `OPENPOLY_ALLOWED_HOSTS`. Loopback gets
+no port-free pass on that check: it is the one authority every local page
+shares, so admitting it would let a dev server on `localhost:3000` drive the
+backend on `localhost:8000`. `curl`, systemd timers and other non-browser
+clients send neither header and are unaffected. The web UI, in turn, now sends the API
+token: paste it once into **Keys → API token** (ASCII only — an HTTP header
+cannot carry anything else).
+
+Everything else in Phase 4 is engineering and leaves behaviour unchanged: a
+vitest suite over the canvas store and template (de)serialization (blocking in
+CI), a shared `TickLoopMonitor` base for the three runtime monitors, the
+module-scope monkey-patched methods folded back into their classes, mypy and
+pre-commit wired up, and
+[docs/architecture/07-runtime-monitors.md](docs/architecture/07-runtime-monitors.md)
+documenting the runtime — including that `bootstrap_peaks` is **not wired**, so
+trailing-stop peaks reset on every restart.
+
+---
+
 ## 08/30/2026 — Phase 3: what counts as a real outcome, and who is allowed to trade
 
 Nothing here changes an entry or exit threshold. What changed is which numbers

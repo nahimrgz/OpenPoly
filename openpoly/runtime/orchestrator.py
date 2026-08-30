@@ -122,6 +122,26 @@ class PipelineOrchestrator:
             self._worker_task = None
             self._state = "stopped"
 
+    # ---------- canvas-sync v2: hot-reload section swap ----------
+
+    async def replace_section(self, section_type: str, new_inst: _SyncSection) -> None:
+        """Atomically swap one section instance while the pipeline runs.
+
+        Held under ``_sections_lock`` so a swap cannot interleave with the
+        read in ``_process``. An item already inside a section's ``run`` keeps
+        the old instance alive through its own reference; the next item reads
+        the attribute again and gets the new one.
+        """
+        async with self._sections_lock:
+            if section_type == "embedding":
+                self._embedding = new_inst
+            elif section_type == "analyzer":
+                self._analyzer = new_inst
+            elif section_type == "entry":
+                self._entry = new_inst
+            else:
+                raise ValueError(f"unknown orchestrator section_type: {section_type!r}")
+
     # ---------- enqueue (sync, called from ws_client hook) ----------
 
     def enqueue(self, item: NewsItem) -> bool:
@@ -455,23 +475,3 @@ async def replace_section(section_type: str, new_inst: _SyncSection) -> None:
     if _singleton is None:
         return
     await _singleton.replace_section(section_type, new_inst)
-
-
-# Patch the class with the swap method (kept here, not next to __init__,
-# so the lock-protected reload code path is co-located with the module-level
-# helper above for a single point of canvas-sync logic to review).
-async def _replace_section_impl(
-    self: PipelineOrchestrator, section_type: str, new_inst: _SyncSection
-) -> None:
-    async with self._sections_lock:
-        if section_type == "embedding":
-            self._embedding = new_inst
-        elif section_type == "analyzer":
-            self._analyzer = new_inst
-        elif section_type == "entry":
-            self._entry = new_inst
-        else:
-            raise ValueError(f"unknown orchestrator section_type: {section_type!r}")
-
-
-PipelineOrchestrator.replace_section = _replace_section_impl  # type: ignore[attr-defined]

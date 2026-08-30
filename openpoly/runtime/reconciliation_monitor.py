@@ -30,30 +30,35 @@ Reuses ``settlement_log`` for observability (same close-to-match-reality shape);
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
 import time
-from typing import Awaitable, Callable, Literal
+from typing import Awaitable, Callable
 
 from openpoly.portfolio import PortfolioStore
 from openpoly.runtime.closing_registry import is_closing
 from openpoly.runtime.section_log import SettlementDecision, settlement_log
+from openpoly.runtime.tick_loop import State, TickLoopMonitor
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TICK_INTERVAL_SECONDS = 300  # 5 min — divergence isn't latency-sensitive
 DEFAULT_GRACE_SECONDS = 300  # don't reconcile a buy younger than this
 
-State = Literal["stopped", "running"]
+__all__ = ["ReconciliationMonitor", "State", "reconciliation_monitor"]
 
 # Async callable returning the set of (condition_id, side) the wallet holds
 # on-chain, side ∈ {"yes", "no"}.
 HoldingsFetcher = Callable[[], Awaitable["set[tuple[str, str]]"]]
 
 
-class ReconciliationMonitor:
-    """Timer-driven loop that closes positions flat on-chain as ``reconciled``."""
+class ReconciliationMonitor(TickLoopMonitor):
+    """Timer-driven loop that closes positions flat on-chain as ``reconciled``.
+
+    Lifecycle (start / stop / the loop itself) comes from ``TickLoopMonitor``;
+    everything below is reconciliation's own work.
+    """
+
+    LOG_NAME = "reconciliation monitor"
 
     def __init__(
         self,
@@ -63,8 +68,8 @@ class ReconciliationMonitor:
         grace_seconds: int = DEFAULT_GRACE_SECONDS,
         live_check: Callable[[], bool] | None = None,
     ) -> None:
+        super().__init__(tick_interval_seconds=tick_interval_seconds)
         self._fetcher = holdings_fetcher
-        self._tick_interval = tick_interval_seconds
         self._grace = grace_seconds
         # Safety gate: reconciliation compares DB positions against the wallet's
         # real on-chain holdings, which is only meaningful in live mode. In paper
@@ -73,56 +78,14 @@ class ReconciliationMonitor:
         # this to ``exec_mode == "live"``.
         self._live_check = live_check
         self._portfolio: PortfolioStore | None = None
-        self._stop = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
-        self._state: State = "stopped"
         # Reverse-diff alert dedup: (condition_id, side) pairs already flagged
         # as untracked this process lifetime — one loud alert per orphan, not
         # one per tick.
         self._alerted: set[tuple[str, str]] = set()
 
-    @property
-    def state(self) -> State:
-        return self._state
-
     def configure(self, portfolio: PortfolioStore) -> None:
         """Inject PortfolioStore — FastAPI lifespan calls once DB is up."""
         self._portfolio = portfolio
-
-    # ---------- lifecycle ----------
-
-    async def start(self) -> None:
-        if self._task is not None and not self._task.done():
-            return
-        self._state = "running"
-        self._stop = asyncio.Event()
-        self._task = asyncio.create_task(self._tick_loop())
-
-    async def stop(self) -> None:
-        if self._task is None:
-            self._state = "stopped"
-            return
-        self._stop.set()
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._task = None
-            self._state = "stopped"
-
-    # ---------- loop ----------
-
-    async def _tick_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await self._tick_once()
-            except Exception:  # noqa: BLE001 — loop must survive any tick error
-                logger.exception("reconciliation monitor: tick failed")
-            await asyncio.sleep(0)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=self._tick_interval)
 
     # ---------- tick ----------
 

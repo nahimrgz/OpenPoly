@@ -1,0 +1,30 @@
+# Pre-commit hooks — the same two ruff commands CI runs, on the files you are
+# about to commit.
+#
+# Local `uv run` hooks rather than the upstream ruff mirror on purpose: the ruff
+# version is already pinned in `pyproject.toml`'s dev group, and a mirror `rev`
+# is a second place to bump it — which is exactly how a hook starts disagreeing
+# with CI. This way there is one pin.
+#
+# Install once:  uv run pre-commit install
+# Run manually:  uv run pre-commit run --all-files
+#
+# Formatting is a fix-in-place hook: it rewrites the file and fails the commit,
+# so you re-stage and commit again. That mirrors CI, where the format check is
+# informational and only lint is a gate.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true

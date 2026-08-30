@@ -1,3 +1,5 @@
+import { apiFetch } from '../lib/apiClient'
+
 export type TestConnectionResult = {
   ok: boolean
   error: string | null
@@ -18,7 +20,7 @@ export async function testNewsConnection(args: {
 }): Promise<TestConnectionResult> {
   let resp: Response
   try {
-    resp = await fetch(ENDPOINT, {
+    resp = await apiFetch(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

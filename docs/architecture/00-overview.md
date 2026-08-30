@@ -17,11 +17,17 @@ live trading kicks in at M4 against Polygon mainnet only.
 |---|---|---|
 | Backend | Python + FastAPI, single process | shared language with strategy logic |
 | DB | SQLite | single system, single writer — zero infra |
-| Polymarket SDK | `py-clob-client` | official client (order placement) |
+| Polymarket SDK | `py-clob-client-v2` | official client (order placement) |
 | Frontend | React + React Flow | strategy canvas UI |
 
 openPoly is a **single system** — one process, one pipeline, one SQLite file.
 See [01-isolation.md](01-isolation.md).
+
+> **The Polymarket SDK is pinned to a release candidate.** `pyproject.toml`
+> pins `py-clob-client-v2==1.0.1rc1` — the V2 client has no GA release yet, and
+> it is the code path that signs and submits real orders. Adopt the GA version
+> as soon as it ships, and re-run the live smoke test when you do; see
+> [SECURITY.md](../../SECURITY.md#dependencies).
 
 ## License & ethos
 
@@ -46,3 +52,4 @@ See [01-isolation.md](01-isolation.md).
 - [04-wallet-config.md](04-wallet-config.md) — wallet config (single prod wallet, M4)
 - [05-runtime-network-risk.md](05-runtime-network-risk.md) — network scope, risk budget, exit policy
 - [06-polymarket-api.md](06-polymarket-api.md) — Gamma / CLOB / Data API surfaces and how openPoly uses them
+- [07-runtime-monitors.md](07-runtime-monitors.md) — the timer-driven exit / settlement / reconciliation loops, the executor dispatcher, entry-side brakes

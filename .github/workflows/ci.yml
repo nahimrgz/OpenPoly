@@ -38,8 +38,15 @@ jobs:
         run: uv run ruff format --check .
         continue-on-error: true
 
+      # Intentionally NOT a gate: mypy is new to a codebase that predates it, so
+      # it reports rather than blocks. Config (lenient on purpose) lives in
+      # pyproject.toml under [tool.mypy]. Tighten it, then promote this step.
+      - name: mypy (informational)
+        run: uv run mypy
+        continue-on-error: true
+
   frontend:
-    name: frontend (typecheck)
+    name: frontend (typecheck + lint + tests)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -64,3 +71,7 @@ jobs:
       # Blocking gate — ESLint must pass (errors cleared).
       - name: Lint
         run: yarn lint
+
+      # Blocking gate — vitest unit suite (canvas store + template (de)serialization).
+      - name: Tests
+        run: yarn test

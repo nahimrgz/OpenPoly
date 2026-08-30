@@ -36,11 +36,10 @@ orchestrator uses for its blocking section calls (docs/architecture/05).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import time
-from typing import Literal, Protocol
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -55,6 +54,7 @@ from openpoly.markets.store import MarketStore
 from openpoly.portfolio import HeldPosition, PortfolioStore
 from openpoly.runtime.closing_registry import clear_closing, mark_closing
 from openpoly.runtime.section_log import ExitDecision, exit_log
+from openpoly.runtime.tick_loop import State, TickLoopMonitor
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.exit.threshold_v0 import (
     CloseIntent,
@@ -82,7 +82,7 @@ DEFAULT_MIN_MARK_BID_SIZE = 5.0
 # already happened on-chain. 30s covers the live executor's own retry budget.
 INFLIGHT_DRAIN_TIMEOUT_SECONDS = 30.0
 
-State = Literal["stopped", "running"]
+__all__ = ["ExitMonitor", "State", "exit_monitor"]
 
 
 def _mark_from_levels(
@@ -122,8 +122,16 @@ class _Executor(Protocol):
     ) -> ExecResult: ...
 
 
-class ExitMonitor:
-    """Timer-driven loop that closes open positions via the exit section."""
+class ExitMonitor(TickLoopMonitor):
+    """Timer-driven loop that closes open positions via the exit section.
+
+    Lifecycle (start / stop / the loop itself) comes from ``TickLoopMonitor``.
+    This monitor adds one thing to shutdown that the others do not need: a sell
+    already handed to a worker thread cannot be cancelled, so ``_after_stop``
+    waits for its bookkeeping (see ``_drain_inflight``).
+    """
+
+    LOG_NAME = "exit monitor"
 
     def __init__(
         self,
@@ -133,19 +141,16 @@ class ExitMonitor:
         tick_interval_seconds: int = DEFAULT_TICK_INTERVAL_SECONDS,
         min_mark_bid_size: float = DEFAULT_MIN_MARK_BID_SIZE,
     ) -> None:
+        super().__init__(tick_interval_seconds=tick_interval_seconds)
         self._exit = exit_section
         self._executor = executor
-        self._tick_interval = tick_interval_seconds
         self._min_mark_bid_size = min_mark_bid_size
         self._portfolio: PortfolioStore | None = None
-        self._stop = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
         # The sell currently in flight, if any. ``execute_sell`` runs in a
         # worker thread and cannot be cancelled, so the sell + its bookkeeping
         # live in their own task: cancelling the tick loop must not strand a
         # close that already happened on-chain (see ``stop``).
         self._inflight: asyncio.Task[None] | None = None
-        self._state: State = "stopped"
         # canvas-sync v2: atomic swap lock — same model as orchestrator's
         # _sections_lock. _tick_once reads self._exit; replace happens between
         # ticks (or between in-flight section.run calls within a tick — Python
@@ -186,10 +191,6 @@ class ExitMonitor:
         # market stayed unresolved (~720 rows/day into a 200-entry ring). One
         # row per position; the id is dropped again when it stops being open.
         self._dust: set[int] = set()
-
-    @property
-    def state(self) -> State:
-        return self._state
 
     @property
     def last_tick_at(self) -> float | None:
@@ -245,31 +246,12 @@ class ExitMonitor:
 
     # ---------- lifecycle ----------
 
-    async def start(self) -> None:
-        if self._task is not None and not self._task.done():
-            return
-        self._state = "running"
-        # Recreate the Event each start so it binds to the *current* loop —
-        # this module singleton may be start()ed across distinct loops (tests).
-        self._stop = asyncio.Event()
-        self._task = asyncio.create_task(self._tick_loop())
-
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._stop.set()
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._task = None
-        # Cancelling the loop does not cancel a sell already handed to a worker
-        # thread: it completes on-chain and in the DB regardless. Wait for its
-        # task so the exit_log entry and the peak cleanup that follow the await
-        # actually run.
+    async def _after_stop(self) -> None:
+        """Cancelling the loop does not cancel a sell already handed to a worker
+        thread: it completes on-chain and in the DB regardless. Wait for its
+        task so the exit_log entry and the peak cleanup that follow the await
+        actually run."""
         await self._drain_inflight()
-        self._state = "stopped"
 
     async def _drain_inflight(self) -> None:
         """Wait (bounded) for the in-flight sell task to finish."""
@@ -287,21 +269,6 @@ class ExitMonitor:
             )
         except Exception:  # noqa: BLE001 — shutdown must not raise on a failed sell
             logger.exception("exit monitor: in-flight sell failed during shutdown")
-
-    # ---------- loop ----------
-
-    async def _tick_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await self._tick_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 — the loop must survive any tick error
-                logger.exception("exit monitor: tick failed")
-            # Cooperative yield, then sleep the interval — waking early on stop.
-            await asyncio.sleep(0)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=self._tick_interval)
 
     # ---------- price observation ----------
 
@@ -557,6 +524,20 @@ class ExitMonitor:
                 error=f"sell not filled: {result.skip_reason}",
             )
 
+    # ---------- canvas-sync v2 ----------
+
+    async def replace_exit_section(self, new_section: _ExitSection) -> None:
+        """Hot-swap the exit section without restarting the monitor.
+
+        Caller (``api/canvas_routes._apply_canvas_reload``) builds the new
+        instance from the latest canvas, then awaits this. Same atomicity story
+        as the orchestrator: an in-flight ``self._exit.run(...)`` keeps a
+        reference to the old instance via Python GC, and the next tick reads
+        ``self._exit`` and gets the new one.
+        """
+        async with self._exit_lock:
+            self._exit = new_section
+
     def _log(
         self,
         held: HeldPosition,
@@ -613,16 +594,3 @@ exit_monitor = ExitMonitor(
     exit_section=ThresholdExitV0(ThresholdExitConfig()),
     executor=_executor_singleton,
 )
-
-
-# canvas-sync v2: hot-swap the exit section without restarting the monitor.
-# Caller (api/canvas_routes._apply_canvas_reload) builds the new instance from
-# the latest canvas, then awaits this. Same atomicity story as orchestrator:
-# in-flight ``self._exit.run(...)`` keeps a reference to the old instance via
-# Python GC; the next tick reads ``self._exit`` and gets the new one.
-async def _replace_exit_section_impl(self: ExitMonitor, new_section: _ExitSection) -> None:
-    async with self._exit_lock:
-        self._exit = new_section
-
-
-ExitMonitor.replace_exit_section = _replace_exit_section_impl  # type: ignore[attr-defined]

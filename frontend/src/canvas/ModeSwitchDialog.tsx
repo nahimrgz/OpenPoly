@@ -48,18 +48,41 @@ function blockerMessage(result: SwitchModeResult): string | null {
   }
 }
 
+/**
+ * Human summary of a bulk close.
+ *
+ * Three outcomes, not two. `ok` from the backend means **flat**; a sell capped
+ * by the level-1 bid's depth comes back as `partial` with the remainder still
+ * on the book. Folding partials into "failed" (they carry neither a
+ * `skip_reason` nor an `error`, so they used to render as `unknown`) told the
+ * operator the sell did not happen — the opposite of the truth, on the one
+ * screen where "am I out of the market?" is the whole question.
+ */
 function closeAllSummary(r: CloseAllResult): string {
   if (r.attempted === 0) return 'No open positions to close.'
   if (r.filled === r.attempted) return `Closed ${r.filled} positions.`
+
+  const parts = [`Closed ${r.filled}/${r.attempted}.`]
+  if (r.partial > 0) {
+    const remaining = r.details.reduce((sum, d) => sum + (d.remaining_qty ?? 0), 0)
+    parts.push(
+      `${r.partial} partially closed, remainder open` +
+        (remaining > 0 ? ` (${remaining.toFixed(2)} shares).` : '.'),
+    )
+  }
   const failed = r.skipped + r.errored
-  const reasons = Array.from(
-    new Set(
-      r.details
-        .filter((d) => !d.ok)
-        .map((d) => d.skip_reason ?? (d.error ? 'executor_error' : 'unknown'))
-    ),
-  ).join(', ')
-  return `Closed ${r.filled}/${r.attempted}. ${failed} failed (${reasons}). Residuals stay open — retry or close manually.`
+  if (failed > 0) {
+    const reasons = Array.from(
+      new Set(
+        r.details
+          .filter((d) => !d.ok && !d.partial)
+          .map((d) => d.skip_reason ?? (d.error ? 'executor_error' : 'unknown')),
+      ),
+    ).join(', ')
+    parts.push(`${failed} failed (${reasons}).`)
+  }
+  parts.push('Anything still open stays open — retry or close manually.')
+  return parts.join(' ')
 }
 
 export function ModeSwitchDialog({ target, onClose }: Props) {
@@ -146,14 +169,15 @@ export function ModeSwitchDialog({ target, onClose }: Props) {
         <p className="text-xs text-neutral-400 leading-relaxed">
           {isLive ? (
             <>
-              Live mode signs and submits real IOC orders on Polygon mainnet with
-              the configured wallet (Polymarket CLOB).{' '}
+              Live mode signs and submits real orders on Polygon mainnet with
+              the configured wallet (Polymarket CLOB). Settlement detection is
+              active.{' '}
               <span className="text-amber-300">
-                Settlement detection (slice E) and kill-switch enforcement (A4)
-                are not yet implemented — open positions will not auto-close on
-                market resolution, and there is no hard daily-loss / drawdown
-                brake beyond the entry-side heat_cap. Monitor positions
-                manually until those land.
+                The kill-switch brakes (consecutive-loss, daily-loss, drawdown)
+                are OFF by default — each stays disabled until you set its
+                limit above 0 in the entry section config. This is experimental
+                software trading real money: monitor positions and review the
+                exit log regularly.
               </span>
             </>
           ) : (
