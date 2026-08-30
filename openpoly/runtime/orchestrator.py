@@ -286,9 +286,9 @@ class PipelineOrchestrator:
     async def _run_entry(self, item: NewsItem, ar: AnalysisResult) -> None:
         """Stage 3 — entry decision + execution.
 
-        The entry section may do a blocking HTTP fetch (the late-buy veto), so
-        its ``run()`` is offloaded to a worker thread; the executor's DB write
-        stays inline (sub-millisecond — see PF5 risk notes).
+        The entry section may do a blocking HTTP fetch (the late-buy veto) and
+        the live executor blocks on network + sleeps, so both are offloaded to
+        worker threads; only the log append stays inline.
         """
         ts = time.time()
         start = time.monotonic()
@@ -318,7 +318,14 @@ class PipelineOrchestrator:
         position_id: int | None = None
         if intent is not None:
             try:
-                result = self._executor.execute_buy(intent, news_id=item.id, ts=ts)
+                # The live executor sleeps for seconds inside execute_buy
+                # (balance-allowance refresh, CTF polling after a lost
+                # response), so it is offloaded like the section calls above —
+                # the event loop must stay free for the WS reconnect / market
+                # poll tasks.
+                result = await asyncio.to_thread(
+                    self._executor.execute_buy, intent, news_id=item.id, ts=ts
+                )
                 if result.filled:
                     fill_status = "filled"
                     fill_price = result.price

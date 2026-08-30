@@ -145,6 +145,7 @@ class MarketSourceManager:
         self._poll_count: int = 0
         self._last_error: str | None = None
         self._book_persist: Callable[[OrderBook], None] | None = None
+        self._book_observer: Callable[[OrderBook], None] | None = None
 
     # ---------- lifecycle ----------
 
@@ -191,6 +192,15 @@ class MarketSourceManager:
         """Install / clear the order-book persist hook — the write-behind
         writer's ``enqueue``. Wired by the FastAPI lifespan; ``None`` in tests."""
         self._book_persist = persist
+
+    def set_book_observer(self, observer: Callable[[OrderBook], None] | None) -> None:
+        """Install / clear the order-book observer hook — the exit monitor's
+        ``observe_book``. It is the only push path the runtime has for prices:
+        the exit tick runs every 120s while this sampler runs every 60s, so a
+        run-up that happens and reverses between two ticks would otherwise
+        never reach the trailing-stop peak. Wired by the FastAPI lifespan;
+        ``None`` in tests."""
+        self._book_observer = observer
 
     def set_portfolio_store(self, store: Any | None) -> None:
         """Install / clear the portfolio_store reference — wired by the FastAPI
@@ -336,6 +346,12 @@ class MarketSourceManager:
         if self._book_persist is not None:
             for book in books:
                 self._book_persist(book)
+        if self._book_observer is not None:
+            for book in books:
+                try:
+                    self._book_observer(book)
+                except Exception as exc:  # noqa: BLE001 — an observer must never stall sampling
+                    logger.warning("order book observer failed for %s: %s", book.token_id, exc)
         return len(books)
 
     async def _run_book_loop(self) -> None:

@@ -16,6 +16,7 @@ import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.portfolio import PortfolioStore
+from openpoly.runtime.closing_registry import clear_closing, mark_closing
 from openpoly.runtime.section_log import settlement_log
 from openpoly.runtime.reconciliation_monitor import ReconciliationMonitor
 
@@ -172,3 +173,27 @@ async def test_tracked_holding_does_not_alert(store) -> None:
     rm.configure(store)
     await rm._tick_once()
     assert settlement_log.entries() == []  # ledger knows it — quiet
+
+
+async def test_position_with_an_exit_sell_in_flight_is_not_reconciled(store) -> None:
+    """A position mid-sell is legitimately absent from... nothing: the wallet
+    may already be flat while the exit monitor is still persisting the fill.
+    Closing it here loses that fill, so reconciliation defers one tick."""
+    pid = _open_position(store, condition_id="0xcid", side="yes")
+    rm = ReconciliationMonitor(holdings_fetcher=_holdings(set()), grace_seconds=0)
+    rm.configure(store)
+    mark_closing(pid)
+    try:
+        await rm._tick_once()
+    finally:
+        clear_closing(pid)
+    rec = store.get_position(pid)
+    assert rec is not None
+    assert rec.status == "open"
+
+    # Sell finished without closing the position → next tick reconciles it.
+    await rm._tick_once()
+    rec = store.get_position(pid)
+    assert rec is not None
+    assert rec.status == "closed"
+    assert rec.close_reason == "reconciled"

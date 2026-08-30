@@ -29,6 +29,7 @@ from typing import Awaitable, Literal, Protocol
 from openpoly.markets.models import normalize_gamma_market
 from openpoly.markets.polymarket_api import fetch_markets_by_condition_id
 from openpoly.portfolio import HeldPosition, PortfolioStore
+from openpoly.runtime.closing_registry import is_closing
 from openpoly.runtime.section_log import SettlementDecision, settlement_log
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,12 @@ class SettlementMonitor:
             return
 
         for held in held_positions:
+            if is_closing(held.position_id):
+                # The exit monitor has an on-chain sell in flight for this
+                # position; settling it now would make that fill unpersistable.
+                # Skip one tick — settlement is not latency-sensitive.
+                self._log(held, ts, verdict="skip", reason="exit_in_flight")
+                continue
             final_price = _settlement_price_for_side(market.outcome_prices, held.side)
             if final_price is None:
                 self._log(

@@ -37,6 +37,7 @@ import time
 from typing import Awaitable, Callable, Literal
 
 from openpoly.portfolio import PortfolioStore
+from openpoly.runtime.closing_registry import is_closing
 from openpoly.runtime.section_log import SettlementDecision, settlement_log
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,12 @@ class ReconciliationMonitor:
             if ts - pos.opened_at < self._grace:
                 continue
             if (pos.condition_id, pos.side) in held:
+                continue
+            if is_closing(pos.position_id):
+                # The exit monitor is mid-sell on this id: the wallet can
+                # already read flat while its fill is still being persisted.
+                # Closing it here would destroy that fill — reconsider next
+                # tick, when the sell has landed one way or the other.
                 continue
             # Flat on-chain but open in the DB → exited outside the ledger.
             try:

@@ -8,6 +8,7 @@ its own log stores so state doesn't leak between cases.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from openpoly.embedding.models import MarketCandidate, MarketCandidates
@@ -540,3 +541,49 @@ async def test_analyzer_returns_ok_but_non_AR_payload_skips_entry() -> None:
     # Entry never called
     assert entry.call_count == 0
     assert len(e_log.entries()) == 0
+
+
+# ---------- blocking I/O must not stall the event loop ----------
+
+
+async def test_execute_buy_runs_off_the_event_loop() -> None:
+    """The live executor sleeps seconds inside execute_buy (CTF balance polling
+    on a lost response). It must run in a worker thread, or the WS reconnect /
+    market-poll tasks stall behind every fill."""
+    import time as _time
+
+    class _SlowExecutor(FakeExecutor):
+        def execute_buy(self, intent: OrderIntent, *, news_id: str | None, ts: float):
+            _time.sleep(0.3)
+            return super().execute_buy(intent, news_id=news_id, ts=ts)
+
+    ex = _SlowExecutor()
+    orch, _, _, e_log = make_orchestrator(executor=ex)
+
+    beats = 0
+
+    async def _heartbeat() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.01)
+            beats += 1
+
+    hb = asyncio.create_task(_heartbeat())
+    await orch.start()
+    try:
+        orch.enqueue(_item())
+
+        async def _wait_for_fill() -> None:
+            while not e_log.entries():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_fill(), timeout=5.0)
+    finally:
+        await orch.stop()
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+
+    assert ex.call_count == 1
+    assert e_log.entries()[0].fill_status == "filled"
+    assert beats >= 10, f"event loop stalled: only {beats} heartbeats"

@@ -17,6 +17,7 @@ import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.portfolio import PortfolioStore
+from openpoly.runtime.closing_registry import clear_closing, mark_closing
 from openpoly.runtime.section_log import settlement_log
 from openpoly.runtime.settlement_monitor import (
     SettlementMonitor,
@@ -292,3 +293,30 @@ async def test_not_configured_is_noop() -> None:
     sm = SettlementMonitor(fetcher=_fetcher_returning([]))
     await sm._tick_once()
     assert settlement_log.entries() == []
+
+
+async def test_position_with_an_exit_sell_in_flight_is_skipped(store) -> None:
+    """The exit monitor's execute_sell runs in a worker thread, so this loop
+    can run while an on-chain sell for the same position is still open.
+    Closing it here would make the real fill unpersistable — defer one tick."""
+    pid = _open_position(store, condition_id="0xcid", side="yes", avg=0.40, qty=10.0)
+    raw = [_raw_market(condition_id="0xcid", closed=True, outcome_prices=["1", "0"])]
+    sm = SettlementMonitor(fetcher=_fetcher_returning(raw))
+    sm.configure(store)
+    mark_closing(pid)
+    try:
+        await sm._tick_once()
+    finally:
+        clear_closing(pid)
+    rec = store.get_position(pid)
+    assert rec is not None
+    assert rec.status == "open"
+    entries = settlement_log.entries()
+    assert entries[0].verdict == "skip"
+    assert entries[0].reason == "exit_in_flight"
+
+    # Once the sell is done the next tick settles it as usual.
+    await sm._tick_once()
+    rec = store.get_position(pid)
+    assert rec is not None
+    assert rec.status == "closed"

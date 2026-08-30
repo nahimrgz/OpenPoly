@@ -10,6 +10,86 @@ Dates are US-style (MM/DD/YYYY).
 
 ---
 
+## 08/30/2026 — Exit policy v2: the trailing stop stops eating the trade
+
+Live behavior exposed a defect in exit policy v1 (05/24): winners were being
+closed on the *first downtick* of a move, at barely above entry. The
+compounding causes, all now fixed:
+
+**The trailing distance was measured in the wrong unit.** `peak_drawdown_pct`
+was applied to the banked gain — retrace 12% *of (peak − entry)*. That
+distance is tightest exactly when a move is youngest: on a $10 position that
+had just armed, 12% of the gain worked out to less than one Polymarket tick
+(0.01), so the very next quote closed the position. The rule now compares the
+retrace against an absolute price distance:
+
+    max(min_trail_ticks × tick_size, current_spread, peak_drawdown_pct × (peak − entry))
+
+Never tighter than two ticks, never tighter than the book's own spread, and
+widening as the move grows. New knobs: `min_trail_ticks` (default 2) and
+`tick_size` (default 0.01).
+
+**It armed far too early.** `peak_meaningful_floor_pct` was 1% of cost basis,
+so on a small position the $1 USD floor did all the work and the lock engaged
+after roughly a +10% move — a range where a retrace is quote noise, not
+given-back profit. The floor is now 30% of cost basis: the trailing lock only
+ever protects a gain worth protecting.
+
+**Precedence made take-profit dead code.** With `peak_drawdown` evaluated
+before `take_profit`, almost every winner large enough to reach +20% had
+already retraced enough to close as a drawdown first — the ceiling nominally
+existed but essentially never fired. Precedence is now **stop-loss →
+take-profit → peak-drawdown**.
+
+**Take-profit now ships off.** The new `take_profit_enabled` flag defaults to
+`false`. This is forced by the two changes above: the trailing lock arms at
++30% of cost basis, so a +20% ceiling would close every winner *before* the
+lock could ever engage and the whole trailing redesign would be inert. Under
+the shipped defaults a position is therefore exited by the trailing lock once
+it has run +30% or more, or by the stop-loss at -15%; `take_profit_pct` (still
+0.20) is kept as an opt-in hard cap for anyone who wants one. The trade-off is
+explicit and worth stating: **between entry and +30% there is no profit-taking
+rule at all — a position in that band is protected only by the stop-loss**, so
+a +25% gain can round-trip back to -15% without the section closing it.
+
+**Marks now require depth.** The mark was the raw level-1 bid, whatever its
+size. A single minimum-size resting order sitting away from fair value was
+enough to print a loss the position never had and fire the stop. The monitor
+now marks at the first bid level carrying at least `min_mark_bid_size` shares
+(default 5 — above the venue's $1 minimum order at the prices traded here) and
+at nothing else: there is no mid fallback, because both executors sell into the
+book's raw level-1 bid, so a mid mark would evaluate take-profit and the
+trailing lock against a price the position can never realize (0.40 bid / 0.72
+ask marks at 0.56 and "takes profit" into a 0.40 fill). When no bid level
+qualifies the position is held, counted as *blocked*, and logged once as
+`no_executable_bid` so the gap is visible instead of silent. A stop-loss can no
+longer fire off a bid nobody is standing behind, and a take-profit can no
+longer fire off a price nobody is bidding.
+
+**Peaks track the book, not the tick.** The peak was only sampled by the 120s
+exit tick, so a run-up that happened and reversed between two ticks left no
+trace and the stop trailed a peak that never existed. The order-book sampler
+(60s) now pushes every observed book into the monitor's peak tracker. This is
+still polling, not a live quote stream — the runtime has no push book feed —
+so the limit is the sampler's interval, which is the smallest honest change
+available today.
+
+**Closing a position is now single-writer.** The exit monitor's `execute_sell`
+moved onto a worker thread (`asyncio.to_thread`) so a seconds-long on-chain
+sell no longer stalls the WS reconnects and market polls — but that hands the
+event loop back mid-sell, and the settlement and reconciliation monitors could
+then close the same position id first, leaving the real fill unpersistable. A
+process-local in-flight registry (`runtime/closing_registry.py`) now holds the
+id for the duration of the sell; the other two loops skip it and reconsider on
+their next sweep. For the same reason `stop()` no longer just cancels the tick
+loop: a sell already handed to a worker thread cannot be cancelled, so the sell
+and its bookkeeping run as their own task, which shutdown drains (30s cap)
+before reporting stopped.
+
+On a synthetic path from 0.50 to 0.80 with single-tick noise, the old rules
+gave the trade back at ~0.55; the shipped defaults hold through every dip and
+exit at 0.76 on the trailing lock, keeping ~87% of the move.
+
 ## 06/01/2026 — The strategy canvas becomes the operating surface
 
 The canvas page was promoted from a configuration sketchpad to the actual

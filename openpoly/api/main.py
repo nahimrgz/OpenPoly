@@ -166,6 +166,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # cached vectors so a restart skips the cold recompute.
     await embedding_manager.start(session_factory=get_session_factory())
     market_source_manager.set_book_persist(database_manager.enqueue_order_book)
+    # Feed every sampled book to the exit monitor's peak tracker. The sampler
+    # runs finer than the exit tick, so this is what keeps the trailing stop
+    # trailing a peak that actually happened.
+    market_source_manager.set_book_observer(exit_monitor.observe_book)
     market_source_manager.set_portfolio_store(PortfolioStore(get_session_factory()))
     news_source_manager.set_news_persist(database_manager.enqueue_news)
     # Auto-start both sources so a fresh process is already streaming — no
@@ -177,6 +181,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Shutdown (reverse order): drain orchestrator first so it doesn't try
     # to enqueue against a torn-down manager, then stop the WS source.
     market_source_manager.set_book_persist(None)
+    market_source_manager.set_book_observer(None)
     market_source_manager.set_portfolio_store(None)
     news_source_manager.set_news_persist(None)
     if _recon_mod.reconciliation_monitor is not None:

@@ -169,3 +169,49 @@ async def test_stop_cancels_both_loops():
     assert mgr._tasks == []
     # second stop is a safe no-op
     assert (await mgr.stop()).state == "stopped"
+
+
+# ---------- book observer hook ----------
+
+
+async def test_sample_books_notifies_observer():
+    seen: list[str] = []
+    mgr = MarketSourceManager(
+        fetcher=_fetcher([_raw_pair("a")]),
+        book_fetcher=_book_fetcher,
+    )
+    mgr._config = MarketSourceConfig()
+    mgr.set_book_observer(lambda book: seen.append(book.token_id))
+    await mgr._poll_once()
+    await mgr._sample_books_once()
+    assert sorted(seen) == ["no-a", "yes-a"]
+
+
+async def test_book_observer_exception_does_not_break_the_cycle():
+    def _boom(book: OrderBook) -> None:
+        raise RuntimeError("observer blew up")
+
+    mgr = MarketSourceManager(
+        fetcher=_fetcher([_raw_pair("a")]),
+        book_fetcher=_book_fetcher,
+    )
+    mgr._config = MarketSourceConfig()
+    mgr.set_book_observer(_boom)
+    await mgr._poll_once()
+    count = await mgr._sample_books_once()
+    assert count == 2
+    assert mgr.store.order_book_count == 2
+
+
+async def test_book_observer_can_be_cleared():
+    seen: list[str] = []
+    mgr = MarketSourceManager(
+        fetcher=_fetcher([_raw_pair("a")]),
+        book_fetcher=_book_fetcher,
+    )
+    mgr._config = MarketSourceConfig()
+    mgr.set_book_observer(lambda book: seen.append(book.token_id))
+    mgr.set_book_observer(None)
+    await mgr._poll_once()
+    await mgr._sample_books_once()
+    assert seen == []

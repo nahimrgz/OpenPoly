@@ -37,3 +37,16 @@ def _reset_orchestrator() -> Iterator[None]:
     _reset_singleton_for_tests()
     yield
     _reset_singleton_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_closing_registry() -> Iterator[None]:
+    """Clear the process-global in-flight close registry before every test.
+
+    An id left behind by one test makes the settlement and reconciliation
+    monitors skip that position in every later test of the session.
+    """
+    from openpoly.runtime.closing_registry import reset_for_tests
+
+    reset_for_tests()
+    yield
