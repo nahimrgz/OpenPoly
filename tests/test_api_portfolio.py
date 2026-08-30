@@ -450,3 +450,56 @@ def test_list_positions_market_question_null_when_no_catalog(env) -> None:
         assert p["market_question"] is None
         # analyzer_decisions still present (empty list when no log match)
         assert isinstance(p["analyzer_decisions"], list)
+
+
+# ---------- GET /api/analytics/calibration ----------
+
+
+def test_calibration_empty_returns_every_bucket(env) -> None:
+    _store, client = env
+    r = client.get("/api/analytics/calibration")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_size"] == 0
+    assert len(body["buckets"]) == 5
+    assert body["buckets"][0]["lower"] == 0.5
+    assert body["buckets"][0]["win_rate"] is None
+
+
+def test_calibration_reports_closed_labelled_positions(env) -> None:
+    store, client = env
+    for i, (p_model, sell) in enumerate([(0.72, 1.0), (0.75, 0.0), (0.62, 1.0)], start=1):
+        held = store.open_position(
+            market_id=f"m{i}",
+            side="yes",
+            token_id=f"t{i}",
+            condition_id=f"0xm{i}",
+            price=0.50,
+            qty=10.0,
+            ts=100.0 + i,
+            news_id=f"n{i}",
+            entry_p_model=p_model,
+            entry_confidence="high",
+            entry_edge=0.20,
+        )
+        store.close_position(
+            held.position_id, sell_price=sell, ts=300.0 + i, close_reason="take_profit"
+        )
+    # An unlabelled position must not enter the sample.
+    store.open_position(
+        market_id="m9",
+        side="yes",
+        token_id="t9",
+        condition_id="0xm9",
+        price=0.50,
+        qty=10.0,
+        ts=150.0,
+    )
+
+    body = client.get("/api/analytics/calibration").json()
+    by_lower = {b["lower"]: b for b in body["buckets"]}
+    assert body["sample_size"] == 3
+    assert by_lower[0.7]["count"] == 2
+    assert by_lower[0.7]["win_rate"] == pytest.approx(0.5)
+    assert by_lower[0.6]["count"] == 1
+    assert by_lower[0.6]["win_rate"] == 1.0

@@ -321,3 +321,92 @@ def test_record_sell_accrues_realized_across_partials(store) -> None:
     assert rec.status == "closed"
     assert rec.realized_pnl == pytest.approx((0.55 - 0.40) * 15.0 + (0.60 - 0.40) * 3.0)
     assert len([f for f in store.list_fills() if f.action == "sell"]) == 2
+
+
+def test_record_sell_sub_size_precision_residual_closes_the_position(store) -> None:
+    """The venue accepts 2 size decimals, so a residual below 0.01 shares can
+    never be expressed as an order size: leaving the row open keeps it open
+    forever, burning a heat-cap slot and an exit-tick decision every tick. It
+    is dropped (worth under $0.01 at any price <= 1.0) and the position closes
+    with the realized PnL accrued from the legs actually sold."""
+    held = _open(store, price=0.40, qty=5.5678)
+    rec = store.record_sell(
+        held.position_id,
+        sold_qty=5.56,
+        sell_price=0.55,
+        ts=200.0,
+        close_reason="take_profit",
+        trigger="take_profit",
+    )
+    assert rec.status == "closed"
+    assert rec.close_reason == "take_profit"
+    assert rec.closed_at == 200.0
+    assert rec.qty == pytest.approx(5.56)  # the 0.0078 residue is dropped
+    assert rec.realized_pnl == pytest.approx((0.55 - 0.40) * 5.56)  # sold legs only
+    sell = next(f for f in store.list_fills() if f.action == "sell")
+    assert sell.qty == pytest.approx(5.56)
+
+
+def test_record_sell_one_cent_residual_stays_open(store) -> None:
+    """0.01 shares is exactly one size increment — still placeable, so the row
+    must stay open rather than be written off."""
+    held = _open(store, price=0.40, qty=5.57)
+    rec = store.record_sell(
+        held.position_id,
+        sold_qty=5.56,
+        sell_price=0.55,
+        ts=200.0,
+        close_reason="take_profit",
+        trigger="take_profit",
+    )
+    assert rec.status == "open"
+    assert rec.qty == pytest.approx(0.01)
+
+
+# ---------- entry calibration signals ----------
+
+
+def test_open_position_persists_entry_signals(store) -> None:
+    """The analyzer's belief at entry has to be joinable to the outcome later,
+    or calibration is unanswerable after the fact."""
+    held = store.open_position(
+        market_id="m1",
+        side="yes",
+        token_id="t1",
+        condition_id="0xm1",
+        price=0.42,
+        qty=20.0,
+        ts=100.0,
+        news_id="n1",
+        entry_p_model=0.72,
+        entry_confidence="high",
+        entry_edge=0.30,
+    )
+    rec = store.get_position(held.position_id)
+    assert rec is not None
+    assert rec.entry_p_model == 0.72
+    assert rec.entry_confidence == "high"
+    assert rec.entry_edge == 0.30
+    # And they survive the close, which is when they become useful.
+    store.close_position(held.position_id, sell_price=0.50, ts=200.0, close_reason="take_profit")
+    closed = store.get_position(held.position_id)
+    assert closed is not None
+    assert closed.entry_p_model == 0.72
+
+
+def test_open_position_entry_signals_default_to_none(store) -> None:
+    """Hand-opened / reconciled positions carry no analyzer signal."""
+    held = store.open_position(
+        market_id="m2",
+        side="no",
+        token_id="t2",
+        condition_id="0xm2",
+        price=0.30,
+        qty=10.0,
+        ts=100.0,
+    )
+    rec = store.get_position(held.position_id)
+    assert rec is not None
+    assert rec.entry_p_model is None
+    assert rec.entry_confidence is None
+    assert rec.entry_edge is None

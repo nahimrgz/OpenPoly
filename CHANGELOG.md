@@ -10,6 +10,70 @@ Dates are US-style (MM/DD/YYYY).
 
 ---
 
+## 08/30/2026 — Execution integrity, and sizing that has to earn the right
+
+Three beliefs changed about the gap between what the system *records* and what
+actually happened at the venue, and a fourth about what has to be true before
+the size of a bet is allowed to vary at all.
+
+**A remainder that cannot be sold is still worth its resolution price.** A
+partial sell can leave less than one share open, which is not a placeable order
+at the venue — every later exit attempt skips. The remainder is not worthless,
+though: the settlement monitor closes open rows at the resolution price, so
+those tokens pay out 1.0 on the winning side. Closing them at 0.0 would book a
+loss that never happened and orphan tokens still sitting in the wallet, so the
+sell now skips (`dust_remainder`, warned once per position) and the row stays
+open until settlement. The tradeoff is accepted deliberately: the remainder
+keeps counting toward the open-position list and `heat_cap_usd` until the
+market resolves, which is a bounded, honest cost — a fabricated realized loss
+is not. Sizing was also the reason most of that dust existed: orders were
+floored to *whole shares* and additionally required `qty × price` to land on
+clean cents. The venue asks for neither. Its SDK allows two size decimals at
+every tick size and rounds the order amount itself, so the cent rule was
+inventing rejections — at a three-decimal price (0.999, 0.993: exactly the
+tick regime a winner exits through) no whole-share quantity aligns, so a
+perfectly sellable nine-share winner quantized to zero and was treated as
+unsellable. Sizing now floors to two decimals and nothing else.
+
+**Paper has to be a rehearsal of live, not a friendlier version of it.** The
+two fill models had drifted apart: paper accepted orders down to $1.00 that
+live rejects below $1.10, never quantized the size at all, and — worst — sold
+the *entire* position into the level-1 bid regardless of that bid's depth,
+reporting an exit price live could never have realized. Both executors now size
+through one module (`execution/sizing.py`), and the paper sell caps at bid
+depth and leaves the unsold remainder open, exactly as the live path does.
+Paper P&L is now a lower-bound rehearsal rather than an optimistic one.
+
+**An order that cannot be confirmed is not worth placing.** The venue SDK
+offers no client-supplied order id, so the only way to tell "lost response" from
+"real fill" is the wallet's CTF balance before and after. When that pre-order
+read fails there is no recovery signal at all, and a fill that did land would
+become an untracked on-chain position. The buy path now refuses to place the
+order (`ctf_balance_unavailable`) rather than trade blind. The manual close and
+close-all routes were the other hole: they sold positions the exit monitor
+already had in flight (the row stays `open` for the seconds the on-chain order
+takes), which is a second sell of tokens already gone. Both now consult and
+hold the same in-flight claim as the monitors — 409 `exit_in_flight` for a
+single close, skipped-and-reported for close-all.
+
+**Sizing may scale with edge, but only once calibration says so.** New knob
+`size_edge_multiplier_max`, defaulting to **1.0 — off**: at the default,
+sizing is byte-for-byte what it was, `order_size_usd / held_price`, ignoring
+edge entirely. Above 1.0 the notional becomes
+`order_size_usd × clamp(edge / min_edge, 1.0, max)`. The reason it ships off is
+that "edge" is `p_model − held_price`, and nothing so far has established that
+`p_model` means what it says; betting more on a bigger number derived from an
+uncalibrated probability just loses faster. So the evidence comes first: every
+entry now freezes its `p_model`, `confidence` and `edge` onto the position row
+(the analyzer log ring evicts a call long before the position it opened
+closes), and `GET /api/analytics/calibration` buckets closed positions by the
+model's probability for the side actually held, with each bucket's win rate and
+mean realized return. The knob should be raised only when a bucket's win rate
+sits near its own midpoint with n ≥ 100 behind it. `heat_cap_usd` still bounds
+the result: the extra size a multiplier grants is trimmed to the headroom left
+over open exposure — never below the base order, so the default path is
+unchanged.
+
 ## 08/30/2026 — Exit policy v2: the trailing stop stops eating the trade
 
 Live behavior exposed a defect in exit policy v1 (05/24): winners were being

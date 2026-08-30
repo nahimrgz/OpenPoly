@@ -7,10 +7,17 @@ NO), reads the held side's live order book, and gates on edge + spread::
     spread     = best ask - best bid
     edge       = (p_model if YES else 1 - p_model) - held_price
 
-A position is sized by ``order_size_usd`` at ``held_price``. The section emits a
-decision only — an ``OrderIntent``; the executor turns it into an actual fill
-and is authoritative on the realized price. The book is read level-1 only
-(best ask / best bid), matching the executor's crude micro-stakes fill model.
+A position is sized by ``order_size_usd`` at ``held_price``, optionally scaled
+by how far the edge exceeds ``min_edge`` (``size_edge_multiplier_max``, off by
+default — see that field). The section emits a decision only — an
+``OrderIntent``; the executor turns it into an actual fill and is authoritative
+on the realized price. The book is read level-1 only (best ask / best bid),
+matching the executor's crude micro-stakes fill model.
+
+The intent also carries the belief behind it (``p_model`` / ``confidence`` /
+``edge``) so the executor can freeze it onto the position row; that is what
+``GET /api/analytics/calibration`` later reads, and it is the evidence that has
+to exist before edge-scaled sizing is turned on.
 
 The section reads the live ``MarketStore`` singleton directly (same pattern as
 the embedding section — no capability injection). When configured with a
@@ -52,12 +59,22 @@ class OrderIntent:
 
     ``price`` is the level-1 ask the section saw; the executor re-reads the live
     book at fill time and is authoritative on the actual fill price / qty.
+
+    ``p_model`` / ``confidence`` / ``edge`` are the belief behind the decision.
+    They are carried here purely so the executor can freeze them onto the
+    position row: the analyzer_log ring evicts a call within a few hundred news
+    events, long before the position it opened closes, so without this the
+    outcome could never be joined back to the prediction (calibration). They
+    default to None so a hand-built intent stays valid.
     """
 
     market_id: str
     side: Side
     price: float
     qty: float
+    p_model: float | None = None
+    confidence: str | None = None
+    edge: float | None = None
 
 
 class EdgeThresholdConfig(BaseModel):
@@ -112,6 +129,22 @@ class EdgeThresholdConfig(BaseModel):
             "side), regardless of when. One-shot-per-(market, side) "
             "across the lifetime of the strategy. When True, "
             "``same_market_cooldown_minutes`` is ignored."
+        ),
+    )
+    size_edge_multiplier_max: float = Field(
+        default=1.0,
+        ge=1.0,
+        le=5.0,
+        description=(
+            "Scale the order with the edge: notional = order_size_usd × "
+            "clamp(edge / min_edge, 1.0, this). 1.0 (the default) disables "
+            "scaling entirely — sizing stays exactly order_size_usd / "
+            "held_price, as it always was. Raise it ONLY after GET "
+            "/api/analytics/calibration shows p_model is actually calibrated: "
+            "each bucket's win rate close to its own midpoint, with n ≥ 100 "
+            "behind the buckets being relied on. Betting more on a larger "
+            "'edge' computed from an uncalibrated probability only loses "
+            "faster. heat_cap_usd, when set, still bounds the scaled notional."
         ),
     )
     heat_cap_usd: float = Field(
@@ -169,7 +202,7 @@ class EdgeThresholdConfig(BaseModel):
 
 class EdgeThresholdEntryV0:
     SECTION_TYPE = "entry"
-    SECTION_VERSION = "0.3.0"
+    SECTION_VERSION = "0.4.0"
     REQUIRES = ["order_book", "market_data"]
     Config = EdgeThresholdConfig
 
@@ -207,6 +240,10 @@ class EdgeThresholdEntryV0:
         portfolio = (
             self._portfolio_provider() if needs_portfolio and self._portfolio_provider else None
         )
+        # Kept for the sizing step below: the heat cap has to bound what is
+        # actually bought, so a scaled order is capped by the headroom left
+        # over this same open exposure. None when the gate is off.
+        open_cost: float | None = None
         if portfolio is not None:
             # heat_cap: portfolio-wide ceiling. One get_open_positions call,
             # only sums the currently-open set, returns fast.
@@ -319,9 +356,51 @@ class EdgeThresholdEntryV0:
                         signals=signals,
                     )
 
-        qty = self.config.order_size_usd / held_price
-        intent = OrderIntent(market_id=res.market_id, side=side, price=held_price, qty=qty)
+        notional = self._scaled_notional(edge, open_cost)
+        multiplier = notional / self.config.order_size_usd
+        if multiplier != 1.0:
+            signals["size_multiplier"] = round(multiplier, 4)
+        qty = notional / held_price
+        intent = OrderIntent(
+            market_id=res.market_id,
+            side=side,
+            price=held_price,
+            qty=qty,
+            # The belief behind the decision, carried so the executor can
+            # freeze it onto the position row (calibration).
+            p_model=res.p_model,
+            confidence=res.confidence,
+            edge=edge,
+        )
         return SectionOutput(payload=intent, verdict="ok", signals=signals)
+
+    def _scaled_notional(self, edge: float, open_cost: float | None) -> float:
+        """Order notional in USD — ``order_size_usd``, optionally scaled by edge.
+
+        The multiplier is ``clamp(edge / min_edge, 1.0, size_edge_multiplier_max)``
+        and never shrinks an order: at the default cap of 1.0 this returns
+        exactly ``order_size_usd``, so sizing is unchanged from before the knob
+        existed. ``min_edge == 0`` makes the ratio meaningless (and undefined),
+        so scaling is off there too.
+
+        ``heat_cap_usd`` then bounds the *scaled* notional: the extra size the
+        multiplier grants is trimmed to the headroom left over currently-open
+        exposure. It is deliberately never trimmed below ``order_size_usd`` —
+        the cap's existing job is to gate on exposure already taken (that
+        pre-check is unchanged), not to shrink the base order — so a config
+        with the knob at its 1.0 default behaves exactly as it did.
+        """
+        base = self.config.order_size_usd
+        cap = self.config.size_edge_multiplier_max
+        if cap <= 1.0 or self.config.min_edge <= 0.0:
+            return base
+        multiplier = max(1.0, min(edge / self.config.min_edge, cap))
+        heat_cap = self.config.heat_cap_usd
+        if heat_cap > 0 and open_cost is not None:
+            headroom = heat_cap - open_cost
+            if headroom < base * multiplier:
+                multiplier = max(1.0, headroom / base)
+        return base * multiplier
 
     @staticmethod
     def CONTRACT_TEST() -> None:

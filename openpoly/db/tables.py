@@ -134,3 +134,12 @@ class PositionRow(Base):
     closed_at: Mapped[float | None]
     close_reason: Mapped[str | None]
     realized_pnl: Mapped[float | None]
+    # Entry-time analyzer/section signals, denormalized onto the position so an
+    # outcome can be joined back to the belief that opened it. Without them a
+    # closed position says what happened but not what we predicted, and the
+    # calibration question ("is p_model 0.7 actually right 70% of the time?")
+    # is unanswerable after the fact — the analyzer_log ring has long evicted
+    # the call. Nullable: hand-opened / reconciled positions have no signal.
+    entry_p_model: Mapped[float | None] = mapped_column(default=None)
+    entry_confidence: Mapped[str | None] = mapped_column(default=None)
+    entry_edge: Mapped[float | None] = mapped_column(default=None)

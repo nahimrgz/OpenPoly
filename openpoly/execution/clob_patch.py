@@ -7,6 +7,14 @@ module BEFORE any other ``py_clob_client_v2`` import — the monkey-patch
 must be in place before any SDK module wires its own reference to the
 helper. Re-exports the SDK symbols callers need so a single import covers
 both the patch and the client surface.
+
+Known limitation (observed 08/30/2026, not changed): only ``Origin`` and
+``Referer`` reach the wire. The SDK's own ``_overload_headers`` runs inside
+``request`` and *assigns* ``User-Agent = "py_clob_client_v2"``, overwriting the
+browser UA this patch sets beforehand. Live has been working against Cloudflare
+on Origin/Referer alone, and the pattern above is the one verified in
+production, so this is documented rather than "fixed" blind — forcing the UA
+after ``_overload_headers`` would need a live re-test to justify.
 """
 
 from __future__ import annotations

@@ -4,7 +4,9 @@ and ``POST /api/positions/{id}/close`` (manual close).
 The ``fill`` ledger is the source of truth; ``position`` is its materialized
 projection. Reads are newest-first, bounded by ``limit``. The manual close
 routes one open position through ``executor.execute_sell`` (close_reason
-``manual``) — the same fill path the ExitMonitor uses.
+``manual``) — the same fill path the ExitMonitor uses, and therefore under the
+same single-writer discipline: both close routes consult (and hold) the
+in-flight claim in ``runtime.closing_registry``.
 """
 
 from __future__ import annotations
@@ -17,15 +19,21 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from openpoly.analytics.calibration import calibration_report
 from openpoly.db.engine import get_session_factory
 from openpoly.execution import executor
 from openpoly.portfolio import PortfolioStore
 from openpoly.portfolio.equity import build_equity_curve
+from openpoly.runtime.closing_registry import clear_closing, is_closing, mark_closing
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
 
 LIMIT_DEFAULT = 100
 LIMIT_MAX = 500
+# Calibration wants the whole trading history, not a page of it — the report is
+# only meaningful at n ≥ 100 per bucket. Still bounded: this is a per-request
+# scan of the position projection, not a cursor.
+CALIBRATION_LIMIT = 5000
 
 
 def get_portfolio_store() -> PortfolioStore:
@@ -80,13 +88,22 @@ async def close_position(
     store: PortfolioStore = Depends(get_portfolio_store),
 ) -> dict[str, Any]:
     """Manually close one open position at the level-1 bid (close_reason
-    ``manual``). 404 if no such position; 409 if it is already closed. The
-    response body is the ``ExecResult`` — ``filled`` is False (with a
-    ``skip_reason``) when the order book has no bid liquidity right now.
+    ``manual``). 404 if no such position; 409 if it is already closed, or if
+    the exit monitor already has a sell in flight for it. The response body is
+    the ``ExecResult`` — ``filled`` is False (with a ``skip_reason``) when the
+    order book has no bid liquidity right now.
 
     Async, and it never awaits between the open-position lookup and the
     synchronous ``execute_sell`` — so the close is atomic with respect to the
-    ExitMonitor tick on the same event loop (no double-close race).
+    ExitMonitor tick on the same event loop.
+
+    "Still open in the DB" is not by itself proof that nobody is selling this
+    position: the exit monitor's ``execute_sell`` runs in a worker thread and
+    the row stays ``open`` for the seconds the on-chain order takes. Closing it
+    from here in that window is a second on-chain sell of tokens that are
+    already gone, so an in-flight claim is a 409 — and this route takes the
+    same claim for the duration of its own sell, so the settlement and
+    reconciliation monitors leave it alone too.
     """
     held = next(
         (p for p in store.get_open_positions() if p.position_id == position_id),
@@ -100,7 +117,13 @@ async def close_position(
             status_code=409,
             detail=f"position {position_id} is {record.status}, not open",
         )
-    result = executor.execute_sell(held, close_reason="manual", ts=time.time(), trigger=None)
+    if is_closing(position_id):
+        raise HTTPException(status_code=409, detail="exit_in_flight")
+    mark_closing(position_id)
+    try:
+        result = executor.execute_sell(held, close_reason="manual", ts=time.time(), trigger=None)
+    finally:
+        clear_closing(position_id)
     return asdict(result)
 
 
@@ -116,7 +139,10 @@ async def close_all_positions(
 
     Same atomicity story as ``close_position``: the open snapshot is taken
     once at the top and each ``execute_sell`` is synchronous; no await
-    interleaves between them and the ExitMonitor tick.
+    interleaves between them and the ExitMonitor tick. Positions the exit
+    monitor is already selling (see ``closing_registry``) are skipped with
+    ``exit_in_flight`` and reported in ``details`` rather than sold twice; each
+    position this route does sell is claimed for the duration.
     """
     opens = store.get_open_positions()
     if not opens:
@@ -131,6 +157,13 @@ async def close_all_positions(
             "market_id": held.market_id,
             "side": held.side,
         }
+        if is_closing(held.position_id):
+            entry["ok"] = False
+            entry["skip_reason"] = "exit_in_flight"
+            skipped += 1
+            details.append(entry)
+            continue
+        mark_closing(held.position_id)
         try:
             result = executor.execute_sell(held, close_reason="manual", ts=now, trigger=None)
         except Exception as exc:  # noqa: BLE001 — isolate per-position failure
@@ -147,6 +180,8 @@ async def close_all_positions(
                 entry["ok"] = False
                 entry["skip_reason"] = result.skip_reason
                 skipped += 1
+        finally:
+            clear_closing(held.position_id)
         details.append(entry)
     return {
         "attempted": len(opens),
@@ -232,6 +267,30 @@ def _lookup_analyzer_decisions(news_id: str | None) -> list[dict[str, Any]]:
             }
         )
     return matches
+
+
+@router.get("/analytics/calibration")
+def get_calibration(
+    store: PortfolioStore = Depends(get_portfolio_store),
+) -> dict[str, Any]:
+    """Is ``p_model`` calibrated? Closed positions bucketed by the model's
+    probability for the side they held, with each bucket's win rate and mean
+    realized return (see ``openpoly.analytics.calibration``).
+
+    Read-only and derived per request — nothing here is persisted. Read it as:
+    a bucket whose ``win_rate`` sits near its own midpoint, with ``count`` of
+    at least ~100, is a bucket whose probability means something. That is the
+    precondition for turning ``size_edge_multiplier_max`` above 1.0.
+    """
+    positions = store.list_positions(CALIBRATION_LIMIT)
+    buckets = calibration_report(
+        positions,
+        store.buy_cost_basis([p.id for p in positions]),
+    )
+    return {
+        "buckets": [asdict(b) for b in buckets],
+        "sample_size": sum(b.count for b in buckets),
+    }
 
 
 @router.get("/portfolio/equity")

@@ -21,6 +21,19 @@ issues #64/#70/#76). Do NOT change without re-testing live:
 
 The ``_ClobClient`` Protocol lets tests pass a fake without instantiating
 the real v2 client (which would hit the network at init).
+
+**No client-side order idempotency.** py-clob-client-v2 exposes no client
+order id: ``OrderArgsV2`` carries only ``builder_code`` and a bytes32
+``metadata`` field (neither is queryable), and the read side filters orders by
+the *server-assigned* id only (``OpenOrderParams.id`` / ``get_order(order_id)``)
+— an id we learn from the very response a lost order loses. There is therefore
+no way to ask "did the order I just sent land?" by an id we chose. The only
+signal available is the wallet's CTF balance delta, so a pre-order balance read
+is not an optimisation here, it is the entire recovery mechanism: without it a
+lost response after a real fill becomes an untracked on-chain position. Both
+order paths consequently refuse to place an order they could not confirm —
+BUY skips with ``ctf_balance_unavailable``, SELL with ``ctf_cache_not_synced``.
+Revisit if the SDK ever gains a client-supplied order id.
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ from openpoly.execution.clob_patch import (
     PartialCreateOrderOptions,
     Side,
 )
+from openpoly.execution.sizing import MIN_NOTIONAL_USD, dust_remainder_skip, quantize_size
 from openpoly.execution.types import ExecResult
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.portfolio import CloseReason, HeldPosition, PortfolioStore
@@ -52,12 +66,8 @@ CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 SIGTYPE_POLY_1271 = 3
 
-# Server-side rules verified by live smoke 2026-05-24:
-# - marketable BUY: maker amount max 2 decimals (cents); min size $1.00
-# - SELL          : taker amount max 4 decimals
-# We give a $0.10 buffer over the $1.00 floor so price/rounding wiggle won't
-# trip server rejection at the edge.
-_MIN_NOTIONAL_PUSD = 1.10
+# Order size + min-notional live in ``openpoly.execution.sizing`` so the paper
+# executor obeys exactly the same venue rules (see that module).
 _CTF_DECIMALS = 6  # CTF / Polymarket shares are 1e6 base units
 _CTF_POLL_ATTEMPTS = 5  # SELL right after BUY can hit cache lag; ~5s total
 _CTF_POLL_SLEEP = 1.0
@@ -66,29 +76,6 @@ _CTF_POLL_SLEEP = 1.0
 # phantom-open with its tokens already gone (root cause of stuck phantom-open positions).
 _CLOSE_PERSIST_ATTEMPTS = 5
 _CLOSE_PERSIST_SLEEP = 0.5
-
-
-def _quantize_size(qty: float, price: float) -> float:
-    """Floor qty so ``qty * price`` yields a clean ≤2-decimal maker amount.
-
-    Most Polymarket prices are 2-decimal-aligned (cents), in which case
-    integer qty is sufficient. For 3+ decimal prices we walk down to find
-    the largest integer qty whose maker amount lands on clean cents.
-    Returns 0.0 only if no qty in [1, floor(qty)] satisfies the rule,
-    which the caller handles via the min-notional floor.
-    """
-    base = int(qty)
-    if base <= 0:
-        return 0.0
-    # Common case: price is 2-dec-aligned → any integer qty is clean.
-    if abs(price * 100 - round(price * 100)) < 1e-9:
-        return float(base)
-    # Rare case: finer price → search.
-    for candidate in range(base, 0, -1):
-        maker_cents = candidate * price * 100
-        if abs(maker_cents - round(maker_cents)) < 1e-6:
-            return float(candidate)
-    return 0.0
 
 
 class _ClobClient(Protocol):
@@ -208,9 +195,9 @@ class LiveExecutor:
         # Quantize qty + check min notional against server rules verified
         # 2026-05-24. Both are pre-flight: cheaper to skip locally than to
         # eat a 400 round-trip + clutter logs with rejections.
-        size = _quantize_size(intent.qty, intent.price)
+        size = quantize_size(intent.qty, intent.price)
         notional = size * intent.price
-        if notional < _MIN_NOTIONAL_PUSD:
+        if notional < MIN_NOTIONAL_USD:
             return ExecResult.skip("min_notional_below_floor")
 
         # Refresh CLOB collateral allowance cache before signing (a prior project pattern).
@@ -224,8 +211,20 @@ class LiveExecutor:
             logger.warning("update_balance_allowance(COLLATERAL) failed: %s", exc)
 
         # Pre-order CTF balance — the baseline for lost-response confirmation
-        # below. None = read failed; confirmation then unavailable.
+        # below, and the ONLY one available: the SDK has no client order id to
+        # query a lost order by (see module header). Without the baseline a
+        # lost response after a real fill becomes an untracked on-chain
+        # position, so we refuse to place the order rather than trade blind.
         pre_raw = self._read_ctf_balance_raw(token_id)
+        if pre_raw is None:
+            logger.error(
+                "buy aborted for %s %s: CTF balance unreadable, so a lost order "
+                "response could not be confirmed — refusing to place an "
+                "unconfirmable order",
+                intent.market_id,
+                intent.side,
+            )
+            return ExecResult.skip("ctf_balance_unavailable")
 
         # GTC + crossing the spread acts like an aggressive market order. We
         # use GTC (not FAK) because a prior project's production verified it end-to-end
@@ -245,11 +244,7 @@ class LiveExecutor:
         except Exception as exc:  # noqa: BLE001
             # The order may have filled despite the lost response — confirm via
             # the balance before declaring failure (R5 at-least-once).
-            got = (
-                self._confirm_lost_order_qty(token_id, pre_raw, "rise")
-                if pre_raw is not None
-                else 0.0
-            )
+            got = self._confirm_lost_order_qty(token_id, pre_raw, "rise")
             if got > 0:
                 actual_qty = min(got, size)
                 # Response (and with it the real fill price) is lost; record at
@@ -272,6 +267,9 @@ class LiveExecutor:
                     news_id=news_id,
                     order_id=None,
                     tx_hash=None,
+                    entry_p_model=intent.p_model,
+                    entry_confidence=intent.confidence,
+                    entry_edge=intent.edge,
                 )
                 return ExecResult.ok(
                     price=intent.price,
@@ -310,6 +308,9 @@ class LiveExecutor:
             news_id=news_id,
             order_id=order_id,
             tx_hash=tx_hash,
+            entry_p_model=intent.p_model,
+            entry_confidence=intent.confidence,
+            entry_edge=intent.edge,
         )
         logger.info(
             "live buy filled: %s %s qty=%.4f @ %.4f order=%s tx=%s",
@@ -340,12 +341,14 @@ class LiveExecutor:
             return ExecResult.skip("no_bid_liquidity")
         bid_price = book.bids[0][0]
 
-        # Quantize SELL size symmetrically with BUY so taker (size * price)
-        # stays within server precision. Most likely a no-op since BUY also
-        # quantized, but defensive for partial-fill positions or hand-opened.
-        size = _quantize_size(position.qty, bid_price)
+        # Quantize SELL size symmetrically with BUY so the size stays within
+        # server precision.
+        size = quantize_size(position.qty, bid_price)
         if size <= 0:
-            return ExecResult.skip("min_notional_below_floor")
+            # Below one share: not a placeable order. The remainder still
+            # settles at the resolution price, so leave the row open rather
+            # than writing it off at 0.
+            return dust_remainder_skip(position)
 
         # Poll CTF balance — handles cache lag when SELL fires shortly after
         # BUY (live smoke testing saw ~3-5s lag). update_balance_allowance is

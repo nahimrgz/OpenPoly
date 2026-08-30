@@ -49,6 +49,7 @@ def _held(
     avg: float = 0.40,
     market_id: str = "m1",
     side: str = "yes",
+    qty: float = 20.0,
 ) -> HeldPosition:
     return HeldPosition(
         position_id=position_id,
@@ -56,7 +57,7 @@ def _held(
         side=side,  # type: ignore[arg-type]
         token_id=token_id,
         condition_id=f"0x{market_id}",
-        qty=20.0,
+        qty=qty,
         avg_entry_price=avg,
         opened_at=1.0,
     )
@@ -979,3 +980,61 @@ async def test_position_closed_mid_sweep_is_not_sold_from_the_stale_snapshot(tmp
     assert [(e.position_id, e.reason) for e in skips] == [
         (second.position_id, "position_no_longer_open")
     ]
+
+
+# ---------- sub-one-share remainder (dust) ----------
+
+
+async def test_dust_position_is_skipped_once_and_never_sold() -> None:
+    """A remainder below one share is not a placeable order: the executors
+    skip it and the row stays open until settlement. Evaluating it every tick
+    therefore produced a CloseIntent -> an unfilled sell -> an ``error`` row,
+    every 120s forever, which evicts the real closes from the 200-entry ring
+    and inflates the error counter. The monitor must not evaluate it at all:
+    one ``skip`` row per position, no sell, and it is not ``blocked``."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    ex = _FakeExecutor()
+    m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40, qty=0.6)]), ex)
+
+    for _ in range(3):
+        await m._tick_once()
+
+    assert ex.calls == []
+    entries = exit_log.entries()
+    assert len(entries) == 1
+    assert entries[0].verdict == "skip"
+    assert entries[0].reason == "dust_remainder"
+    assert entries[0].position_id == 1
+    assert [e for e in entries if e.verdict == "error"] == []
+    assert m.open_positions == 1
+    assert m.blocked == 0
+
+
+async def test_sellable_position_is_unaffected_by_the_dust_guard() -> None:
+    """Six shares is a placeable order — the dust guard must not touch it."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    ex = _FakeExecutor(result=ExecResult.ok(price=0.55, qty=6.0, position_id=1))
+    m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40, qty=6.0)]), ex)
+
+    await m._tick_once()
+
+    assert [c["position_id"] for c in ex.calls] == [1]
+    entries = exit_log.entries()
+    assert [e.verdict for e in entries] == ["ok"]
+    assert entries[0].trigger == "take_profit"
+
+
+async def test_dust_marker_is_pruned_when_the_position_stops_being_open() -> None:
+    """The dedup set is pruned against the current open list every tick, like
+    ``_unmarkable`` — it must not grow across the process lifetime."""
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    ex = _FakeExecutor()
+    pf = _FakePortfolio([_held(1, "t1", avg=0.40, qty=0.6)])
+    m = _monitor(pf, ex)
+
+    await m._tick_once()
+    assert m._dust == {1}
+
+    pf._positions = []
+    await m._tick_once()
+    assert m._dust == set()

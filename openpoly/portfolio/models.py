@@ -68,6 +68,13 @@ class PositionRecord:
     ``realized_pnl`` is a materialized derived value: it equals
     ``(sell_price - avg_entry_price) * qty`` from the two fills and is
     recomputable from the ledger, not an authoritative mutable field.
+
+    ``entry_*`` are the entry decision's own inputs, frozen at open time: the
+    analyzer's ``p_model`` and ``confidence`` and the entry section's ``edge``
+    (``fair - held_price``; the held price itself is ``avg_entry_price``).
+    They exist so an outcome can be joined back to the belief that produced it
+    — see ``openpoly.analytics.calibration``. None on any position opened
+    without an entry decision (manual, reconciled, pre-calibration rows).
     """
 
     id: int
@@ -82,3 +89,6 @@ class PositionRecord:
     closed_at: float | None
     close_reason: str | None
     realized_pnl: float | None
+    entry_p_model: float | None = None
+    entry_confidence: str | None = None
+    entry_edge: float | None = None

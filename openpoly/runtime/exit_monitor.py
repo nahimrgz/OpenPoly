@@ -48,6 +48,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from openpoly.db.tables import OrderBookSnapshot
 from openpoly.execution import ExecResult
 from openpoly.execution import executor as _executor_singleton
+from openpoly.execution.sizing import is_dust_qty
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook
 from openpoly.markets.store import MarketStore
@@ -178,6 +179,13 @@ class ExitMonitor:
         # position becomes markable (or closes), so a book that goes thin twice
         # is logged twice.
         self._unmarkable: set[int] = set()
+        # Positions already logged as ``dust_remainder`` — same dedup contract
+        # as ``_unmarkable``. A sub-one-share remainder is not a placeable
+        # order, so evaluating it produced a CloseIntent → a sell the executor
+        # can only skip → an ``error`` row, every tick, for as long as the
+        # market stayed unresolved (~720 rows/day into a 200-entry ring). One
+        # row per position; the id is dropped again when it stops being open.
+        self._dust: set[int] = set()
 
     @property
     def state(self) -> State:
@@ -356,9 +364,11 @@ class ExitMonitor:
         for held in opens:
             watch.setdefault(held.token_id, []).append(held.position_id)
         self._watch = watch
-        # Drop the unmarkable marker for anything no longer open, so the set
-        # can't grow across the process lifetime.
-        self._unmarkable &= {held.position_id for held in opens}
+        # Drop the unmarkable / dust markers for anything no longer open, so
+        # neither set can grow across the process lifetime.
+        open_ids = {held.position_id for held in opens}
+        self._unmarkable &= open_ids
+        self._dust &= open_ids
         blocked = 0
         for held in opens:
             try:
@@ -374,9 +384,21 @@ class ExitMonitor:
     async def _evaluate(self, held: HeldPosition, catalog: MarketStore, ts: float) -> bool:
         """Evaluate one position. Returns True when it could not be evaluated
         (no order book, or no level deep enough to mark against — counted as
-        ``blocked``); False when held within thresholds or closed. ok / error
-        closes are logged; within-threshold and unmarkable holds are not (see
-        tick telemetry)."""
+        ``blocked``); False when held within thresholds, dust, or closed. ok /
+        error closes are logged; within-threshold and unmarkable holds are not
+        (see tick telemetry)."""
+        if is_dust_qty(held.qty):
+            # A remainder below one share cannot be sold at all (see
+            # execution.sizing): the row stays open until settlement closes it
+            # at the resolution price. Evaluating it anyway means a CloseIntent
+            # every tick and an ``error`` row for a sell that was never
+            # placeable — noise that evicts the real closes from the log ring.
+            # Not blocked either: nothing is wrong with the book, there is
+            # simply nothing to do. Logged once per position (see ``_dust``).
+            if held.position_id not in self._dust:
+                self._dust.add(held.position_id)
+                self._log(held, ts, verdict="skip", reason="dust_remainder")
+            return False
         book = catalog.get_order_book(held.token_id)
         if book is None or not book.bids:
             return True

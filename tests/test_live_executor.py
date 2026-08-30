@@ -34,6 +34,7 @@ class _FakeClob:
         ctf_balance_sequence: list[int] | None = None,
         cancel_raises: bool = False,
         order_status: dict[str, Any] | None = None,
+        balance_read_raises: bool = False,
     ) -> None:
         self._response = order_response or {
             "success": True,
@@ -51,6 +52,7 @@ class _FakeClob:
         # gate read and the post-exception confirmation polls.
         self._ctf_balance_sequence = list(ctf_balance_sequence) if ctf_balance_sequence else None
         self._cancel_raises = cancel_raises
+        self._balance_read_raises = balance_read_raises
         # get_order response; default "0" so the final qty falls back to the
         # reported fill (max(matched, reported)).
         self._order_status = order_status or {"size_matched": "0"}
@@ -66,7 +68,10 @@ class _FakeClob:
 
     def update_balance_allowance(self, params):
         self.allowance_updates.append(params)
-        if self._allowance_update_raises:
+        # Scoped to the pre-signing COLLATERAL refresh: the CONDITIONAL read is
+        # the lost-response confirmation baseline, whose failure is a separate
+        # (and fatal) case — see balance_read_raises.
+        if self._allowance_update_raises and params.asset_type == "COLLATERAL":
             raise RuntimeError("cache refresh failed")
 
     def cancel_order(self, payload):
@@ -78,6 +83,8 @@ class _FakeClob:
         return self._order_status
 
     def get_balance_allowance(self, params):
+        if self._balance_read_raises:
+            raise RuntimeError("balance read failed")
         # CONDITIONAL queries return the CTF balance the SELL poll checks;
         # COLLATERAL queries don't matter for these tests.
         if self._ctf_balance_sequence is not None:
@@ -177,13 +184,13 @@ def test_buy_skips_when_below_min_notional(store) -> None:
 
 
 def test_buy_quantizes_fractional_qty_down(store) -> None:
-    """qty=5.56 → floors to 5; maker = 5 * 0.50 = $2.50 (clean cents)."""
+    """qty=5.567 → floors to 5.56; the SDK allows 2 size decimals."""
     m = _market("m1")
     _populate(m)
     clob = _FakeClob()
     le = LiveExecutor(portfolio=store, clob_client=clob)
-    le.execute_buy(_intent(qty=5.56, price=0.50), news_id="n", ts=1.0)
-    assert clob.posted[0]["order_args"].size == 5.0
+    le.execute_buy(_intent(qty=5.567, price=0.50), news_id="n", ts=1.0)
+    assert clob.posted[0]["order_args"].size == pytest.approx(5.56)
 
 
 def test_buy_market_not_in_catalog_skips(store) -> None:
@@ -267,7 +274,8 @@ def test_buy_neg_risk_flag_passed_to_options(store) -> None:
 
 
 def test_buy_allowance_refresh_failure_is_non_fatal(store) -> None:
-    """Allowance cache refresh is best-effort — order should still attempt."""
+    """The pre-signing COLLATERAL allowance refresh is best-effort — the order
+    should still attempt (unlike the CTF baseline read, which is not)."""
     m = _market("m1")
     _populate(m)
     clob = _FakeClob(allowance_update_raises=True)
@@ -799,3 +807,133 @@ def test_sell_partial_fill_cancels_resting_remainder(store) -> None:
     r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.filled is True
     assert clob.cancelled == ["0xSPART"]  # the unsold 3 don't rest
+
+
+# ---------- dust remainder (below one share: not sellable, still valuable) ----------
+
+
+def test_sell_skips_a_sub_one_share_remainder_and_leaves_it_open(store) -> None:
+    """A partial sell can leave < 1 share open, which is not a placeable order.
+    It is still worth its resolution price at settlement, so the sell skips and
+    the row stays open — writing it off at 0.0 would book a fake loss and
+    orphan the tokens."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = store.open_position(
+        market_id="m1",
+        side="yes",
+        token_id=m.yes_token_id,
+        condition_id=m.condition_id,
+        price=0.40,
+        qty=10.0,
+        ts=100.0,
+        news_id="n",
+    )
+    # A prior partial sell leaves 0.6 shares open.
+    store.record_sell(
+        held.position_id,
+        sold_qty=9.4,
+        sell_price=0.55,
+        ts=150.0,
+        close_reason="take_profit",
+    )
+    remainder = store.get_open_position("m1", "yes")
+    assert remainder is not None and remainder.qty == pytest.approx(0.6)
+
+    clob = _FakeClob()
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(remainder, close_reason="take_profit", ts=200.0)
+
+    assert r.filled is False
+    assert r.skip_reason == "dust_remainder"
+    assert clob.posted == []  # nothing placeable was ever sent
+    rec = store.get_position(held.position_id)
+    assert rec is not None
+    assert rec.status == "open"
+    assert rec.qty == pytest.approx(0.6)
+    # Only the earlier partial's gain is realized — the remainder is not a loss.
+    assert rec.realized_pnl == pytest.approx((0.55 - 0.40) * 9.4)
+
+
+def test_sell_does_not_skip_a_whole_share_position(store) -> None:
+    """A position of 2 shares is a placeable order — it sells, it is not dust."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = store.open_position(
+        market_id="m1",
+        side="yes",
+        token_id=m.yes_token_id,
+        condition_id=m.condition_id,
+        price=0.40,
+        qty=2.0,
+        ts=100.0,
+        news_id="n",
+    )
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xSELL",
+            "makingAmount": "2.0",
+            "takingAmount": "1.1",
+            "transactionsHashes": ["0xSTX"],
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
+
+    assert r.filled is True
+    assert r.price == pytest.approx(0.55)
+    assert len(clob.posted) == 1
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.close_reason == "take_profit"
+
+
+# ---------- order idempotency fallback (no client order id in the SDK) ----------
+
+
+def test_buy_refuses_to_post_without_a_ctf_baseline(store) -> None:
+    """Without a pre-order CTF balance there is no way to tell a lost response
+    from a real fill, and the SDK offers no client order id to query by — so a
+    fill would become an untracked position. Refuse to place the order."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(balance_read_raises=True)
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+
+    assert r.filled is False
+    assert r.skip_reason == "ctf_balance_unavailable"
+    assert clob.posted == []
+    assert store.get_open_position("m1", "yes") is None
+
+
+def test_live_buy_persists_the_entry_signals_from_the_intent(store) -> None:
+    """Same calibration contract as paper — a live fill must be joinable to the
+    belief that opened it."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xORDER",
+            "makingAmount": "4.0",
+            "takingAmount": "10.0",
+        }
+    )
+    intent = OrderIntent(
+        market_id="m1",
+        side="yes",
+        price=0.5,
+        qty=10.0,
+        p_model=0.61,
+        confidence="medium",
+        edge=0.11,
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(intent, news_id="n1", ts=100.0)
+    assert r.filled is True
+    rec = store.get_position(r.position_id)
+    assert rec is not None
+    assert rec.entry_p_model == 0.61
+    assert rec.entry_confidence == "medium"
+    assert rec.entry_edge == 0.11

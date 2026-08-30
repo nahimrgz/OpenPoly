@@ -18,6 +18,7 @@ from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook
 from openpoly.markets.store import MarketStore
 from openpoly.portfolio import PortfolioStore
+from openpoly.runtime.closing_registry import closing_ids, is_closing, mark_closing
 
 
 @pytest.fixture
@@ -187,4 +188,88 @@ def test_close_all_partial_failure_does_not_block_others(env) -> None:
     assert store.get_position(p1.position_id).status == "closed"
     assert store.get_position(p3.position_id).status == "closed"
     # 2 still open.
+    assert store.get_position(p2.position_id).status == "open"
+
+
+# ---------- in-flight close claims (the exit monitor holds the position) ----------
+
+
+def test_close_conflicts_with_an_in_flight_exit(env) -> None:
+    """The exit monitor's sell runs in a worker thread, so its position stays
+    ``open`` in the DB for seconds while the tokens are already being sold.
+    A manual close in that window is a second on-chain sell of the same
+    position — refuse it."""
+    store, client = env
+    held = _open(store)
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    mark_closing(held.position_id)
+
+    r = client.post(f"/api/positions/{held.position_id}/close")
+
+    assert r.status_code == 409
+    assert r.json()["detail"] == "exit_in_flight"
+    # Untouched: the exit monitor still owns this position.
+    assert store.get_position(held.position_id).status == "open"
+
+
+def test_close_registers_and_releases_the_claim(env) -> None:
+    """The manual close must itself claim the position, so the settlement and
+    reconciliation monitors skip it while the sell is in flight — and must
+    release it on the way out."""
+    store, client = env
+    held = _open(store)
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+
+    seen: list[bool] = []
+
+    class _Watching:
+        def execute_sell(self, position, *, close_reason, ts, trigger=None):
+            seen.append(is_closing(position.position_id))
+            return Executor(store).execute_sell(
+                position, close_reason=close_reason, ts=ts, trigger=trigger
+            )
+
+    portfolio_routes.executor = _Watching()
+    r = client.post(f"/api/positions/{held.position_id}/close")
+
+    assert r.status_code == 200, r.text
+    assert seen == [True]  # claimed for the duration of the sell
+    assert closing_ids() == frozenset()  # released afterwards
+
+
+def test_close_releases_the_claim_when_the_sell_raises(env) -> None:
+    store, client = env
+    held = _open(store)
+
+    class _Boom:
+        def execute_sell(self, position, *, close_reason, ts, trigger=None):
+            raise RuntimeError("clob down")
+
+    portfolio_routes.executor = _Boom()
+    with pytest.raises(RuntimeError):
+        client.post(f"/api/positions/{held.position_id}/close")
+
+    assert closing_ids() == frozenset()
+
+
+def test_close_all_skips_positions_with_an_in_flight_exit(env) -> None:
+    """Bulk close must not fight the exit monitor either — the claimed ids are
+    skipped and reported, the rest still close."""
+    store, client = env
+    p1 = _open(store, token_id="t1", market_id="m1")
+    p2 = _open(store, token_id="t2", market_id="m2")
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55), _book("t2", bid=0.50)])
+    mark_closing(p2.position_id)
+
+    r = client.post("/api/positions/close-all")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["attempted"] == 2
+    assert body["filled"] == 1
+    assert body["skipped"] == 1
+    by_id = {d["position_id"]: d for d in body["details"]}
+    assert by_id[p2.position_id]["ok"] is False
+    assert by_id[p2.position_id]["skip_reason"] == "exit_in_flight"
+    assert store.get_position(p1.position_id).status == "closed"
     assert store.get_position(p2.position_id).status == "open"

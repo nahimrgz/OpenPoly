@@ -770,3 +770,144 @@ def test_kill_consecutive_runs_before_lockout() -> None:
     out = _run(inst, _ar(p_model=0.30))
     assert out.verdict == "skip"
     assert out.reason == "kill_consecutive_losses"
+
+
+# ---------- size_edge_multiplier_max (edge-scaled sizing, OFF by default) ----------
+#
+# ask 0.50 / bid 0.48 with p_model 0.60 gives edge = 0.10 = 2 x the default
+# min_edge, so the multiplier under test is exactly 2.0 before clamping.
+
+
+def _edge_book() -> OrderBook:
+    return _book("yes-m1", bid=0.48, ask=0.50)
+
+
+def test_default_sizing_ignores_edge_entirely() -> None:
+    """Default is 1.0: sizing must stay exactly order_size_usd / held_price,
+    whatever the edge, and must not add a multiplier signal."""
+    _populate(_market(), _edge_book())
+    out = _run(EdgeThresholdEntryV0(EdgeThresholdConfig()), _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert isinstance(out.payload, OrderIntent)
+    assert out.payload.qty == pytest.approx(10.0 / 0.50)
+    assert "size_multiplier" not in out.signals
+
+
+def test_edge_multiplier_scales_the_order() -> None:
+    """edge = 2 x min_edge with headroom to 3 x → double the notional."""
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(EdgeThresholdConfig(size_edge_multiplier_max=3.0))
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(2 * 10.0 / 0.50)
+    assert out.signals["size_multiplier"] == pytest.approx(2.0)
+
+
+def test_edge_multiplier_is_clamped_to_its_maximum() -> None:
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(EdgeThresholdConfig(size_edge_multiplier_max=1.5))
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.payload.qty == pytest.approx(1.5 * 10.0 / 0.50)
+
+
+def test_a_marginal_edge_barely_scales_the_order() -> None:
+    """Scaling is proportional, so an edge only just over min_edge buys only
+    just over order_size_usd — the knob is not a step function."""
+    # ask 0.55 / p_model 0.605 → edge = 0.055 = 1.1 x the 0.05 min_edge.
+    _populate(_market(), _book("yes-m1", bid=0.52, ask=0.55))
+    inst = EdgeThresholdEntryV0(EdgeThresholdConfig(size_edge_multiplier_max=3.0))
+    out = _run(inst, _ar(p_model=0.605))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(1.1 * 10.0 / 0.55)
+    assert out.payload.qty > 10.0 / 0.55
+
+
+def test_zero_min_edge_does_not_divide_by_zero() -> None:
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(EdgeThresholdConfig(min_edge=0.0, size_edge_multiplier_max=3.0))
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(10.0 / 0.50)
+
+
+def test_heat_cap_binds_on_the_scaled_notional() -> None:
+    """The cap has to bound what actually gets bought. A 2x multiplier wants
+    $20 of exposure against a $15 cap — the extra size the multiplier grants
+    is what gets cut, down to the headroom."""
+    _populate(_market(), _edge_book())
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(heat_cap_usd=15.0, size_edge_multiplier_max=3.0),
+        portfolio_provider=lambda: _FakePortfolio([]),
+    )
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(15.0 / 0.50)  # $15, not $20
+    assert out.signals["size_multiplier"] == pytest.approx(1.5)
+
+
+def test_heat_cap_counts_existing_exposure_against_the_scaled_notional() -> None:
+    """One $4 open position eats into the headroom the multiplier may use."""
+    _populate(_market(), _edge_book())
+    opens = [_rec("other1", "yes", opened_at=_time.time() - 600, position_id=10)]
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(heat_cap_usd=18.0, size_edge_multiplier_max=3.0),
+        portfolio_provider=lambda: _FakePortfolio(opens),
+    )
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    # headroom = 18 - 4 = $14 → multiplier 1.4.
+    assert out.payload.qty == pytest.approx(14.0 / 0.50)
+
+
+def test_heat_cap_never_shrinks_the_base_order() -> None:
+    """The cap gates pre-existing exposure (unchanged); it must not start
+    shrinking an unscaled order below order_size_usd."""
+    _populate(_market(), _edge_book())
+    opens = [_rec("other1", "yes", opened_at=_time.time() - 600, position_id=10)]
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(heat_cap_usd=6.0, size_edge_multiplier_max=3.0),
+        portfolio_provider=lambda: _FakePortfolio(opens),
+    )
+    out = _run(inst, _ar(p_model=0.60))
+    assert out.verdict == "ok"
+    assert out.payload.qty == pytest.approx(10.0 / 0.50)
+
+
+def test_multiplier_bounds_are_enforced_by_config() -> None:
+    with pytest.raises(ValueError):
+        EdgeThresholdConfig(size_edge_multiplier_max=0.5)
+    with pytest.raises(ValueError):
+        EdgeThresholdConfig(size_edge_multiplier_max=5.5)
+
+
+def test_multiplier_description_points_at_the_calibration_gate() -> None:
+    """The knob is only safe after calibration says so — the config has to say
+    that, since the canvas UI shows nothing else."""
+    field = EdgeThresholdConfig.model_fields["size_edge_multiplier_max"]
+    assert field.default == 1.0
+    assert "calibration" in field.description
+
+
+# ---------- the intent carries the belief that produced it ----------
+
+
+def test_intent_carries_the_entry_signals() -> None:
+    _populate(_market(), _edge_book())
+    out = _run(EdgeThresholdEntryV0(EdgeThresholdConfig()), _ar(p_model=0.60))
+    intent = out.payload
+    assert intent.p_model == pytest.approx(0.60)
+    assert intent.confidence == "medium"
+    assert intent.edge == pytest.approx(0.10)
+
+
+def test_intent_carries_the_raw_p_model_on_a_no_side() -> None:
+    """Stored raw; the held-side view is derived by the calibration report."""
+    _populate(_market(), _book("no-m1", bid=0.38, ask=0.40))
+    out = _run(EdgeThresholdEntryV0(EdgeThresholdConfig()), _ar(p_model=0.30))
+    assert out.payload.side == "no"
+    assert out.payload.p_model == pytest.approx(0.30)
+    assert out.payload.edge == pytest.approx(0.30)
+
+
+def test_section_version_bumped_for_the_sizing_knob() -> None:
+    assert EdgeThresholdEntryV0.SECTION_VERSION == "0.4.0"

@@ -179,3 +179,35 @@ def test_unconfigured_executor_raises() -> None:
     _populate(_market(), _book("yes-m1", ask=0.42))
     with pytest.raises(RuntimeError, match="PortfolioStore"):
         Executor().execute_buy(_intent(), news_id="n1", ts=1.0)
+
+
+# ---------- entry calibration signals ----------
+
+
+def test_buy_persists_the_entry_signals_from_the_intent(store) -> None:
+    """The executor is the only thing that touches the position row, so it is
+    what has to carry the entry decision's signals into it."""
+    _populate(_market(), _book("yes-m1", ask=0.42))
+    intent = OrderIntent(
+        market_id="m1",
+        side="yes",
+        price=0.42,
+        qty=20.0,
+        p_model=0.68,
+        confidence="high",
+        edge=0.26,
+    )
+    r = Executor(store).execute_buy(intent, news_id="n1", ts=1.0)
+    assert r.filled
+    rec = store.get_position(r.position_id)
+    assert rec is not None
+    assert rec.entry_p_model == 0.68
+    assert rec.entry_confidence == "high"
+    assert rec.entry_edge == 0.26
+
+
+def test_buy_without_signals_leaves_them_null(store) -> None:
+    _populate(_market(), _book("yes-m1", ask=0.42))
+    r = Executor(store).execute_buy(_intent(qty=20.0), news_id="n1", ts=1.0)
+    rec = store.get_position(r.position_id)
+    assert rec is not None and rec.entry_p_model is None

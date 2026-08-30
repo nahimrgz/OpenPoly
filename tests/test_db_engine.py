@@ -88,3 +88,46 @@ def test_ensure_fill_live_columns_migrates_old_db(tmp_path) -> None:
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(fill)")).fetchall()}
     assert "order_id" in cols
     assert "tx_hash" in cols
+
+
+def test_position_table_has_entry_calibration_columns(tmp_path) -> None:
+    """A new DB gets the entry-signal columns straight from create_all."""
+    from sqlalchemy import text
+
+    engine = make_engine(f"sqlite:///{tmp_path}/cal.db")
+    init_db(engine)
+    with engine.begin() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(position)")).fetchall()}
+    assert {"entry_p_model", "entry_confidence", "entry_edge"} <= cols
+
+
+def test_ensure_position_entry_columns_migrates_old_db(tmp_path) -> None:
+    """Old DB predating calibration: migration adds them, idempotent."""
+    from sqlalchemy import text
+    from openpoly.db.manager import _ensure_position_entry_columns
+
+    engine = make_engine(f"sqlite:///{tmp_path}/x.db")
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+            CREATE TABLE position (
+                id INTEGER PRIMARY KEY,
+                market_id VARCHAR NOT NULL,
+                side VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                condition_id VARCHAR NOT NULL,
+                qty FLOAT NOT NULL,
+                avg_entry_price FLOAT NOT NULL,
+                status VARCHAR NOT NULL,
+                opened_at FLOAT NOT NULL,
+                closed_at FLOAT,
+                close_reason VARCHAR,
+                realized_pnl FLOAT
+            )
+        """)
+        )
+    for _ in range(2):  # second run must be a no-op
+        _ensure_position_entry_columns(engine)
+        with engine.begin() as conn:
+            cols = {r[1] for r in conn.execute(text("PRAGMA table_info(position)")).fetchall()}
+        assert {"entry_p_model", "entry_confidence", "entry_edge"} <= cols

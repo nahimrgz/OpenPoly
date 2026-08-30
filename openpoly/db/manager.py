@@ -48,6 +48,26 @@ def _ensure_fill_live_columns(engine: Engine) -> None:
             logger.info("migration: added fill.tx_hash")
 
 
+def _ensure_position_entry_columns(engine: Engine) -> None:
+    """Idempotent migration: add the entry-signal columns to the position table
+    if they are missing (older DBs predate calibration). New DBs get them via
+    init_db()'s create_all and skip this entirely.
+
+    Same hand-rolled PRAGMA-then-ALTER shape as ``_ensure_fill_live_columns``:
+    SQLite's ALTER TABLE ADD COLUMN only fails if the column exists, so we
+    check first instead of catching."""
+    with engine.begin() as conn:
+        existing = {r[1] for r in conn.execute(text("PRAGMA table_info(position)")).fetchall()}
+        for column, sql_type in (
+            ("entry_p_model", "FLOAT"),
+            ("entry_confidence", "VARCHAR"),
+            ("entry_edge", "FLOAT"),
+        ):
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE position ADD COLUMN {column} {sql_type}"))
+                logger.info("migration: added position.%s", column)
+
+
 class DatabaseConfig(BaseModel):
     """Config for the ``database`` section.
 
@@ -78,6 +98,7 @@ class DatabaseManager:
         self._engine = engine or get_engine()
         init_db(self._engine)
         _ensure_fill_live_columns(self._engine)
+        _ensure_position_entry_columns(self._engine)
         factory = make_session_factory(self._engine)
         self._book_writer = WriteBehindWriter(make_order_book_sink(factory))
         self._news_writer = WriteBehindWriter(make_news_sink(factory))
@@ -146,6 +167,9 @@ class DatabaseManager:
         return {
             "written": writer.written,
             "dropped": writer.dropped,
+            # Sink failures: a non-zero count means batches were lost to a
+            # persistence outage, which is otherwise invisible from outside.
+            "errors": writer.errors,
             "pending": writer.pending,
         }
 
