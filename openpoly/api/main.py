@@ -186,6 +186,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Exit monitor — the timer-driven close loop; shares the executor with the
     # orchestrator. Configure with its own PortfolioStore, then start ticking.
     exit_monitor.configure(PortfolioStore(get_session_factory()))
+    # Rebuild trailing-stop peaks from persisted snapshots BEFORE the first
+    # tick. The trailing lock is the primary winner exit (take_profit ships
+    # off), and without this call a restart forgot every run-up and re-seeded
+    # each peak at the current mark — the exact give-back the lock exists to
+    # prevent. Synchronous startup-only scan, served by the
+    # (token_id, recorded_at) index.
+    exit_monitor.bootstrap_peaks(get_session_factory())
     await exit_monitor.start()
     # Settlement monitor (slice E) — closes resolved-market positions at 0/1
     # directly via PortfolioStore (no broker tx). Independent from exit_monitor

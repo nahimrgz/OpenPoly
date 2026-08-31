@@ -26,7 +26,14 @@ class OrderBookSnapshot(Base):
     """
 
     __tablename__ = "order_book_snapshot"
-    __table_args__ = (Index("ix_order_book_snapshot_token_recorded", "token_id", "recorded_at"),)
+    __table_args__ = (
+        Index("ix_order_book_snapshot_token_recorded", "token_id", "recorded_at"),
+        # Bare recorded_at index for the retention prune: its DELETE filters on
+        # recorded_at alone, which the token_id-led composite can only
+        # full-scan, never seek (no skip-scan without ANALYZE). Mirrors
+        # migration 4 so fresh databases match migrated ones.
+        Index("ix_order_book_snapshot_recorded_at", "recorded_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     token_id: Mapped[str] = mapped_column(index=True)

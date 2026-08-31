@@ -329,6 +329,13 @@ def set_mode(
                 },
             )
 
+        # Hand the freshly validated executor to the dispatcher NOW.
+        # ``executor.configure_live`` otherwise runs only in the boot lifespan
+        # (behind ``runtime_state.wallet is not None``), so a wallet configured
+        # after boot flipped the mode while every trade skipped with
+        # ``live_not_ready`` until the next restart.
+        executor.configure_live(le)
+
     runtime_state.set_mode(target)
     logger.info("exec mode -> %s", target)
     return SetModeResponse(mode=target)

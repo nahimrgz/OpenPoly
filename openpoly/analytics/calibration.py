@@ -45,7 +45,9 @@ class CalibrationBucket:
     average of ``realized_pnl / cost_basis``, where the cost basis is what was
     paid to *open* the position — it answers a different question (is the edge
     worth trading) and can disagree with the win rate.
-    Both are None for an empty bucket rather than a misleading 0.0.
+    Both are None for an empty bucket rather than a misleading 0.0;
+    ``mean_return`` is also None when no row in the bucket has a measurable
+    (positive) cost basis.
     """
 
     lower: float
@@ -111,6 +113,7 @@ def calibration_report(
     wins: list[int] = [0] * (len(BUCKET_EDGES) - 1)
     counts: list[int] = [0] * (len(BUCKET_EDGES) - 1)
     returns: list[float] = [0.0] * (len(BUCKET_EDGES) - 1)
+    measured: list[int] = [0] * (len(BUCKET_EDGES) - 1)
 
     for record in positions:
         if record.status != "closed" or record.realized_pnl is None:
@@ -125,7 +128,12 @@ def calibration_report(
         if record.realized_pnl > 0:
             wins[index] += 1
         basis = basis_by_id.get(record.id, record.avg_entry_price * record.qty)
-        returns[index] += record.realized_pnl / basis if basis > 0 else 0.0
+        if basis > 0:
+            returns[index] += record.realized_pnl / basis
+            measured[index] += 1
+        # basis <= 0 → the return is unmeasurable: leave it out of mean_return
+        # instead of diluting the bucket with a fake 0.0. The row still counts
+        # toward count / win_rate, which need no basis.
 
     return [
         CalibrationBucket(
@@ -133,7 +141,7 @@ def calibration_report(
             upper=BUCKET_EDGES[i + 1],
             count=counts[i],
             win_rate=(wins[i] / counts[i]) if counts[i] else None,
-            mean_return=(returns[i] / counts[i]) if counts[i] else None,
+            mean_return=(returns[i] / measured[i]) if measured[i] else None,
         )
         for i in range(len(counts))
     ]

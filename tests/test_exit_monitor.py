@@ -21,7 +21,7 @@ from openpoly.markets.models import OrderBook
 from openpoly.markets.store import MarketStore
 from openpoly.portfolio import HeldPosition, PortfolioStore
 from openpoly.portfolio.models import PositionRecord
-from openpoly.runtime.closing_registry import is_closing
+from openpoly.runtime.closing_registry import is_closing, mark_closing
 from openpoly.runtime.exit_monitor import ExitMonitor
 from openpoly.runtime.reconciliation_monitor import ReconciliationMonitor
 from openpoly.runtime.section_log import exit_log
@@ -1177,3 +1177,108 @@ async def test_peak_is_dropped_when_the_position_stops_being_open() -> None:
     pf._positions = []
     await m._tick_once()
     assert m._peak == {}
+
+
+# ---------- the lifespan must rebuild peaks before the first tick ----------
+
+
+class _StubEmbeddingManager:
+    """Stand-in for the process-wide embedding manager during the lifespan —
+    its warm loop is not under test and its stop Event is created once per
+    process (see tests/test_api_security.py)."""
+
+    async def start(self, **_kwargs: object) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+async def test_lifespan_bootstraps_peaks_before_the_first_tick(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Startup must rebuild the trailing-stop peaks from persisted snapshots.
+
+    ``bootstrap_peaks`` is unit-tested above; what this pins is that the boot
+    path actually calls it. Without the call the restart forgot every run-up
+    and re-seeded each peak at the next tick's mark — the give-back the
+    trailing lock exists to prevent. Drives the real ``main.lifespan``.
+    """
+    import openpoly.api.main as main_mod
+    from openpoly.wallet.runtime_state import RuntimeState
+
+    engine = make_engine(f"sqlite:///{tmp_path}/lifespan_peaks.db")
+    init_db(engine)
+    sf = make_session_factory(engine)
+    pf = PortfolioStore(sf)
+    held = pf.open_position(
+        market_id="m1",
+        side="yes",
+        # Token nothing else in the suite samples, so the catalog holds no
+        # book for it and only bootstrap_peaks can populate its peak.
+        token_id="lifespan-peak-token",
+        condition_id="0xm1",
+        qty=20.0,
+        price=0.40,
+        ts=100.0,
+        news_id="n1",
+    )
+    with sf() as session:
+        session.add(
+            OrderBookSnapshot(
+                token_id="lifespan-peak-token",
+                recorded_at=120.0,  # after opened_at — a run-up to 0.55
+                bids_json=json.dumps([[0.55, 100]]),
+                asks_json=json.dumps([[0.56, 100]]),
+            )
+        )
+        session.commit()
+
+    # The lifespan reads the process session factory; point it at this DB so
+    # the store it hands the monitor and the snapshots it scans are the ones
+    # seeded above.
+    monkeypatch.setattr(main_mod, "get_session_factory", lambda: sf)
+    monkeypatch.setattr(main_mod, "embedding_manager", _StubEmbeddingManager())
+    monkeypatch.setattr(main_mod, "runtime_state", RuntimeState(tmp_path / "runtime.json"))
+
+    from openpoly.runtime.exit_monitor import exit_monitor as singleton
+
+    saved_peak, saved_watch = singleton._peak, singleton._watch
+    saved_portfolio = singleton._portfolio
+    singleton._peak = {}
+    try:
+        async with main_mod.lifespan(main_mod.app):
+            pass
+        peak = singleton._peak
+    finally:
+        singleton._peak, singleton._watch = saved_peak, saved_watch
+        singleton._portfolio = saved_portfolio
+        engine.dispose()
+
+    # 0.55 is the snapshot's depth-qualified bid; 0.40 would be the
+    # avg_entry_price fallback and an empty dict is "peaks were discarded".
+    assert peak.get(held.position_id) == pytest.approx(0.55)
+
+
+# ---------- the manual close routes hold the claim too ----------
+
+
+async def test_tick_skips_a_position_a_manual_close_already_claimed() -> None:
+    """The claim is symmetric. ``POST /api/positions/{id}/close`` marks the
+    position before its first await and its sell then runs in a worker thread,
+    so the row is still ``open`` when the next tick reads it — and the monitor
+    would sell tokens that are already being sold. Skip and reconsider next
+    tick.
+    """
+    market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
+    ex = _FakeExecutor()
+    m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), ex)
+    mark_closing(1)  # a manual close route owns this position right now
+
+    await m._tick_once()  # +37.5% — the section does return a CloseIntent
+
+    assert ex.calls == []
+    skips = [e for e in exit_log.entries() if e.verdict == "skip"]
+    assert len(skips) == 1
+    assert skips[0].reason == "exit_in_flight"
+    assert skips[0].position_id == 1
+    # The route's claim is untouched — only its own ``finally`` may clear it.
+    assert is_closing(1)

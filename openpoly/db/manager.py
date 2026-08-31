@@ -199,7 +199,11 @@ class DatabaseManager:
         stamp = time.time() if now is None else now
         cutoff = stamp - retention_days * SECONDS_PER_DAY
         deleted = 0
-        while True:
+        # Bail between batches once shutdown starts: stop() cancels only the
+        # awaiting task — this worker thread runs on regardless — and a large
+        # backlog sweep would otherwise keep contending with the writers' final
+        # flush (and hold process exit) until it finished on its own.
+        while not self._prune_stop.is_set():
             with self._engine.begin() as conn:
                 removed = conn.execute(
                     text(

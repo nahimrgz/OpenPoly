@@ -60,6 +60,17 @@ MIN_SELL_SHARES = 1.0
 _dust_warned: set[int] = set()
 
 
+def reset_dust_warnings_for_tests() -> None:
+    """Drop the warn-once markers.
+
+    Process-global like ``closing_registry``: a marker left by one test would
+    silently suppress the warning for every later test in the session
+    (position ids restart at 1 per fresh test DB). Wired into the autouse
+    registry-reset fixture in ``tests/conftest.py``; never called in runtime.
+    """
+    _dust_warned.clear()
+
+
 def is_dust_qty(qty: float) -> bool:
     """True when ``qty`` is below the venue's one-share sell minimum.
 

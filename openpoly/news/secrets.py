@@ -36,6 +36,18 @@ class UnsupportedScheme(SecretsError):
     """The reference uses a scheme the resolver does not recognize."""
 
 
+# Every scheme ``resolve`` recognizes, colon included — the single source for
+# "is this value a ref or a literal secret". ``vault:`` / ``keychain:`` are
+# reserved (resolve raises NotImplementedError) but still refs, never literals.
+# Mirrored (by comment only) in frontend/src/lib/refUtils.ts.
+REF_SCHEMES: tuple[str, ...] = ("env:", "local:", "vault:", "keychain:")
+
+
+def is_secret_ref(value: str) -> bool:
+    """True when ``value`` is a ``*_ref`` rather than a literal secret."""
+    return value.startswith(REF_SCHEMES)
+
+
 def resolve(ref: str) -> str:
     """Resolve a `*_ref` string into the actual secret value.
 

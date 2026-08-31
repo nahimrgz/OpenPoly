@@ -55,8 +55,17 @@ export function setApiToken(token: string): string {
   return trimmed
 }
 
-function isMutating(init?: RequestInit): boolean {
-  return MUTATING_METHODS.has((init?.method ?? 'GET').toUpperCase())
+function requestMethod(input: RequestInfo | URL, init?: RequestInit): string {
+  // init wins per the fetch spec, but a Request input carries its own method:
+  // an init-only check classified apiFetch(new Request(url, {method: 'POST'}))
+  // as a GET and silently skipped the token header.
+  if (init?.method) return init.method
+  if (typeof Request !== 'undefined' && input instanceof Request) return input.method
+  return 'GET'
+}
+
+function isMutating(input: RequestInfo | URL, init?: RequestInit): boolean {
+  return MUTATING_METHODS.has(requestMethod(input, init).toUpperCase())
 }
 
 /**
@@ -71,7 +80,7 @@ export function apiFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
-  if (!isMutating(init)) return fetch(input, init)
+  if (!isMutating(input, init)) return fetch(input, init)
   const token = getApiToken()
   if (!token || !isTokenTransportable(token)) {
     if (token) {
@@ -82,7 +91,13 @@ export function apiFetch(
     }
     return fetch(input, init)
   }
-  const headers = new Headers(init?.headers)
+  // Seed from init.headers when given (it replaces a Request's headers per
+  // the fetch spec), else from the Request input's own headers so they
+  // survive the wrapper instead of being dropped by the spread below.
+  const headers = new Headers(
+    init?.headers ??
+      (typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined),
+  )
   headers.set(API_TOKEN_HEADER, token)
   return fetch(input, { ...init, headers })
 }

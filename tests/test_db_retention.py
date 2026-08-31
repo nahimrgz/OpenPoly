@@ -129,6 +129,43 @@ def test_prune_batches_the_delete(tmp_path, monkeypatch: pytest.MonkeyPatch) -> 
     engine.dispose()
 
 
+def test_prune_stops_between_batches_once_shutdown_starts(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``stop()`` sets the stop event and cancels the awaiting task — but the
+    sweep itself runs in a worker thread that cancellation cannot reach. An
+    unconditional batch loop therefore kept deleting to completion, contending
+    with the writers' final flush for the single SQLite writer and holding up
+    process exit for as long as the backlog took.
+
+    The event is set from an engine-level hook on the first DELETE, which is
+    the shape ``stop()`` produces: the batch already in flight finishes, and
+    the loop must not start another.
+    """
+    from sqlalchemy import event
+
+    now = time.time()
+    engine = _engine(tmp_path, "prune_stop.db")
+    monkeypatch.setattr("openpoly.db.manager.PRUNE_BATCH_ROWS", 3)
+    _seed(engine, [10.0] * 9 + [1.0], now=now)  # 9 expired → 3 full batches
+
+    mgr = DatabaseManager()
+    mgr.configure(engine, DatabaseConfig(order_book_retention_days=7.0))
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _stop_after_the_first_batch(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001, ANN202
+        if statement.lstrip().upper().startswith("DELETE FROM ORDER_BOOK_SNAPSHOT"):
+            mgr._prune_stop.set()
+
+    deleted = mgr.prune_order_books(now=now)
+
+    assert deleted == 3  # one batch, then bail — not the whole 9
+    assert _count(engine) == 7
+    # The backlog is deliberately left for the next process to sweep.
+    assert len([age for age in _remaining_ages(engine, now) if age > 7.0]) == 6
+    engine.dispose()
+
+
 def test_prune_batch_default_is_five_thousand() -> None:
     assert PRUNE_BATCH_ROWS == 5000
 

@@ -116,11 +116,19 @@ export type PushConflict = {
   current_rev: string
   current_template: Template
 }
+export type PushAuthError = {
+  status: 'auth_error'
+  /** 401 (missing/wrong X-OpenPoly-Token) or 403 (cross-origin write guard). */
+  httpStatus: number
+  error: string
+}
+
 export type PushResult =
   | PushOk
   | PushConflict
   | { status: 'network_error'; error: string }
   | { status: 'bad_request'; error: string }
+  | PushAuthError
 
 
 async function _parseTemplate(raw: unknown): Promise<FetchResult> {
@@ -242,6 +250,21 @@ export async function pushTemplateToBackend(
     return {
       status: 'bad_request',
       error: body.detail?.message ?? `HTTP 400`,
+    }
+  }
+  if (r.status === 401 || r.status === 403) {
+    // The backend is up and answering — the write was REFUSED (missing/stale
+    // API token, or the cross-origin write guard). Folding this into
+    // network_error flipped the canvas to "Backend unreachable" and sent the
+    // operator to debug connectivity instead of Keys → API token.
+    const body = (await r.json().catch(() => ({}))) as {
+      detail?: { message?: string }
+      message?: string
+    }
+    return {
+      status: 'auth_error',
+      httpStatus: r.status,
+      error: body.detail?.message ?? body.message ?? `HTTP ${r.status}`,
     }
   }
   if (!r.ok) {

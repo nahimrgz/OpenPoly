@@ -19,9 +19,17 @@ after ``_overload_headers`` would need a live re-test to justify.
 
 from __future__ import annotations
 
+import logging
+
 from py_clob_client_v2.http_helpers import helpers as _v2_helpers
 
+logger = logging.getLogger(__name__)
+
 _orig_request = _v2_helpers.request
+
+# Once-guard for the unexpected-call-shape warning below: if an SDK bump ever
+# changes the call convention, every request would otherwise emit one line.
+_warned_shape_mismatch = False
 
 
 def _patched_request(*args, **kwargs):
@@ -39,6 +47,19 @@ def _patched_request(*args, **kwargs):
         headers.setdefault("Origin", "https://polymarket.com")
         headers.setdefault("Referer", "https://polymarket.com/")
         args[2] = headers
+    else:
+        # Never reached with the pinned SDK (every helper passes headers
+        # positionally — tests/test_clob_patch.py pins both shapes). Reaching
+        # it means an SDK bump changed the call convention and the Cloudflare
+        # headers are NOT being injected: say so once instead of failing open
+        # silently while live orders start 403ing.
+        global _warned_shape_mismatch
+        if not _warned_shape_mismatch:
+            _warned_shape_mismatch = True
+            logger.warning(
+                "clob_patch: request() called without a positional headers "
+                "slot — browser headers not injected (SDK call shape changed?)"
+            )
     return _orig_request(*args, **kwargs)
 
 

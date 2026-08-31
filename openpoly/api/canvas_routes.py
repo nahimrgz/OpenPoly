@@ -207,6 +207,23 @@ async def _apply_canvas_reload(
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to swap %s section", stype)
 
+    # Database section: held by DatabaseManager, not the orchestrator, and its
+    # one tunable (retention) is re-read by the prune loop each sweep — so a
+    # changed value only needs apply_config, no rebuild. Without this the
+    # canvas edit was persisted and then silently ignored until restart.
+    old_db = _section_config(old_template, "database")
+    new_db = _section_config(new_template, "database")
+    if old_db != new_db:
+        try:
+            from openpoly.db.manager import DatabaseConfig
+            from openpoly.db.manager import manager as database_manager
+            from openpoly.runtime.orchestrator import _canvas_config
+
+            database_manager.apply_config(_canvas_config(DatabaseConfig, "database"))
+            logger.info("canvas reload: applied database section config")
+        except Exception:  # noqa: BLE001
+            logger.exception("canvas reload: failed to apply database config")
+
     # Exit section is held by exit_monitor, not orchestrator.
     old_exit = _section_config(old_template, "exit")
     new_exit = _section_config(new_template, "exit")

@@ -86,7 +86,9 @@ export function CanvasTopBar() {
               ? 'Saving…'
               : saveStatus === 'offline'
                 ? '⚠ Offline — local draft only'
-                : 'All changes saved'}
+                : saveStatus === 'auth_error'
+                  ? '⚠ Save refused — check Keys → API token'
+                  : 'All changes saved'}
           </span>
           <ModePill />
           <div className="flex items-center gap-1">

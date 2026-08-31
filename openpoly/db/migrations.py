@@ -39,11 +39,15 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION_TABLE = "schema_version"
 
 # Composite index backing ``ExitMonitor.bootstrap_peaks`` and the per-token
-# history route, both of which filter (token_id, recorded_at) — and the
-# retention prune, which deletes by ``recorded_at``. Kept in sync with the
-# ``Index(...)`` declared on ``OrderBookSnapshot`` so fresh databases get the
-# same index from ``create_all``.
+# history route, both of which filter (token_id, recorded_at). Kept in sync
+# with the ``Index(...)`` declared on ``OrderBookSnapshot`` so fresh databases
+# get the same index from ``create_all``.
 ORDER_BOOK_TOKEN_TIME_INDEX = "ix_order_book_snapshot_token_recorded"
+
+# Bare ``recorded_at`` index for the retention prune (migration 4): its DELETE
+# filters on ``recorded_at`` alone, which the token_id-led composite above can
+# only full-scan, never seek (SQLite has no skip-scan without ANALYZE stats).
+ORDER_BOOK_RECORDED_AT_INDEX = "ix_order_book_snapshot_recorded_at"
 
 Migration = Callable[[Connection], None]
 
@@ -130,12 +134,33 @@ def _m003_order_book_token_time_index(conn: Connection) -> None:
     )
 
 
+def _m004_order_book_recorded_at_index(conn: Connection) -> None:
+    """Bare ``recorded_at`` index on ``order_book_snapshot`` for the retention
+    prune.
+
+    The prune's DELETE filters on ``recorded_at`` alone; the composite index
+    from migration 3 leads with ``token_id``, which SQLite can only full-scan
+    for that predicate (EXPLAIN shows ``SCAN ... USING COVERING INDEX``, and
+    skip-scan needs ANALYZE stats that are never gathered), so every batch of
+    a large sweep re-scanned the whole index inside the DELETE transaction.
+    """
+    if not _table_exists(conn, "order_book_snapshot"):
+        return
+    conn.execute(
+        text(
+            f"CREATE INDEX IF NOT EXISTS {ORDER_BOOK_RECORDED_AT_INDEX} "
+            "ON order_book_snapshot (recorded_at)"
+        )
+    )
+
+
 # Ordered, append-only. Never renumber or reuse a version: the number recorded
 # in a deployed database is the only thing that says what has run there.
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _m001_fill_live_columns),
     (2, _m002_position_entry_columns),
     (3, _m003_order_book_token_time_index),
+    (4, _m004_order_book_recorded_at_index),
 ]
 
 LATEST_VERSION: int = MIGRATIONS[-1][0]

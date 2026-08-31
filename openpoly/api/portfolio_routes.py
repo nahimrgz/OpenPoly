@@ -11,6 +11,7 @@ in-flight claim in ``runtime.closing_registry``.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import asdict
 from typing import Any
@@ -99,9 +100,12 @@ async def close_position(
     ``remaining_qty``) so "sold 10 of 25, 15 still on the book" is not reported
     as a completed exit.
 
-    Async, and it never awaits between the open-position lookup and the
-    synchronous ``execute_sell`` — so the close is atomic with respect to the
-    ExitMonitor tick on the same event loop.
+    The in-flight claim (``closing_registry``) is what makes this safe
+    against the ExitMonitor tick: both sides check-and-claim synchronously
+    before their first await, so exactly one seller can hold a given position.
+    The sell itself runs in a worker thread — on live it blocks on network
+    calls and sleeps for seconds, and an inline call froze the whole event
+    loop for the duration.
 
     "Still open in the DB" is not by itself proof that nobody is selling this
     position: the exit monitor's ``execute_sell`` runs in a worker thread and
@@ -127,7 +131,11 @@ async def close_position(
         raise HTTPException(status_code=409, detail="exit_in_flight")
     mark_closing(position_id)
     try:
-        result = executor.execute_sell(held, close_reason="manual", ts=time.time(), trigger=None)
+        # Live execute_sell blocks on network + sleeps; the claim above already
+        # excludes every other seller, so it is safe off the event loop.
+        result = await asyncio.to_thread(
+            executor.execute_sell, held, close_reason="manual", ts=time.time(), trigger=None
+        )
     finally:
         clear_closing(position_id)
     body = asdict(result)
@@ -160,9 +168,9 @@ async def close_all_positions(
     others. Always returns 200 with a per-position result list — the caller
     decides what to do with the residuals.
 
-    Same atomicity story as ``close_position``: the open snapshot is taken
-    once at the top and each ``execute_sell`` is synchronous; no await
-    interleaves between them and the ExitMonitor tick. Positions the exit
+    Same claim discipline as ``close_position``: each position is claimed
+    before the sell's first await and the sell runs in a worker thread, so a
+    live bulk close no longer freezes the event loop. Positions the exit
     monitor is already selling (see ``closing_registry``) are skipped with
     ``exit_in_flight`` and reported in ``details`` rather than sold twice; each
     position this route does sell is claimed for the duration.
@@ -202,7 +210,13 @@ async def close_all_positions(
             continue
         mark_closing(held.position_id)
         try:
-            result = executor.execute_sell(held, close_reason="manual", ts=now, trigger=None)
+            result = await asyncio.to_thread(
+                executor.execute_sell, held, close_reason="manual", ts=now, trigger=None
+            )
+            # Inside the per-position isolation on purpose: a transient store
+            # error reading the residual must degrade THIS entry, not 500 the
+            # whole bulk close after real sells already executed.
+            remaining = _remaining_qty(store, held.position_id) if result.filled else None
         except Exception as exc:  # noqa: BLE001 — isolate per-position failure
             entry["ok"] = False
             entry["error"] = repr(exc)[:200]
@@ -211,7 +225,6 @@ async def close_all_positions(
             if result.filled:
                 entry["price"] = result.price
                 entry["qty"] = result.qty
-                remaining = _remaining_qty(store, held.position_id)
                 entry["partial"] = remaining is not None
                 entry["ok"] = remaining is None
                 if remaining is None:

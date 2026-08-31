@@ -31,8 +31,15 @@ export function ApiTokenPanel() {
 
   function onSave() {
     setApiToken(token)
-    setToken(getApiToken())
-    setSaved(trimmed ? 'Token saved for this browser.' : 'Token cleared.')
+    const persisted = getApiToken()
+    setToken(persisted)
+    if (trimmed && persisted !== trimmed) {
+      // setItem threw (private mode, storage blocked): setApiToken swallows
+      // the error, so the re-read is the only honest signal.
+      setSaved('Token could not be stored in this browser.')
+    } else {
+      setSaved(trimmed ? 'Token saved for this browser.' : 'Token cleared.')
+    }
   }
 
   function onClear() {

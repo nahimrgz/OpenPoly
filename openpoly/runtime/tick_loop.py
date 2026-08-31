@@ -73,9 +73,16 @@ class TickLoopMonitor:
     async def stop(self) -> None:
         """Stop the tick loop and run any subclass shutdown. Safe when never
         started."""
-        await self._cancel_loop()
-        await self._after_stop()
-        self._state = "stopped"
+        try:
+            await self._cancel_loop()
+            await self._after_stop()
+        finally:
+            # The pre-extraction monitors flipped the flag in a ``finally`` and
+            # the extraction dropped it: a cancelled shutdown (uvicorn timeout
+            # mid ``_after_stop`` drain) or a raising subclass hook left
+            # ``_state == "running"`` with the loop task already gone, so the
+            # status surface reported a monitor that no longer existed.
+            self._state = "stopped"
 
     async def _cancel_loop(self) -> None:
         task = self._task

@@ -244,3 +244,54 @@ def test_put_preserves_unknown_top_level_fields(client: TestClient) -> None:
     client.put("/api/canvas/template", json=tpl)
     got = client.get("/api/canvas/template").json()
     assert got["custom_metadata"] == {"layout_version": 42, "favorite": True}
+
+
+# ---------- hot-reload: the database section ----------
+
+
+def _db_template(retention_days: float) -> dict:
+    return {
+        "version": 3,
+        "name": "test",
+        "nodes": [
+            {
+                "id": "database-seed",
+                "sectionType": "database",
+                "position": {"x": 0, "y": 0},
+                "config": {"order_book_retention_days": retention_days},
+            }
+        ],
+        "edges": [],
+    }
+
+
+async def test_canvas_reload_applies_the_database_retention_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A canvas edit to ``order_book_retention_days`` must reach the manager.
+
+    The database section is held by ``DatabaseManager``, not the orchestrator,
+    so the reload's section loop never touched it: the new window was persisted
+    to the canvas and then silently ignored until the next restart — the prune
+    kept sweeping on the old window while the UI showed the new one.
+    """
+    from openpoly.api.canvas_routes import _apply_canvas_reload
+    from openpoly.db.manager import DatabaseConfig
+    from openpoly.db.manager import manager as database_manager
+    from openpoly.runtime.canvas_store import save_template
+
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    old_template = _db_template(7.0)
+    new_template = _db_template(30.0)
+    # The reload rebuilds from the *persisted* canvas, which is what the PUT
+    # route has already written by the time it fires.
+    save_template(new_template)
+
+    # Process-wide singleton — put back whatever the rest of the suite had.
+    saved = database_manager.status()["retention"]["retention_days"]
+    try:
+        database_manager.apply_config(DatabaseConfig(order_book_retention_days=7.0))
+        await _apply_canvas_reload(old_template, new_template)
+        assert database_manager.status()["retention"]["retention_days"] == pytest.approx(30.0)
+    finally:
+        database_manager.apply_config(DatabaseConfig(order_book_retention_days=saved))

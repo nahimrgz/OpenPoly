@@ -48,12 +48,16 @@ def _reset_orchestrator() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _reset_closing_registry() -> Iterator[None]:
-    """Clear the process-global in-flight close registry before every test.
+    """Clear process-global runtime registries before every test.
 
-    An id left behind by one test makes the settlement and reconciliation
-    monitors skip that position in every later test of the session.
+    An id left in the closing registry makes the settlement and reconciliation
+    monitors skip that position in every later test; a marker left in
+    ``sizing._dust_warned`` silently suppresses the dust warning for every
+    later test that reuses the position id.
     """
+    from openpoly.execution.sizing import reset_dust_warnings_for_tests
     from openpoly.runtime.closing_registry import reset_for_tests
 
     reset_for_tests()
+    reset_dust_warnings_for_tests()
     yield

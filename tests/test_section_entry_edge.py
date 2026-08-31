@@ -540,6 +540,7 @@ def _closed_rec(
     realized_pnl: float,
     position_id: int = 1,
     opened_at: float | None = None,
+    close_reason: str = "stop_loss",
 ) -> PositionRecord:
     """Closed position helper for kill-switch tests — overrides _rec's
     hardcoded -1.50 PnL with a per-call value."""
@@ -554,7 +555,7 @@ def _closed_rec(
         status="closed",
         opened_at=opened_at if opened_at is not None else (closed_at - 600),
         closed_at=closed_at,
-        close_reason="stop_loss",
+        close_reason=close_reason,
         realized_pnl=realized_pnl,
     )
 
@@ -614,6 +615,38 @@ def test_kill_consecutive_losses_resets_on_win() -> None:
     )
     out = _run(inst, _ar(p_model=0.30))
     assert out.verdict == "ok"
+
+
+def test_kill_consecutive_losses_is_not_reset_by_a_reconciled_close() -> None:
+    """A reconciled close books exactly 0.0 by construction — the position was
+    exited outside the ledger, so there is no measured outcome. Counting it as
+    a win let one of them break a live losing run: 5 real losses with a
+    reconciled row sitting in the middle read as a streak of 2 and the brake
+    never fired.
+    """
+    _populate(_market(), _book("no-m1", bid=0.40, ask=0.42))
+    now = _time.time()
+    # newest-first: loss, loss, reconciled(0.0), loss, loss, loss
+    pnls = [-0.50, -0.50, 0.0, -0.50, -0.50, -0.50]
+    records = [
+        _closed_rec(
+            market_id=f"m{i}",
+            side="yes",
+            closed_at=now - (i + 1) * 600,
+            realized_pnl=pnl,
+            position_id=10 + i,
+            close_reason="reconciled" if pnl == 0.0 else "stop_loss",
+        )
+        for i, pnl in enumerate(pnls)
+    ]
+    inst = EdgeThresholdEntryV0(
+        EdgeThresholdConfig(kill_max_consecutive_losses=5),
+        portfolio_provider=lambda: _FakePortfolio(records),
+    )
+    out = _run(inst, _ar(p_model=0.30))
+    assert out.verdict == "skip"
+    assert out.reason == "kill_consecutive_losses"
+    assert out.signals["streak"] == 5
 
 
 def test_kill_daily_loss_blocks_when_24h_sum_exceeds_cap() -> None:

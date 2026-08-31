@@ -354,3 +354,64 @@ def test_close_all_noop_body_carries_the_partial_counter(env) -> None:
     _store, client = env
     body = client.post("/api/positions/close-all").json()
     assert body["partial"] == 0
+
+
+# ---------- the sell must not run on the event loop ----------
+
+
+@pytest.mark.parametrize("route", ["single", "close-all"])
+async def test_close_keeps_the_event_loop_running(env, monkeypatch, route: str) -> None:  # noqa: ANN001
+    """``execute_sell`` blocks for seconds on live (CTF cache polling, order
+    placement, close-persist retries). Called inline from these ``async def``
+    routes it froze the whole event loop for that long — every WS reconnect,
+    market poll and monitor tick stalled behind one operator click. It has to
+    run in a worker thread.
+
+    The request is driven through ``ASGITransport`` on purpose: ``TestClient``
+    runs the app on its own event loop, so the heartbeat below would keep
+    ticking on this one no matter what the route did.
+    """
+    import asyncio
+    import contextlib
+    import time as _time
+
+    from httpx import ASGITransport, AsyncClient
+
+    from openpoly.execution import ExecResult
+
+    store, _client = env
+    held = _open(store)
+
+    class _Blocking:
+        def execute_sell(self, position, *, close_reason, ts, trigger=None):  # noqa: ANN001, ANN201
+            _time.sleep(0.3)
+            return ExecResult.ok(price=0.55, qty=position.qty, position_id=position.position_id)
+
+    monkeypatch.setattr(portfolio_routes, "executor", _Blocking())
+    url = (
+        f"/api/positions/{held.position_id}/close"
+        if route == "single"
+        else "/api/positions/close-all"
+    )
+
+    beats = 0
+
+    async def _heartbeat() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.01)
+            beats += 1
+
+    hb = asyncio.create_task(_heartbeat())
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            r = await client.post(url)
+    finally:
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+
+    assert r.status_code == 200, r.text
+    # ~30 beats fit in 0.3s; anything past a handful proves the loop kept
+    # running while the sell slept.
+    assert beats >= 10, f"event loop stalled: only {beats} heartbeats"

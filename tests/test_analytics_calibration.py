@@ -136,7 +136,9 @@ def test_zero_cost_basis_does_not_divide_by_zero() -> None:
     positions = [_closed(p_model=0.65, realized_pnl=0.0, entry=0.0, position_id=1)]
     bucket = next(b for b in calibration_report(positions) if b.lower == 0.6)
     assert bucket.count == 1
-    assert bucket.mean_return == 0.0
+    # Unmeasurable basis: excluded from mean_return rather than counted as a
+    # fake 0.0 return that dilutes the bucket's average.
+    assert bucket.mean_return is None
 
 
 def test_return_is_measured_against_the_opened_cost_basis_not_the_residual(store) -> None:

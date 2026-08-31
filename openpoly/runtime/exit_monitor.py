@@ -52,7 +52,7 @@ from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook
 from openpoly.markets.store import MarketStore
 from openpoly.portfolio import HeldPosition, PortfolioStore
-from openpoly.runtime.closing_registry import clear_closing, mark_closing
+from openpoly.runtime.closing_registry import clear_closing, is_closing, mark_closing
 from openpoly.runtime.section_log import ExitDecision, exit_log
 from openpoly.runtime.tick_loop import State, TickLoopMonitor
 from openpoly.sections._base import SectionInput, SectionOutput
@@ -384,7 +384,13 @@ class ExitMonitor(TickLoopMonitor):
                 self._log(held, ts, verdict="skip", reason="no_executable_bid")
             return True
         self._unmarkable.discard(held.position_id)
-        spread = book.asks[0][0] - book.bids[0][0] if book.asks else None
+        # Spread against the SAME depth-guarded bid the mark uses. The raw
+        # level-1 bid can be a dust probe: one resting near the ask understates
+        # the spread floor (premature trailing exits inside real quote noise),
+        # one far below it inflates the floor until the trailing lock can never
+        # fire. ``current_price`` is the executable bid, so ask - mark is the
+        # spread the position actually faces.
+        spread = book.asks[0][0] - current_price if book.asks else None
         # Monotone-increasing per-position peak. New open positions seed at
         # current_price; bootstrap_peaks / observe_price may have seeded a
         # higher one already.
@@ -423,6 +429,13 @@ class ExitMonitor(TickLoopMonitor):
         # this check and the claim below, so nothing can close it in between.
         if not self._still_open(held.position_id):
             self._log(held, ts, verdict="skip", reason="position_no_longer_open")
+            return False
+        if is_closing(held.position_id):
+            # A manual close route already holds the in-flight claim for this
+            # id (the routes claim before their first await, exactly as we do
+            # below) — selling it too is the double-sell the registry exists
+            # to prevent. Reconsider on the next tick.
+            self._log(held, ts, verdict="skip", reason="exit_in_flight")
             return False
         # Claim the position before yielding the loop: from here until the sell
         # has been persisted, the settlement and reconciliation monitors must

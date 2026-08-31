@@ -8,7 +8,8 @@
  * (`[A-Za-z0-9_-]` characters).
  */
 
-// Schemes the backend resolver knows about.
+// Schemes the backend resolver knows about — mirrors REF_SCHEMES in
+// openpoly/news/secrets.py (the backend's single source for ref-vs-literal).
 const REF_SCHEME_RE = /^(env|local|vault|keychain):/
 
 export function isRefFormatted(value: unknown): boolean {

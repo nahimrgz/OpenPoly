@@ -33,7 +33,7 @@ export type SectionNodeType = Node<SectionNodeData, 'section'>
 
 type ConfigValue = string | number | boolean
 
-export type SaveStatus = 'saved' | 'saving' | 'offline'
+export type SaveStatus = 'saved' | 'saving' | 'offline' | 'auth_error'
 
 /** Pending conflict surfaced by autosave PUT — operator must explicitly
  * resolve via ConflictDialog before any further autosave fires. */
@@ -183,6 +183,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       // localStorage is still authoritative for the live working copy.
       // Mark offline so the UI surfaces a banner; reconnect will retry.
       set({ saveStatus: 'offline', isOnline: false })
+    } else if (result.status === 'auth_error') {
+      // The backend is reachable — it REFUSED the write (401 missing/stale
+      // API token, 403 cross-origin guard). Not offline: reads keep working,
+      // and saying "unreachable" would send the operator to debug the network
+      // instead of Keys → API token. Edits stay in localStorage; the next
+      // autosave retries once the token is fixed.
+      console.error('canvas PUT refused:', result.httpStatus, result.error)
+      set({ saveStatus: 'auth_error' })
     } else if (result.status === 'bad_request') {
       // 400 from server (e.g. malformed). Loud-log; not autosave-retryable.
       console.error('canvas PUT 400:', result.error)

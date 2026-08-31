@@ -61,7 +61,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from openpoly.news.secrets import SecretsError, resolve
+from openpoly.news.secrets import SecretsError, is_secret_ref, resolve
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +93,6 @@ MUTATING_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 # Always accepted, with or without the allowlist: these are the names the
 # operator's own machine uses to reach a loopback-bound backend.
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
-
-# Prefixes that mark the value as a ``*_ref`` (see ``openpoly.news.secrets``)
-# rather than the literal token. Anything else is used verbatim, so a literal
-# token containing a colon still works.
-_REF_SCHEMES = ("env:", "local:", "vault:", "keychain:")
 
 _ALLOWLIST_WILDCARD = "*"
 
@@ -135,7 +130,11 @@ def resolve_api_token() -> str | None:
     raw = _raw_token_setting()
     if not raw:
         return None
-    if raw.startswith(_REF_SCHEMES):
+    # Ref-vs-literal is the resolver's own call (openpoly.news.secrets):
+    # a scheme known there but not here would have turned the ref into the
+    # literal expected token — every request 401s, with no "does not
+    # resolve" log to explain why.
+    if is_secret_ref(raw):
         try:
             value = resolve(raw)
         except (SecretsError, NotImplementedError) as exc:

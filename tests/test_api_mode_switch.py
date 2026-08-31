@@ -251,3 +251,84 @@ def test_switch_to_live_blocked_by_rpc_unreachable(env, monkeypatch: pytest.Monk
     r = client.post("/api/system/mode", json={"mode": "live"})
     assert r.status_code == 409
     assert r.json()["detail"]["error"] == "rpc_unreachable"
+
+
+# ---------- the switch must hand the executor to the dispatcher ----------
+
+
+class _FakeClob:
+    """Only the one call the live preflight makes."""
+
+    def get_balance_allowance(self, params):  # noqa: ANN001, ANN201
+        return {"balance": "5000000", "allowances": _allowance_dict()}
+
+
+class _RecordingLiveExecutor:
+    """Stand-in for ``build_live_executor``'s return value.
+
+    The route touches exactly two things on it: ``_clob`` (the preflight
+    balance/allowance read) and, after the fix, the dispatcher hand-off. Its
+    ``execute_buy`` is what proves a trade actually reached the live side.
+    """
+
+    def __init__(self) -> None:
+        self._clob = _FakeClob()
+        self.buys: list[str] = []
+
+    def execute_buy(self, intent, *, news_id, ts):  # noqa: ANN001, ANN201
+        from openpoly.execution import ExecResult
+
+        self.buys.append(intent.market_id)
+        return ExecResult.ok(price=intent.price, qty=intent.qty, position_id=1)
+
+    def execute_sell(self, position, *, close_reason, ts, trigger=None):  # noqa: ANN001, ANN201
+        raise AssertionError("not exercised by this test")
+
+    def get_collateral_balance_raw(self) -> int | None:
+        return None
+
+
+def test_switch_to_live_wires_the_executor_into_the_dispatcher(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wallet configured *after* boot must be able to trade.
+
+    ``executor.configure_live`` otherwise ran only in the boot lifespan, behind
+    ``runtime_state.wallet is not None``. Configure the wallet later, flip the
+    mode, and the route built a live executor, validated it, and threw it
+    away — so every dispatch skipped with ``live_not_ready`` until the process
+    was restarted. This drives the route and then asks the dispatcher to route
+    a real buy.
+    """
+    import openpoly.execution.dispatcher as dispatcher_module
+    from openpoly.execution import executor
+    from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
+
+    client, _store, rs = env
+    # In production these are the same module-level singleton; the fixture
+    # swaps only the routes' reference, so point the dispatcher at the same
+    # RuntimeState the route is about to flip.
+    monkeypatch.setattr(dispatcher_module, "runtime_state", rs)
+    _set_wallet(rs)  # wallet configured after boot
+    live = _RecordingLiveExecutor()
+    monkeypatch.setattr(wallet_routes, "build_live_executor", lambda wallet, portfolio: live)
+    # The dispatcher is a process-wide singleton — start from the state a boot
+    # without a wallet leaves behind, and put back whatever was there.
+    saved_live = executor._live
+    executor._live = None
+
+    try:
+        r = client.post("/api/system/mode", json={"mode": "live"})
+        assert r.status_code == 200, r.text
+
+        result = executor.execute_buy(
+            OrderIntent(market_id="m1", side="yes", price=0.42, qty=10.0),
+            news_id="n1",
+            ts=1.0,
+        )
+    finally:
+        executor._live = saved_live
+
+    assert result.skip_reason != "live_not_ready"
+    assert result.filled is True
+    assert live.buys == ["m1"]

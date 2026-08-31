@@ -498,6 +498,12 @@ def _kill_switch_check(
         for p in closed:
             if p.realized_pnl < 0:
                 streak += 1
+            elif p.close_reason == "reconciled":
+                # Booked at exactly 0 by construction (exited outside the
+                # ledger — see ReconciliationMonitor): not a measured outcome,
+                # so it neither extends nor resets the streak. Treating it as
+                # a win here let one reconciled close mask a live losing run.
+                continue
             else:
                 break
         if streak >= config.kill_max_consecutive_losses:
