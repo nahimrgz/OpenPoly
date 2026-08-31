@@ -22,12 +22,17 @@ yarn install
 yarn dev          # Vite dev server on :5173, proxies /api → 127.0.0.1:8000
 yarn typecheck    # tsc -b --noEmit
 yarn lint         # eslint
+yarn test         # vitest run
 ```
 
-CI enforces (must pass to merge): **`ruff check` + `pytest`** (backend) and
-**`yarn typecheck` + `yarn lint`** (frontend). **`ruff format` is a local
-convention, not a CI gate** — run it before pushing, but it is intentionally not
-enforced (avoids ruff-version-drift churn blocking merges).
+CI enforces (must pass to merge): **`pytest` + `ruff check`** (backend) and
+**`yarn typecheck` + `yarn lint` + `yarn test`** (frontend). Two backend steps are
+**informational only** (`continue-on-error`): **`ruff format --check`** — a local
+convention, run it before pushing, but ruff-version drift must not block merges —
+and **`mypy`**, whose lenient config lives in `pyproject.toml` under
+`[tool.mypy]`; tighten it first, then promote the step to a gate.
+`.pre-commit-config.yaml` runs ruff check + format locally
+(`uv run pre-commit install` to enable).
 
 Same-machine (backend + frontend on one box) is the **default and needs no env
 vars** — the frontend proxies to `127.0.0.1:8000` out of the box.
@@ -76,6 +81,15 @@ unless you are deliberately changing the contract.
 - **Front/back mirror** — `frontend/src/sections/<type>/` mirrors
   `openpoly/sections/<type>/` by name. Add a section type in one, mirror it in
   the other.
+- **Schema changes need a migration** — editing `openpoly/db/tables.py` only
+  covers *fresh* databases (`create_all`). For an existing one, append an entry to
+  `MIGRATIONS` in [`openpoly/db/migrations.py`](./openpoly/db/migrations.py)
+  (PRAGMA-check before altering, so re-running is a no-op); `LATEST_VERSION`
+  follows the list automatically.
+- **Mutating routes carry the auth dependency** — every `POST` / `PUT` / `DELETE` /
+  `PATCH` route declares `dependencies=[Depends(require_api_token)]`
+  ([`openpoly/api/security.py`](./openpoly/api/security.py)). A test enumerates
+  `app.routes` and fails if one is missing.
 - **Don't confuse layers** — `openpoly/db/` is the SQLite engine, *not*
   `sections/database/` (a swappable section). `openpoly/news/` · `markets/` are
   domain logic, *not* `sections/news_source/` · `market_source/` (section impls).
