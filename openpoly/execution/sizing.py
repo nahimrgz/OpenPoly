@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 # $1.00 server minimum + a $0.10 buffer for price/rounding wiggle.
 MIN_NOTIONAL_USD = 1.10
 
+# An outcome token pays $1 or $0, so it trades in (0, 1]; and no quote is finer
+# than the smallest tick in the SDK's ROUNDING_CONFIG. A price outside that band
+# is not a price the venue could have produced — it is a wrong-scale or garbage
+# field, and booking one as a cost basis poisons every later exit decision.
+MIN_TOKEN_PRICE = 0.0001
+MAX_TOKEN_PRICE = 1.0
+
 # ``RoundConfig.size`` is 2 for every tick size in the SDK's ROUNDING_CONFIG,
 # so the tick size is not needed to floor a size. ``MIN_SELLABLE_QTY`` in
 # openpoly/portfolio/store.py is the ``10**-SIZE_DECIMALS`` twin of this

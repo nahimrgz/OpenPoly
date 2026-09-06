@@ -14,7 +14,14 @@ from typing import Any
 import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
-from openpoly.execution.live_executor import _PERSIST_ATTEMPTS, _SETTLE_ATTEMPTS, LiveExecutor
+from openpoly.execution.live_executor import (
+    _PERSIST_ATTEMPTS,
+    _SETTLE_ATTEMPTS,
+    _SETTLE_SLEEP,
+    LiveExecutor,
+    _bookable_price,
+)
+from openpoly.execution.sizing import MAX_TOKEN_PRICE, MIN_TOKEN_PRICE
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook, normalize_gamma_market
 from openpoly.markets.store import MarketStore, PollSummary
@@ -204,6 +211,12 @@ def _held(store: PortfolioStore, m, **overrides: Any):
     )
     kw.update(overrides)
     return store.open_position(**kw)
+
+
+def _settle_waits(no_sleep: list[float]) -> list[float]:
+    """Only the settle loop's waits — ``no_sleep`` also records the CTF poll's
+    and the persist retries'."""
+    return [w for w in no_sleep if w == _SETTLE_SLEEP]
 
 
 @pytest.fixture(autouse=True)
@@ -615,28 +628,24 @@ def test_sell_network_error_but_balance_dropped_records_fill(store) -> None:
     assert rec is not None and rec.status == "closed"
 
 
-def test_sell_network_error_partial_drop_records_partial(store) -> None:
+def test_sell_network_error_partial_drop_records_partial(store, caplog) -> None:
+    """A delta short of the whole order is positive proof that a remainder is
+    still on the book — and this path never learned an order id, so nothing can
+    cancel it. That is an alert, not a finished trade."""
     m = _market("m1")
     _populate(m, _book(m.yes_token_id, bid=0.55))
-    held = store.open_position(
-        market_id="m1",
-        side="yes",
-        token_id=m.yes_token_id,
-        condition_id=m.condition_id,
-        price=0.40,
-        qty=18.0,
-        ts=100.0,
-        news_id="n",
-    )
+    held = _held(store, m, qty=18.0)
     # Gate sees 18; confirm sees 3 → 15 sold, 3 unsold remain open.
     clob = _FakeClob(
         exception=RuntimeError("request exception"),
         ctf_balance_sequence=[18_000_000, 3_000_000],
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
-    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.filled is True
     assert r.qty == pytest.approx(15.0)
+    assert "RESTING ORDER ALERT" in caplog.text
     rec = store.get_position(held.position_id)
     assert rec is not None and rec.status == "open"
     assert rec.qty == pytest.approx(3.0)
@@ -1116,7 +1125,7 @@ def test_buy_delayed_order_retries_cancel_until_window_expires(store, no_sleep) 
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.skip_reason == "live_no_match"
     assert clob.cancelled == ["0x1", "0x1"]
-    assert len(no_sleep) == 1  # one wait between the refusal and the retry
+    assert len(_settle_waits(no_sleep)) == 1  # one wait between the refusal and the retry
     assert store.get_open_position("m1", "yes") is None
 
 
@@ -1138,7 +1147,8 @@ def test_buy_cancel_refused_every_attempt_reports_cancel_failed(store, no_sleep,
     assert r.skip_reason == "live_cancel_failed"
     assert r.resting_order_id == "0x1"
     assert len(clob.cancelled) == _SETTLE_ATTEMPTS
-    assert len(no_sleep) == _SETTLE_ATTEMPTS - 1
+    settle_waits = _settle_waits(no_sleep)
+    assert len(settle_waits) == _SETTLE_ATTEMPTS - 1
     assert "RESTING ORDER ALERT" in caplog.text
     assert store.get_open_position("m1", "yes") is None
 
@@ -1167,15 +1177,22 @@ def test_buy_cancel_refused_because_already_matched_records_full_fill(store) -> 
     assert held is not None and held.qty == pytest.approx(10.0)
 
 
-def test_buy_get_order_failure_falls_back_to_balance_delta(store) -> None:
-    """A clean cancel, then ``get_order`` raises: the fill that may have raced
-    the cancel is confirmed through the CTF balance (the lost-response
-    mechanism, whose baseline is already in hand) instead of being dropped."""
+@pytest.mark.parametrize(
+    "order_status",
+    [RuntimeError("order lookup failed"), {"status": "LIVE"}],
+    ids=["read-raises", "no-size_matched"],
+)
+def test_buy_unreadable_size_falls_back_to_balance_delta(store, order_status) -> None:
+    """A clean cancel, then the size cannot be read — the call raised, or the
+    answer carried no ``size_matched`` and so is not an order document. Either
+    way the fill that may have raced the cancel is confirmed through the CTF
+    balance (the lost-response mechanism, whose baseline is already in hand)
+    instead of being dropped."""
     m = _market("m1")
     _populate(m)
     clob = _FakeClob(
         order_response=_zero_fill_response("live"),
-        order_status=[RuntimeError("order lookup failed")],
+        order_status=[order_status],
         ctf_balance_sequence=[0, 10_000_000],  # baseline 0; confirm sees 10 shares
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
@@ -1324,7 +1341,10 @@ def test_sell_get_order_failure_and_balance_failure_is_fill_unknown(store) -> No
     assert rec.qty == pytest.approx(10.0)
 
 
-@pytest.mark.parametrize("taking", ["", "n/a"])  # absent, then unparseable
+@pytest.mark.parametrize(
+    "taking",
+    ["", "n/a", pytest.param(10**400, id="overflowing-int")],
+)
 def test_sell_unusable_usdc_amount_records_shares_at_limit_price(store, taking) -> None:
     """SELL twin: shares are ``makingAmount`` here. Booking a 0.0 sale would
     fabricate a total loss; record at the bid (proceeds can only be ≥ bid)."""
@@ -1448,7 +1468,8 @@ def test_settle_stops_at_the_wall_clock_deadline(store, monkeypatch, no_sleep) -
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert len(clob.cancelled) == expected
-    assert len(no_sleep) == expected - 1  # never a wait after the last attempt
+    settle_waits = _settle_waits(no_sleep)
+    assert len(settle_waits) == expected - 1  # never a wait after the last attempt
     assert r.skip_reason == "live_cancel_failed"
     assert r.resting_order_id == "0x1"
 
@@ -1668,24 +1689,26 @@ def test_sell_over_size_report_is_discarded_not_booked(store) -> None:
     [[_cancelled()], [_refused(), _cancelled()]],
     ids=["post-loop-read", "in-loop-read"],
 )
-def test_buy_over_size_order_read_is_clamped_to_the_order(store, cancels) -> None:
-    """The order read is the settle's source of truth once an over-size POST
-    amount is discarded, and ``open_position`` validates nothing — so a
-    ``size_matched`` bigger than the order would become exactly the phantom row
-    the discard exists to prevent. Clamp it like the balance already is."""
+def test_buy_over_size_order_read_is_discarded_not_clamped(store, cancels) -> None:
+    """The plausibility rule binds every source alike. A ``size_matched`` bigger
+    than the order is the same nonsense as an over-size POST amount, so it earns
+    the same treatment: discarded, not booked down. Clamping it to the size
+    would pin a full-size floor under the answer — the phantom position against
+    an empty wallet that the POST-side discard exists to prevent, arriving
+    through the read instead."""
     m = _market("m1")
     _populate(m)
     clob = _FakeClob(
         order_response=_zero_fill_response("live"),
         cancel_responses=cancels,
         order_status=[{"size_matched": "999", "status": "LIVE"}],
+        ctf_balance_sequence=[0, RuntimeError("clob down")],
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
-    assert r.filled is True
-    assert r.qty == pytest.approx(10.0)
-    held = store.get_open_position("m1", "yes")
-    assert held is not None and held.qty == pytest.approx(10.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_fill_unknown"
+    assert store.get_open_position("m1", "yes") is None
 
 
 # ``NaN`` and the infinities are floats, so they parse — and then defeat every
@@ -1712,16 +1735,21 @@ def test_buy_non_finite_order_read_is_not_a_fill(store) -> None:
     assert store.get_open_position("m1", "yes") is None
 
 
-def test_buy_nan_share_count_is_unusable_never_a_clean_miss(store) -> None:
-    """A ``NaN`` share count is neither over-size nor ``<= 0``, so it would walk
-    past the discard and past the clean-miss guard alike and report a miss
-    nothing had established."""
+@pytest.mark.parametrize(
+    "taking",
+    ["NaN", pytest.param(10**400, id="overflowing-int")],
+)
+def test_buy_unusable_share_count_is_never_a_clean_miss(store, taking) -> None:
+    """Neither over-size nor ``<= 0``, so an unusable share count would walk past
+    the discard and past the clean-miss guard alike and report a miss nothing had
+    established. ``NaN`` parses; an int too large for a double raises an
+    ``OverflowError`` a ``ValueError`` clause would miss."""
     m = _market("m1")
     _populate(m)
     clob = _FakeClob(
         order_response={
             **_zero_fill_response("matched"),
-            "takingAmount": "NaN",
+            "takingAmount": taking,
             "makingAmount": "5",
         },
         order_status=[RuntimeError("dark")],
@@ -1804,12 +1832,7 @@ def test_buy_string_tx_hashes_is_not_indexed_into(store) -> None:
     assert fills and fills[0].tx_hash is None
 
 
-# A whole number is not the string the venue documents, but it is still an id
-# we can send — and an id we can send is worth a cancel attempt, because the
-# alternative is an order left on the book with nothing to cancel it by and no
-# id for the caller to back off on. Anything that would have to be reshaped to
-# be sent (a container, a bool, a float that stringifies into a different id)
-# stays unreachable instead.
+# A whole number is still an id we can send, so it is worth a cancel attempt.
 
 
 def test_sell_non_list_tx_hashes_does_not_raise(store) -> None:
@@ -1879,15 +1902,13 @@ _UNSENDABLE_ORDER_ID = {"dict": {"a": 1}, "list": ["0x1"]}
 
 @pytest.mark.parametrize("case", list(_UNSENDABLE_ORDER_ID))
 def test_buy_non_scalar_order_id_is_treated_as_no_order_id(store, caplog, case) -> None:
-    """An id we cannot cancel by is no id: the alert path, not an exception."""
+    """An id we cannot cancel by is no id: the alert path, not an exception. The
+    value still reaches the alert — the venue named this order, and dropping the
+    name leaves nothing to look it up by."""
     m = _market("m1")
     _populate(m)
-    clob = _FakeClob(
-        order_response={
-            **_zero_fill_response("live"),
-            "orderID": _UNSENDABLE_ORDER_ID[case],
-        }
-    )
+    raw = _UNSENDABLE_ORDER_ID[case]
+    clob = _FakeClob(order_response={**_zero_fill_response("live"), "orderID": raw})
     le = LiveExecutor(portfolio=store, clob_client=clob)
     with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
         r = le.execute_buy(_intent(), news_id="n", ts=1.0)
@@ -1896,15 +1917,21 @@ def test_buy_non_scalar_order_id_is_treated_as_no_order_id(store, caplog, case) 
     assert r.resting_order_id is None  # there is no id to name
     assert clob.cancelled == []  # nothing to cancel by
     assert "RESTING ORDER ALERT" in caplog.text
+    assert repr(raw) in caplog.text  # ...but the value the venue sent survives
+    assert type(raw).__name__ in caplog.text
     assert store.get_open_position("m1", "yes") is None
 
 
-# Every shape here is a 200 the executor must read as a refusal: never as an
-# acknowledgement, and never as an exception out of execute_buy with the order
-# left on the book.
+# Every shape here is a 200 the executor must read as a refusal, with the
+# operator-facing reason each one earns.
 _BAD_CANCEL_BODY = {
-    "not_canceled-is-a-list": {**_refused(), "not_canceled": ["0x1"]},
-    "canceled-is-a-string": {"canceled": "0x1abc"},  # ``in`` would substring-match
+    "not_canceled-is-a-list": (
+        {**_refused(), "not_canceled": ["0x1"]},
+        "unexpected cancel body shape",
+    ),
+    # ``in`` would substring-match; and with no ``not_canceled`` key at all.
+    "canceled-is-a-string": ({"canceled": "0x1abc"}, "refused without a reason"),
+    "no-not_canceled": ({"canceled": []}, "refused without a reason"),
 }
 
 
@@ -1912,9 +1939,10 @@ _BAD_CANCEL_BODY = {
 def test_buy_bad_cancel_body_is_a_refusal(store, caplog, case) -> None:
     m = _market("m1")
     _populate(m)
+    body, expected_reason = _BAD_CANCEL_BODY[case]
     clob = _FakeClob(
         order_response=_zero_fill_response("live"),
-        cancel_responses=[_BAD_CANCEL_BODY[case]],
+        cancel_responses=[body],
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
     with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
@@ -1924,6 +1952,7 @@ def test_buy_bad_cancel_body_is_a_refusal(store, caplog, case) -> None:
     assert r.resting_order_id == "0x1"
     assert len(clob.cancelled) == _SETTLE_ATTEMPTS  # refused, so it kept retrying
     assert "RESTING ORDER ALERT" in caplog.text
+    assert expected_reason in caplog.text
 
 
 def test_buy_stale_zero_read_does_not_become_a_clean_miss(store) -> None:
@@ -1965,3 +1994,462 @@ def test_buy_balance_showing_a_full_fill_does_not_clear_the_resting_alert(store,
     assert r.qty == pytest.approx(10.0)
     assert r.resting_order_id == "0x1"
     assert "RESTING ORDER ALERT" in caplog.text
+
+
+# ---------- a price the venue cannot mean is never the basis ----------
+
+
+@pytest.mark.parametrize(
+    "making",
+    ["5000000", "5.0000001"],  # raw 1e6 units; and a hair over 1.0 per share
+    ids=["wrong-scale", "just-over-one"],
+)
+def test_buy_out_of_domain_price_falls_back_to_the_limit(store, making) -> None:
+    """A wrong-scale money field divides into a price the venue cannot mean, and
+    nothing downstream catches it: the store validates nothing and the exit
+    section rejects only a non-positive basis."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            **_zero_fill_response("matched"),
+            "takingAmount": "5",
+            "makingAmount": making,
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=5.0)
+    r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(5.0)
+    assert r.price == pytest.approx(intent.price)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.avg_entry_price == pytest.approx(intent.price)
+
+
+def test_sell_out_of_domain_price_falls_back_to_the_bid(store) -> None:
+    """SELL twin: shares are ``makingAmount``, pUSD ``takingAmount``."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response={
+            **_zero_fill_response("matched"),
+            "makingAmount": "10",
+            "takingAmount": "5500000",  # raw 1e6 units, not pUSD
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
+    assert r.filled is True
+    assert r.price == pytest.approx(0.55)
+    sell_fill = next(f for f in store.list_fills(limit=5) if f.action == "sell")
+    assert sell_fill.price == pytest.approx(0.55)
+
+
+# Both entry points now refuse to sign against an out-of-band book price, so
+# neither of these paths can reach ``_bookable_price``'s limit fallback any
+# more: what used to be "book the conservative edge" is "do not trade on it".
+# The edge itself stays pinned by the unit tests above, as defence in depth for
+# any future caller.
+
+
+# ---------- the settle reads what the venue actually said ----------
+
+
+def test_buy_numeric_order_id_acknowledgement_is_recognised(store, caplog) -> None:
+    """A venue that names an order numerically echoes it numerically in the
+    cancel body too, and ``"12345" in [12345]`` is False."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={**_zero_fill_response("live"), "orderID": 12345},
+        cancel_responses=[{"canceled": [12345], "not_canceled": {}}],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert len(clob.cancelled) == 1  # acknowledged at once, no retry budget spent
+    assert r.skip_reason == "live_no_match"
+    assert r.resting_order_id is None
+    assert "RESTING ORDER ALERT" not in caplog.text
+
+
+def test_buy_terminal_status_without_size_ends_the_loop_at_once(store) -> None:
+    """A cancelled order is cancelled whether or not the answer carried a size:
+    discarding the whole read over a missing size spends the entire retry
+    budget on an order that provably stopped resting after one attempt."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[{"status": "CANCELED"}],  # terminal, but no size_matched
+        ctf_balance_sequence=[0, 0],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert len(clob.cancelled) == 1  # the status settled it; no budget spent
+    assert r.resting_order_id is None  # nothing rests after a cancelled status
+    assert r.skip_reason == "live_fill_unknown"  # the size was never established
+
+
+# ---------- the settle's evidence model ----------
+#
+# The model itself (strengths, plausibility, resolution) is documented in
+# openpoly/execution/live_executor.py; each test below names the rule it pins.
+
+
+def test_settle_exact_count_beats_a_larger_lower_bound(store, caplog) -> None:
+    """The response claimed 5 crossed; the order itself, cancelled, says 2. The
+    venue's account of THIS order is the answer — a lower bound never floors it
+    — and the disagreement is reported rather than settled in our favour."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            **_zero_fill_response("matched"),
+            "takingAmount": "5",
+            "makingAmount": "2.5",
+        },
+        cancel_responses=[_refused()],
+        order_status=[{"size_matched": "2", "status": "CANCELED"}],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(2.0)
+    assert "disagrees" in caplog.text
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(2.0)
+
+
+def test_settle_exact_zero_is_a_clean_miss_and_the_wallet_is_not_asked(store) -> None:
+    """The order is cancelled having matched nothing. That is the venue's own
+    count, so it stands: a wallet that rose in the same window rose for some
+    other reason, and attributing it here would book a position this order did
+    not open."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[{"size_matched": "0", "status": "CANCELED"}],
+        ctf_balance_sequence=[0, 7_000_000],  # would say 7 if it were consulted
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_no_match"
+    assert r.resting_order_id is None
+    assert store.get_open_position("m1", "yes") is None
+
+
+def test_settle_exact_count_never_falls_below_an_earlier_reading_of_the_order(
+    store, caplog
+) -> None:
+    """``size_matched`` counts what one order matched, so it only ever grows. A
+    later reading below an earlier one is the data API lagging behind the
+    matching engine, not the venue taking a fill back — so the cancelled read's
+    nought cannot erase the 4 shares an earlier read of the SAME order already
+    reported."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused(), _cancelled()],
+        order_status=[
+            {"size_matched": "4", "status": "LIVE"},
+            {"size_matched": "0", "status": "CANCELED"},
+        ],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(4.0)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    ("moved", "expected"),
+    [
+        pytest.param(8_000_000, 8.0, id="inside-the-order"),
+        pytest.param(15_000_000, 10.0, id="over-size-books-the-order"),
+    ],
+)
+def test_settle_books_an_over_size_wallet_delta_down_to_the_order(store, moved, expected) -> None:
+    """The wallet is the one source booked down rather than discarded, and the
+    settle must say so as loudly as the lost-response path does: an order for
+    exactly this size was sent, so a bigger delta still means at least this size
+    was ours. Discarding it drops a real fill — and would make a LARGER delta
+    book LESS than a smaller one, which is the shape of a bug, not a rule."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[RuntimeError("dark")],
+        ctf_balance_sequence=[0, moved],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(expected)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(expected)
+
+
+def test_sell_settle_books_an_over_size_wallet_drop_down_to_the_order(store) -> None:
+    """SELL twin: the wallet held more of the token than this order sold, so the
+    drop measured across the poll window is larger than the order. Discarding it
+    would leave the row open with the tokens already gone."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[RuntimeError("dark")],
+        # Gate syncs at 25 shares held, then the window shows a 15-share drop.
+        ctf_balance_sequence=[25_000_000, 10_000_000],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "closed"
+
+
+def test_settle_keeps_a_reported_cross_when_nothing_else_can_speak(store) -> None:
+    """The POST body reported 3 of 10 crossing and then every later source went
+    dark. The cross is a lower bound, not a count — but it is the venue's own
+    word that 3 shares moved on-chain, so it is booked. Reporting the outcome
+    unknown here would leave a real fill with no ledger row, which is the one
+    thing this path must never do."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            **_zero_fill_response("matched"),
+            "takingAmount": "3",
+            "makingAmount": "1.5",
+        },
+        order_status=[RuntimeError("dark")],
+        ctf_balance_sequence=[0, RuntimeError("clob down")],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(3.0)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(3.0)
+
+
+# ---------- a price outside the venue's band is booked conservatively ----------
+#
+# Clamping to the nearest edge is not neutral: for a SELL the ceiling is the
+# most favourable price there is, so a wrong-scale book would fabricate realized
+# profit — and fabricated profit resets the entry kill switch's consecutive-loss
+# walk. Each side is booked at ITS worst edge instead.
+
+
+@pytest.mark.parametrize(
+    ("price", "fallback"),
+    [(None, 550_000.0), (float("nan"), float("nan"))],
+    ids=["wrong-scale-limit", "non-finite"],
+)
+@pytest.mark.parametrize(
+    ("side", "expected"),
+    [("buy", MAX_TOKEN_PRICE), ("sell", MIN_TOKEN_PRICE)],
+)
+def test_bookable_price_falls_to_the_conservative_edge(price, fallback, side, expected) -> None:
+    """Neither the quotient nor the limit is a price the venue could produce —
+    including when neither is even a number, which the band rejects too."""
+    booked = _bookable_price(price, fallback=fallback, side=side, order_id="0x1")
+    assert booked == pytest.approx(expected)
+    assert math.isfinite(booked)
+
+
+def test_buy_lost_response_over_size_balance_delta_books_the_order(store, caplog) -> None:
+    """R1: on the lost-response path an order for exactly ``size`` was sent, so a
+    wallet delta ABOVE the size still means at least the whole order is ours —
+    an earlier order's remainder settling in the same window explains the
+    excess. Discarding it leaves tokens no ledger row manages, which is the
+    worse error, so this one source is booked down to the size and the excess is
+    reported."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        exception=RuntimeError("request exception"),
+        ctf_balance_sequence=[0, 999_000_000],  # +999 shares for an order of 10
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(10.0)
+    assert "999" in caplog.text  # the excess is not swallowed
+
+
+def test_sell_lost_response_over_size_balance_delta_books_the_order(store) -> None:
+    """R1, sell side: discarding here is worse still — the row stays open with
+    the tokens already gone, so every later tick fails the balance gate until
+    reconciliation closes it at a fabricated zero P&L."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m, qty=10.0)
+    clob = _FakeClob(
+        exception=RuntimeError("request exception"),
+        ctf_balance_sequence=[999_000_000, 0],  # gate syncs, then -999 shares
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "closed"
+
+
+def test_settle_keeps_a_settled_cross_over_a_lagging_exact_zero(store) -> None:
+    """R2: a transaction hash is the venue's own proof that a match settled. When
+    only the status propagates to the data API, its ``size_matched: 0`` must not
+    erase a cross the response already reported and stamped with a hash."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0x1",
+            "status": "matched",
+            "takingAmount": "5",
+            "makingAmount": "2.5",
+            "transactionsHashes": ["0xabc"],
+        },
+        cancel_responses=[_cancelled()],
+        order_status=[{"size_matched": "0", "status": "CANCELED"}],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(5.0)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(5.0)
+
+
+def test_settle_post_ack_zero_is_not_evidence_so_the_balance_speaks(store) -> None:
+    """R3: the data API lags the matching engine, so a ``size_matched: 0`` read
+    moments after an acknowledged cancel proves nothing — exactly as the same
+    zero read inside the loop proves nothing. The wallet gets its turn."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_cancelled()],
+        order_status=[{"size_matched": "0", "status": "LIVE"}],
+        ctf_balance_sequence=[0, 5_000_000],  # 5 shares crossed before the ack
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(5.0)
+
+
+def test_read_order_blank_size_matched_is_unknown_not_a_counted_zero(store) -> None:
+    """R4: an order document with a blank count is not an order document. The
+    parser maps an empty string to a clean zero, which is right for a POST body
+    and wrong here — it would be the venue counting nought."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            **_zero_fill_response("matched"),
+            "takingAmount": "3",
+            "makingAmount": "1.5",
+        },
+        cancel_responses=[_cancelled()],
+        order_status=[{"size_matched": "", "status": "CANCELED"}],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(3.0)  # the cross survives; the blank counts nothing
+
+
+def test_settle_without_an_order_id_still_asks_the_balance(store, caplog) -> None:
+    """R5: with no id to cancel by, the CTF balance is the ONLY remaining signal
+    — and it was the one path that never asked it. The alert stays either way:
+    nothing can be cancelled, so the remainder may still rest."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live", order_id=None),
+        ctf_balance_sequence=[0, 6_000_000],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(6.0)
+    assert "RESTING ORDER ALERT" in caplog.text
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(6.0)
+
+
+def test_sell_out_of_band_bid_is_never_posted(store) -> None:
+    """C3: the order is signed at the level-1 bid. If that bid is not a price the
+    venue could produce, the book is not trustworthy and the trade must not be
+    made on it — refusing after signing only declines to RECORD a price we
+    already traded at."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=550_000.0))
+    held = _held(store, m, qty=10.0)
+    clob = _FakeClob()
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is False
+    assert r.skip_reason == "price_out_of_band"
+    assert clob.posted == []  # nothing was signed
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
+
+
+def test_buy_out_of_band_price_is_never_posted(store) -> None:
+    """C3, buy side: the intent's price is the level-1 ask the entry section
+    read, and that section guards only against a non-positive one."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob()
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=550_000.0, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "price_out_of_band"
+    assert clob.posted == []
+
+
+def test_buy_partial_fill_that_may_rest_is_flagged_on_the_fill_path(store) -> None:
+    """C2: a partial fill whose remainder could not be cancelled is still an
+    order the venue may hold. That has to reach the caller through the FILL
+    path, not only through the skip path, or the next tick posts a second order
+    on top of the first."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            **_zero_fill_response("matched"),
+            "takingAmount": "4",
+            "makingAmount": "2",
+        },
+        cancel_responses=[_refused()],
+        order_status=[{"size_matched": "4", "status": "LIVE"}],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(4.0)
+    assert r.resting_order_id == "0x1"
