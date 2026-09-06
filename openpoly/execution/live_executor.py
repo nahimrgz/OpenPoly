@@ -134,6 +134,25 @@ def _parse_order_id(raw: Any) -> str | None:
     return None
 
 
+def _order_was_rejected(resp: dict[str, Any]) -> bool:
+    """Whether a POST /order response says the venue rejected the order.
+
+    ``True`` only when ``"success"`` is present AND definitively falsy in the
+    venue's terms: the boolean ``False``, or a string equal — case-insensitive,
+    stripped of surrounding whitespace — to ``"false"``. An ABSENT key is not a
+    rejection (some response variants omit it entirely; the order may still
+    have been placed, with an ``orderID`` and amounts in the body), and neither
+    is any other value (``True``, a truthy non-"false" string, ...). Both cases
+    return ``False`` — not rejected, proceed to settle.
+    """
+    if "success" not in resp:
+        return False
+    value = resp["success"]
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().lower() == "false"
+
+
 CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 SIGTYPE_POLY_1271 = 3
@@ -158,7 +177,7 @@ _SETTLE_DEADLINE_S = 8.0
 # ``MATCHED`` is NOT one of them: the venue reports it for a PARTIAL match too,
 # so believing it would abandon the unmatched remainder of a partially filled
 # order on the book. A match ends the settle only through the size comparison.
-_ORDER_DONE_STATUSES = frozenset({"CANCELED", "CANCELLED"})
+_ORDER_DONE_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "PURGED"})
 # An on-chain fill is irreversible; persisting it (open for BUY, close for SELL)
 # must survive a transient write failure (SQLite lock contention, surfaced as
 # ``sqlalchemy.exc.OperationalError``) or the ledger drifts from the wallet: a
@@ -214,6 +233,8 @@ def _bookable_price(
     A non-finite value is out of band by the same comparison, so it never
     survives to become a basis.
     """
+    if side not in ("buy", "sell"):
+        raise ValueError(f"invalid side: {side!r}")
     if in_price_band(price):
         return price
     if price is not None:
@@ -534,12 +555,24 @@ class LiveExecutor:
         whether anything can still be resting — and throwing it away over a
         missing size spends the whole retry budget on an order the venue has
         already reported cancelled.
+
+        A 404 from this endpoint is not a transient read failure like every
+        other exception: the venue purges old/settled orders from its records,
+        so a 404 here means the order is definitely gone. It is reported as the
+        synthetic terminal status ``PURGED`` (in ``_ORDER_DONE_STATUSES``)
+        rather than spending the retry budget on a read that will never
+        succeed again.
         """
         try:
             order = self._clob.get_order(order_id)
             raw_matched = order.get("size_matched")
             matched = _parse_amount(raw_matched)
             status = str(order.get("status") or "").upper()
+        except PolyApiException as exc:
+            if exc.status_code == 404:
+                return None, "PURGED"
+            logger.warning("get_order for %s failed: %s", order_id, exc)
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("get_order for %s failed: %s", order_id, exc)
             return None
@@ -800,6 +833,8 @@ class LiveExecutor:
         account of the order is either believed or thrown away; the settle step
         below is handed only numbers that survived that, and runs whenever what
         did survive is short of ``size``."""
+        if side not in ("buy", "sell"):
+            raise ValueError(f"invalid side: {side!r}")
         # ``makingAmount`` is what our order gives, ``takingAmount`` what it
         # receives: a BUY receives shares (and gives pUSD), a SELL the reverse.
         shares_key, usdc_key = (
@@ -889,6 +924,8 @@ class LiveExecutor:
         establishes nothing leaves this order's fate unknown rather than merely
         unmeasured.
         """
+        if side not in ("buy", "sell"):
+            raise ValueError(f"invalid side: {side!r}")
         qty = self._wallet_delta(confirm, size, order_id=None)
         if qty is None:
             return ExecResult.skip("live_fill_unknown")
@@ -1155,7 +1192,7 @@ class LiveExecutor:
                 fill.price,
             )
         else:
-            if not resp.get("success"):
+            if _order_was_rejected(resp):
                 return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
             fill = self._resolve_fill(
                 resp, side="buy", size=size, limit_price=intent.price, confirm=confirm
@@ -1265,7 +1302,7 @@ class LiveExecutor:
                 fill.price,
             )
         else:
-            if not resp.get("success"):
+            if _order_was_rejected(resp):
                 return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
             fill = self._resolve_fill(
                 resp, side="sell", size=size, limit_price=bid_price, confirm=confirm

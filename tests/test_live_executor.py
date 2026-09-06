@@ -24,6 +24,7 @@ from openpoly.execution.live_executor import (
     _SETTLE_SLEEP,
     LiveExecutor,
     _bookable_price,
+    _order_was_rejected,
 )
 from openpoly.execution.sizing import MAX_TOKEN_PRICE, MIN_TOKEN_PRICE
 from openpoly.markets.manager import manager as market_source_manager
@@ -407,6 +408,101 @@ def test_buy_response_success_false_skips(store) -> None:
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.filled is False
     assert r.skip_reason == "live_rejected:price not tick-aligned"
+
+
+# ---------- ``_order_was_rejected``: what "success" actually says ----------
+#
+# An absent key is not a rejection (some venue response variants omit it, and
+# an order the venue placed must still be settled). A truthy non-bool string
+# such as ``"true"`` is not a rejection either. Only the boolean ``False`` or a
+# string equal, case-insensitively and stripped, to ``"false"`` is.
+
+
+@pytest.mark.parametrize(
+    ("resp", "expected"),
+    [
+        pytest.param({}, False, id="absent-key"),
+        pytest.param({"success": True}, False, id="bool-true"),
+        pytest.param({"success": False}, True, id="bool-false"),
+        pytest.param({"success": "true"}, False, id="string-true"),
+        pytest.param({"success": "false"}, True, id="string-false"),
+        pytest.param({"success": "False"}, True, id="string-false-mixed-case"),
+        pytest.param({"success": " false "}, True, id="string-false-whitespace"),
+        pytest.param({"success": "no"}, False, id="unrelated-string"),
+    ],
+)
+def test_order_was_rejected(resp, expected) -> None:
+    assert _order_was_rejected(resp) is expected
+
+
+def test_buy_response_without_success_key_still_settles(store) -> None:
+    """An absent ``success`` key does not mean rejected: the response still
+    carries an orderID and usable amounts, so it must go through the settle
+    path exactly like an explicit ``success: true`` would, not bail out as
+    ``live_rejected`` with the order possibly still resting unattended."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            "orderID": "0xORDER",
+            "status": "matched",
+            "makingAmount": "4.0",
+            "takingAmount": "10.0",
+            "transactionsHashes": ["0xTX"],
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n1", ts=100.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert r.price == pytest.approx(0.4)
+
+
+def test_sell_response_without_success_key_still_settles(store) -> None:
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response={
+            "orderID": "0xSELL",
+            "status": "matched",
+            "makingAmount": "10.0",
+            "takingAmount": "5.5",
+            "transactionsHashes": ["0xSTX"],
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+
+
+def test_buy_response_success_string_false_skips_without_settling(store) -> None:
+    """``"success": "false"`` (a string, not the boolean) must be read as a
+    rejection: it must never sail past the check into ``_resolve_fill`` as
+    though the order succeeded."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(order_response={"success": "false", "errorMsg": "bad price"})
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_rejected:bad price"
+    assert clob.order_reads == 0
+    assert clob.cancelled == []
+
+
+def test_sell_response_success_string_false_skips_without_settling(store) -> None:
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    clob = _FakeClob(order_response={"success": "false", "errorMsg": "bad price"})
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_rejected:bad price"
+    assert clob.order_reads == 0
+    assert clob.cancelled == []
 
 
 @pytest.mark.parametrize("status", ["live", "unmatched"])
@@ -2210,6 +2306,71 @@ def test_buy_terminal_status_without_size_ends_the_loop_at_once(store) -> None:
     assert r.skip_reason == "live_fill_unknown"  # the size was never established
 
 
+@pytest.mark.parametrize("status", ["EXPIRED", "REJECTED"])
+def test_buy_expired_or_rejected_status_ends_the_loop_at_once(store, status) -> None:
+    """``EXPIRED`` and ``REJECTED`` mean the order can no longer fill, exactly
+    like a cancellation — the settle loop must not keep burning its retry/cancel
+    budget on an order the venue has already reported dead."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[{"status": status}],  # terminal, but no size_matched
+        ctf_balance_sequence=[0, 0],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert len(clob.cancelled) == 1  # the status settled it; no budget spent
+    assert r.resting_order_id is None  # nothing rests after a terminal status
+    assert r.skip_reason == "live_fill_unknown"  # the size was never established
+
+
+# ---------- ``_read_order``: a 404 read means the order was purged ----------
+#
+# The venue purges old/settled orders from its records; for this endpoint a 404
+# means the order is definitely gone, not a transient read failure worth
+# retrying like every other exception is.
+
+
+def test_read_order_404_is_purged(store) -> None:
+    exc = PolyApiException(error_msg="not found")
+    exc.status_code = 404
+    clob = _FakeClob(order_status=[exc])
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    assert le._read_order("0x1") == (None, "PURGED")
+
+
+@pytest.mark.parametrize("status_code", [500, None])
+def test_read_order_non_404_poly_api_exception_returns_none(store, status_code) -> None:
+    exc = PolyApiException(error_msg="server error")
+    exc.status_code = status_code
+    clob = _FakeClob(order_status=[exc])
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    assert le._read_order("0x1") is None
+
+
+def test_buy_purged_order_ends_the_settle_loop_at_once(store) -> None:
+    """A 404 read during the settle loop is treated as terminal (``PURGED`` is
+    in ``_ORDER_DONE_STATUSES``), not spent retrying a read that will never
+    succeed again."""
+    m = _market("m1")
+    _populate(m)
+    exc = PolyApiException(error_msg="not found")
+    exc.status_code = 404
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[exc],
+        ctf_balance_sequence=[0, 0],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+    assert len(clob.cancelled) == 1  # the purged read settled it; no budget spent
+    assert r.resting_order_id is None
+    assert r.skip_reason == "live_fill_unknown"  # the size was never established
+
+
 # ---------- the settle's evidence model ----------
 #
 # The model itself (strengths, plausibility, resolution) is documented in
@@ -2388,6 +2549,39 @@ def test_bookable_price_falls_to_the_conservative_edge(price, fallback, side, ex
     booked = _bookable_price(price, fallback=fallback, side=side, order_id="0x1")
     assert booked == pytest.approx(expected)
     assert math.isfinite(booked)
+
+
+# ---------- ``side`` is validated, not silently mis-branched ----------
+#
+# Every function below treats anything that is not exactly "buy" as "sell"
+# via an if/else. An invalid value (a typo, or ``intent.side`` which is
+# "yes"/"no" — a real, different string domain) must raise rather than
+# silently pick the sell branch's amount ordering / price edge.
+
+
+def test_bookable_price_rejects_invalid_side() -> None:
+    with pytest.raises(ValueError):
+        _bookable_price(0.5, fallback=0.5, side="yes", order_id="0x1")
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_bookable_price_accepts_valid_sides(side) -> None:
+    booked = _bookable_price(0.5, fallback=0.5, side=side, order_id="0x1")
+    assert booked == pytest.approx(0.5)
+
+
+def test_resolve_fill_rejects_invalid_side(store) -> None:
+    clob = _FakeClob()
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with pytest.raises(ValueError):
+        le._resolve_fill({}, side="yes", size=10.0, limit_price=0.5, confirm=lambda: 0.0)
+
+
+def test_fill_from_balance_rejects_invalid_side(store) -> None:
+    clob = _FakeClob()
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with pytest.raises(ValueError):
+        le._fill_from_balance(lambda: 0.0, side="yes", size=10.0, limit_price=0.5)
 
 
 def test_buy_lost_response_over_size_balance_delta_books_the_order(store, caplog) -> None:
