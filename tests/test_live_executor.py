@@ -1,19 +1,35 @@
-"""Tests for LiveExecutor — V2 IOC submission through a faked _ClobClient."""
+"""Tests for LiveExecutor — crossing-GTC submission through a faked _ClobClient.
+
+Every order the server answers is settled: whatever did not fill immediately is
+cancelled, across a bounded retry that outlives the venue's matching delay.
+"""
 
 from __future__ import annotations
 
+import itertools
+import math
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
-from openpoly.execution.live_executor import LiveExecutor
+from openpoly.execution.live_executor import _PERSIST_ATTEMPTS, _SETTLE_ATTEMPTS, LiveExecutor
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook, normalize_gamma_market
 from openpoly.markets.store import MarketStore, PollSummary
 from openpoly.portfolio import PortfolioStore
 from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
+
+
+def _refused(order_id: str = "0x1", reason: str = "order is pending") -> dict[str, Any]:
+    """DELETE /order body when the venue keeps the order (200, not an exception)."""
+    return {"canceled": [], "not_canceled": {order_id: reason}}
+
+
+def _cancelled(order_id: str = "0x1") -> dict[str, Any]:
+    """DELETE /order body when the venue acknowledges the cancel."""
+    return {"canceled": [order_id], "not_canceled": {}}
 
 
 class _FakeClob:
@@ -27,38 +43,52 @@ class _FakeClob:
     def __init__(
         self,
         *,
-        order_response: dict[str, Any] | None = None,
+        order_response: Any = None,
         exception: Exception | None = None,
         allowance_update_raises: bool = False,
         ctf_balance_raw: int = 10**18,
-        ctf_balance_sequence: list[int] | None = None,
-        cancel_raises: bool = False,
-        order_status: dict[str, Any] | None = None,
-        balance_read_raises: bool = False,
+        ctf_balance_sequence: list[Any] | None = None,
+        cancel_responses: list[Any] | None = None,
+        order_status: Any = None,
     ) -> None:
-        self._response = order_response or {
-            "success": True,
-            "orderID": "0xDEAD",
-            "status": "matched",
-            "makingAmount": "5.0",
-            "takingAmount": "10.0",
-            "transactionsHashes": ["0xCAFE"],
-        }
+        # ``None`` → the default full fill; anything else (including a non-dict
+        # such as "") is returned verbatim, so a 200-with-garbage body can be
+        # modelled.
+        self._response = (
+            {
+                "success": True,
+                "orderID": "0xDEAD",
+                "status": "matched",
+                "makingAmount": "5.0",
+                "takingAmount": "10.0",
+                "transactionsHashes": ["0xCAFE"],
+            }
+            if order_response is None
+            else order_response
+        )
         self._exception = exception
         self._allowance_update_raises = allowance_update_raises
         self._ctf_balance_raw = ctf_balance_raw
         # When set, successive CONDITIONAL balance reads consume this list
         # (last value sticks) — models balance changing across the pre-order
         # gate read and the post-exception confirmation polls.
+        # (an Exception entry is raised — models the read going dark).
         self._ctf_balance_sequence = list(ctf_balance_sequence) if ctf_balance_sequence else None
-        self._cancel_raises = cancel_raises
-        self._balance_read_raises = balance_read_raises
-        # get_order response; default "0" so the final qty falls back to the
-        # reported fill (max(matched, reported)).
-        self._order_status = order_status or {"size_matched": "0"}
+        # Successive cancel_order calls consume this list (last value sticks);
+        # an Exception entry is raised. None → the venue acknowledges every cancel.
+        self._cancel_responses = list(cancel_responses) if cancel_responses else None
+        # get_order answers: one dict, or a list consumed per call (last value
+        # sticks; an Exception entry is raised). Default "0" so the final qty
+        # falls back to the reported fill (max(matched, reported)).
+        if order_status is None:
+            order_status = {"size_matched": "0"}
+        self._order_status = (
+            list(order_status) if isinstance(order_status, list) else [order_status]
+        )
         self.posted: list[dict[str, Any]] = []
         self.allowance_updates: list[Any] = []
         self.cancelled: list[str] = []
+        self.order_reads = 0
 
     def create_and_post_order(self, order_args, options, order_type):
         self.posted.append({"order_args": order_args, "options": options, "order_type": order_type})
@@ -70,29 +100,38 @@ class _FakeClob:
         self.allowance_updates.append(params)
         # Scoped to the pre-signing COLLATERAL refresh: the CONDITIONAL read is
         # the lost-response confirmation baseline, whose failure is a separate
-        # (and fatal) case — see balance_read_raises.
+        # (and fatal) case — an Exception entry in ``ctf_balance_sequence``.
         if self._allowance_update_raises and params.asset_type == "COLLATERAL":
             raise RuntimeError("cache refresh failed")
 
+    @staticmethod
+    def _next(seq: list[Any]) -> Any:
+        """Consume ``seq`` one entry per call; the last entry sticks."""
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
     def cancel_order(self, payload):
         self.cancelled.append(payload.orderID)
-        if self._cancel_raises:
-            raise RuntimeError("cancel failed")
+        if self._cancel_responses is None:
+            return _cancelled(payload.orderID)
+        res = self._next(self._cancel_responses)
+        if isinstance(res, Exception):
+            raise res
+        return res
 
     def get_order(self, order_id):
-        return self._order_status
+        self.order_reads += 1
+        res = self._next(self._order_status)
+        if isinstance(res, Exception):
+            raise res
+        return res
 
     def get_balance_allowance(self, params):
-        if self._balance_read_raises:
-            raise RuntimeError("balance read failed")
         # CONDITIONAL queries return the CTF balance the SELL poll checks;
         # COLLATERAL queries don't matter for these tests.
         if self._ctf_balance_sequence is not None:
-            val = (
-                self._ctf_balance_sequence.pop(0)
-                if len(self._ctf_balance_sequence) > 1
-                else self._ctf_balance_sequence[0]
-            )
+            val = self._next(self._ctf_balance_sequence)
+            if isinstance(val, Exception):
+                raise val
             return {"balance": str(val), "allowances": {}}
         return {"balance": str(self._ctf_balance_raw), "allowances": {}}
 
@@ -134,6 +173,84 @@ def _populate(market, *books: OrderBook) -> None:
 
 def _intent(market_id="m1", side="yes", price=0.5, qty=10.0) -> OrderIntent:
     return OrderIntent(market_id=market_id, side=side, price=price, qty=qty)
+
+
+def _zero_fill_response(status: str, order_id: str | None = "0x1") -> dict[str, Any]:
+    """POST /order answer for an order that crossed nothing: ``live`` rests,
+    ``delayed`` sits in the venue's matching-delay window, ``unmatched`` rests
+    after that window expired. ``order_id=None`` drops the id altogether."""
+    resp: dict[str, Any] = {
+        "success": True,
+        "status": status,
+        "makingAmount": "0",
+        "takingAmount": "0",
+    }
+    if order_id is not None:
+        resp["orderID"] = order_id
+    return resp
+
+
+def _held(store: PortfolioStore, m, **overrides: Any):
+    """Seed one open position on ``m`` (10 shares @ 0.40 by default)."""
+    kw: dict[str, Any] = dict(
+        market_id=m.market_id,
+        side="yes",
+        token_id=m.yes_token_id,
+        condition_id=m.condition_id,
+        price=0.40,
+        qty=10.0,
+        ts=100.0,
+        news_id="n",
+    )
+    kw.update(overrides)
+    return store.open_position(**kw)
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch) -> list[float]:
+    """Patch the executor's ``time.sleep`` (settle retries, CTF polls, persist
+    retries) for every test and record the requested delays; tests that assert
+    on the delays request it by name."""
+    import openpoly.execution.live_executor as le_mod
+
+    calls: list[float] = []
+    monkeypatch.setattr(le_mod.time, "sleep", lambda secs=0.0, *_a, **_k: calls.append(secs))
+    return calls
+
+
+class _FlakyStore:
+    """Wraps a PortfolioStore; ``method`` raises for the first ``fail_times``
+    calls (``None`` = always), then delegates. Models a transient DB write
+    failure *after* an irreversible on-chain fill — the window that leaves the
+    ledger out of step with the wallet if the persist is dropped instead of
+    retried."""
+
+    def __init__(
+        self,
+        inner: PortfolioStore,
+        *,
+        method: str,
+        fail_times: int | None,
+        exc: type[Exception] = RuntimeError,
+    ) -> None:
+        self._inner = inner
+        self._method = method
+        self._remaining = fail_times
+        self._exc = exc
+        self.attempts = 0
+
+    def __getattr__(self, name: str) -> Any:
+        if name == self._method:
+            return self._flaky
+        return getattr(self._inner, name)
+
+    def _flaky(self, *args: Any, **kwargs: Any):
+        self.attempts += 1
+        if self._remaining is None or self._remaining > 0:
+            if self._remaining is not None:
+                self._remaining -= 1
+            raise self._exc("database is locked")
+        return getattr(self._inner, self._method)(*args, **kwargs)
 
 
 # ---------- execute_buy ----------
@@ -221,14 +338,10 @@ def test_buy_duplicate_position_skips(store) -> None:
     assert clob.posted == []
 
 
-def test_buy_clob_network_error_skips(store, monkeypatch) -> None:
+def test_buy_clob_network_error_skips(store) -> None:
     m = _market("m1")
     _populate(m)
     clob = _FakeClob(exception=ConnectionError("RPC down"))
-    # R5 confirmation polls after the exception — patch out its sleeps.
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.filled is False
@@ -245,22 +358,46 @@ def test_buy_response_success_false_skips(store) -> None:
     assert r.skip_reason == "live_rejected:price not tick-aligned"
 
 
-def test_buy_zero_match_skips(store) -> None:
-    """FAK with no liquidity at price → takingAmount=0 → skip."""
+@pytest.mark.parametrize("status", ["live", "unmatched"])
+def test_buy_zero_fill_is_cancelled(store, status) -> None:
+    """A GTC that crossed nothing is placed and RESTS — ``live`` right away,
+    ``unmatched`` after the venue's delay window expired without a match (per
+    the order lifecycle docs it is NOT "not placed"). Left alone it fills later
+    at a stale limit with no ledger row — the orphan incident the partial-fill
+    cancel exists for — so zero match cancels too."""
     m = _market("m1")
     _populate(m)
-    clob = _FakeClob(
-        order_response={
-            "success": True,
-            "orderID": "0x1",
-            "status": "unmatched",
-            "makingAmount": "0",
-            "takingAmount": "0",
-        }
-    )
+    clob = _FakeClob(order_response=_zero_fill_response(status))
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.skip_reason == "live_no_match"
+    assert r.resting_order_id is None  # the cancel was acknowledged
+    assert clob.cancelled == ["0x1"]
+    assert store.get_open_position("m1", "yes") is None
+
+
+def test_buy_zero_match_raced_fill_after_cancel_is_recorded(store) -> None:
+    """The resting order can fill between the response and the cancel. The
+    post-cancel ``get_order`` re-read is the only place that fill is visible;
+    it must become a position (at the limit price — actual cost ≤ limit)."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        order_status={"size_matched": "10.0"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=10.0)
+    r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert r.price == pytest.approx(intent.price)
+    assert clob.cancelled == ["0x1"]
+    held = store.get_open_position("m1", "yes")
+    assert held is not None
+    assert held.qty == pytest.approx(10.0)
+    assert held.avg_entry_price == pytest.approx(intent.price)
+    assert any(f.order_id == "0x1" for f in store.list_fills(limit=5))
 
 
 def test_buy_neg_risk_flag_passed_to_options(store) -> None:
@@ -338,7 +475,7 @@ def test_sell_success_closes_position(store) -> None:
     assert len(clob.allowance_updates) >= 1
 
 
-def test_sell_skips_when_ctf_cache_never_syncs(store, monkeypatch) -> None:
+def test_sell_skips_when_ctf_cache_never_syncs(store) -> None:
     """If CTF balance never reaches position.qty within poll window → skip."""
     m = _market("m1")
     _populate(m, _book(m.yes_token_id))
@@ -354,10 +491,6 @@ def test_sell_skips_when_ctf_cache_never_syncs(store, monkeypatch) -> None:
     )
     # CTF balance always 0 — cache "stuck"
     clob = _FakeClob(ctf_balance_raw=0)
-    # Patch time.sleep so the 5×1s poll doesn't actually delay the test.
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.skip_reason == "ctf_cache_not_synced"
@@ -405,32 +538,46 @@ def test_sell_empty_bids_skips(store) -> None:
     assert clob.posted == []
 
 
-def test_sell_zero_match_skips_position_stays_open(store) -> None:
+@pytest.mark.parametrize("status", ["live", "unmatched"])
+def test_sell_zero_fill_is_cancelled(store, status) -> None:
+    """SELL twin: a sell that crossed nothing rests at our bid and would sell
+    the position later behind the ledger's back. Cancel it; the position stays
+    open and untouched."""
     m = _market("m1")
     _populate(m, _book(m.yes_token_id))
-    held = store.open_position(
-        market_id="m1",
-        side="yes",
-        token_id=m.yes_token_id,
-        condition_id=m.condition_id,
-        price=0.40,
-        qty=10.0,
-        ts=100.0,
-        news_id="n",
-    )
-    clob = _FakeClob(
-        order_response={
-            "success": True,
-            "orderID": "0x1",
-            "makingAmount": "0",
-            "takingAmount": "0",
-        }
-    )
+    held = _held(store, m)
+    clob = _FakeClob(order_response=_zero_fill_response(status))
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.skip_reason == "live_no_match"
+    assert r.resting_order_id is None
+    assert clob.cancelled == ["0x1"]
     rec = store.get_position(held.position_id)
     assert rec is not None and rec.status == "open"
+    assert rec.qty == pytest.approx(10.0)
+
+
+def test_sell_zero_match_raced_fill_after_cancel_is_recorded(store) -> None:
+    """A sell that filled between the response and the cancel: the re-read
+    reports 4 of 10 sold. Persist that at the limit (bid) price — proceeds can
+    only be ≥ bid — and keep the position open with the unsold 6."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        order_status={"size_matched": "4.0"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(4.0)
+    assert r.price == pytest.approx(0.55)
+    assert clob.cancelled == ["0x1"]
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
+    assert rec.qty == pytest.approx(6.0)
+    assert any(f.order_id == "0x1" for f in store.list_fills(limit=5))
 
 
 # ---------- lost-response confirmation (R5: at-least-once hardening) ----------
@@ -441,7 +588,7 @@ def test_sell_zero_match_skips_position_stays_open(store) -> None:
 # the CTF balance before declaring failure.
 
 
-def test_sell_network_error_but_balance_dropped_records_fill(store, monkeypatch) -> None:
+def test_sell_network_error_but_balance_dropped_records_fill(store) -> None:
     m = _market("m1")
     _populate(m, _book(m.yes_token_id, bid=0.55))
     held = store.open_position(
@@ -459,9 +606,6 @@ def test_sell_network_error_but_balance_dropped_records_fill(store, monkeypatch)
         exception=RuntimeError("request exception"),
         ctf_balance_sequence=[10_000_000, 0],
     )
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.filled is True
@@ -471,34 +615,7 @@ def test_sell_network_error_but_balance_dropped_records_fill(store, monkeypatch)
     assert rec is not None and rec.status == "closed"
 
 
-def test_sell_network_error_balance_unchanged_skips(store, monkeypatch) -> None:
-    m = _market("m1")
-    _populate(m, _book(m.yes_token_id, bid=0.55))
-    held = store.open_position(
-        market_id="m1",
-        side="yes",
-        token_id=m.yes_token_id,
-        condition_id=m.condition_id,
-        price=0.40,
-        qty=10.0,
-        ts=100.0,
-        news_id="n",
-    )
-    clob = _FakeClob(
-        exception=RuntimeError("request exception"),
-        ctf_balance_sequence=[10_000_000, 10_000_000],  # never drops
-    )
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
-    le = LiveExecutor(portfolio=store, clob_client=clob)
-    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
-    assert r.skip_reason == "live_error:RuntimeError"
-    rec = store.get_position(held.position_id)
-    assert rec is not None and rec.status == "open"
-
-
-def test_sell_network_error_partial_drop_records_partial(store, monkeypatch) -> None:
+def test_sell_network_error_partial_drop_records_partial(store) -> None:
     m = _market("m1")
     _populate(m, _book(m.yes_token_id, bid=0.55))
     held = store.open_position(
@@ -516,9 +633,6 @@ def test_sell_network_error_partial_drop_records_partial(store, monkeypatch) -> 
         exception=RuntimeError("request exception"),
         ctf_balance_sequence=[18_000_000, 3_000_000],
     )
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.filled is True
@@ -528,17 +642,36 @@ def test_sell_network_error_partial_drop_records_partial(store, monkeypatch) -> 
     assert rec.qty == pytest.approx(3.0)
 
 
-def test_buy_network_error_but_balance_increased_opens_position(store, monkeypatch) -> None:
+# A raised post and a 200 whose body is not JSON (the SDK hands back the raw
+# text) are the same event: the order's fate is unknown until the balance says.
+_LOST_RESPONSE = {
+    "exception": {"exception": RuntimeError("request exception")},
+    "non-json-200": {"order_response": ""},
+}
+_LOST_RESPONSE_REASON = {
+    "exception": "live_error:RuntimeError",
+    "non-json-200": "live_error:TypeError",
+}
+
+
+@pytest.mark.parametrize("case", list(_LOST_RESPONSE))
+def test_buy_lost_response_without_balance_change_skips(store, case) -> None:
     m = _market("m1")
     _populate(m)
-    # Pre-order read 0; post-exception confirm 10 tokens → buy actually filled.
-    clob = _FakeClob(
-        exception=RuntimeError("request exception"),
-        ctf_balance_sequence=[0, 10_000_000],
-    )
-    import openpoly.execution.live_executor as le_mod
+    clob = _FakeClob(ctf_balance_sequence=[0, 0], **_LOST_RESPONSE[case])
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n1", ts=100.0)
+    assert r.filled is False
+    assert r.skip_reason == _LOST_RESPONSE_REASON[case]
+    assert store.get_open_position("m1", "yes") is None
 
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
+
+@pytest.mark.parametrize("case", list(_LOST_RESPONSE))
+def test_buy_lost_response_with_balance_rise_records_fill_at_limit(store, case) -> None:
+    m = _market("m1")
+    _populate(m)
+    # Pre-order read 0; post-exception confirm 10 tokens → the buy filled.
+    clob = _FakeClob(ctf_balance_sequence=[0, 10_000_000], **_LOST_RESPONSE[case])
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n1", ts=100.0)
     assert r.filled is True
@@ -547,20 +680,20 @@ def test_buy_network_error_but_balance_increased_opens_position(store, monkeypat
     assert store.get_open_position("m1", "yes") is not None
 
 
-def test_buy_network_error_balance_unchanged_skips(store, monkeypatch) -> None:
+@pytest.mark.parametrize("case", list(_LOST_RESPONSE))
+def test_sell_lost_response_without_balance_change_skips(store, case) -> None:
     m = _market("m1")
-    _populate(m)
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
     clob = _FakeClob(
-        exception=RuntimeError("request exception"),
-        ctf_balance_sequence=[0, 0],
+        ctf_balance_sequence=[10_000_000, 10_000_000],  # never drops
+        **_LOST_RESPONSE[case],
     )
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
     le = LiveExecutor(portfolio=store, clob_client=clob)
-    r = le.execute_buy(_intent(), news_id="n1", ts=100.0)
-    assert r.skip_reason == "live_error:RuntimeError"
-    assert store.get_open_position("m1", "yes") is None
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.skip_reason == _LOST_RESPONSE_REASON[case]
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
 
 
 def test_sell_partial_fill_keeps_position_open(store) -> None:
@@ -600,29 +733,7 @@ def test_sell_partial_fill_keeps_position_open(store) -> None:
     assert rec.realized_pnl == pytest.approx((0.55 - 0.40) * 15.0)
 
 
-class _FlakyCloseStore:
-    """Wraps a PortfolioStore; raises on the first ``fail_times`` record_sell
-    calls, then delegates. Models a transient DB write failure occurring *after*
-    an irreversible on-chain fill — the exact window that leaves a phantom-open
-    position when the persist is dropped instead of retried."""
-
-    def __init__(self, inner: PortfolioStore, *, fail_times: int) -> None:
-        self._inner = inner
-        self._remaining = fail_times
-        self.close_attempts = 0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
-    def record_sell(self, *args: Any, **kwargs: Any):
-        self.close_attempts += 1
-        if self._remaining > 0:
-            self._remaining -= 1
-            raise RuntimeError("database is locked")
-        return self._inner.record_sell(*args, **kwargs)
-
-
-def test_sell_retries_db_close_after_transient_failure(store, monkeypatch) -> None:
+def test_sell_retries_db_close_after_transient_failure(store) -> None:
     """The on-chain sell is irreversible. A transient close_position failure must
     be retried so the position is not left phantom-open while its tokens are
     already gone — the root cause of stuck phantom-open positions."""
@@ -648,14 +759,11 @@ def test_sell_retries_db_close_after_transient_failure(store, monkeypatch) -> No
             "transactionsHashes": ["0xSTX"],
         }
     )
-    import openpoly.execution.live_executor as le_mod
-
-    monkeypatch.setattr(le_mod.time, "sleep", lambda *_a, **_k: None)
-    flaky = _FlakyCloseStore(store, fail_times=1)
+    flaky = _FlakyStore(store, method="record_sell", fail_times=1)
     le = LiveExecutor(portfolio=flaky, clob_client=clob)
     r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
     assert r.filled is True
-    assert flaky.close_attempts == 2  # failed once, retried, then persisted
+    assert flaky.attempts == 2  # failed once, retried, then persisted
     rec = store.get_position(held.position_id)
     assert rec is not None and rec.status == "closed"
     assert rec.close_reason == "take_profit"
@@ -714,6 +822,7 @@ def test_buy_partial_fill_cancels_resting_remainder(store) -> None:
     assert r.filled is True
     assert r.qty == pytest.approx(12.0)
     assert clob.cancelled == ["0xPART"]  # remainder cancelled, nothing rests
+    assert r.resting_order_id is None
     held = store.get_open_position("m1", "yes")
     assert held is not None and held.qty == pytest.approx(12.0)
 
@@ -759,8 +868,8 @@ def test_buy_full_fill_does_not_cancel(store) -> None:
 
 
 def test_buy_cancel_failure_records_reported_qty(store) -> None:
-    """Cancel failing must not lose the recorded fill — record the reported
-    qty; the resting remainder is the reverse-reconciliation alert's job."""
+    """Every cancel attempt raising must not lose the recorded fill — record
+    the reported qty and name the order that may still rest."""
     m = _market("m1")
     _populate(m)
     clob = _FakeClob(
@@ -772,12 +881,13 @@ def test_buy_cancel_failure_records_reported_qty(store) -> None:
             "takingAmount": "12.0",
             "transactionsHashes": ["0xTX"],
         },
-        cancel_raises=True,
+        cancel_responses=[RuntimeError("cancel failed")],
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(price=0.5, qty=30.0), news_id="n", ts=1.0)
     assert r.filled is True
     assert r.qty == pytest.approx(12.0)
+    assert r.resting_order_id == "0xPART"
 
 
 def test_sell_partial_fill_cancels_resting_remainder(store) -> None:
@@ -897,7 +1007,7 @@ def test_buy_refuses_to_post_without_a_ctf_baseline(store) -> None:
     fill would become an untracked position. Refuse to place the order."""
     m = _market("m1")
     _populate(m)
-    clob = _FakeClob(balance_read_raises=True)
+    clob = _FakeClob(ctf_balance_sequence=[RuntimeError("balance read failed")])
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
 
@@ -980,3 +1090,481 @@ def test_read_ctf_balance_raw_returns_none_for_a_missing_balance_field(store) ->
 
     le = LiveExecutor(portfolio=store, clob_client=_NoBalanceKey())
     assert le._read_ctf_balance_raw("tok") is None
+
+
+# ---------- settle: every answered order is cancelled unless fully filled ----------
+#
+# Facts (docs.polymarket.com, order lifecycle + manage orders): ``delayed`` is a
+# marketable order held in the venue's matching-delay window and cannot be
+# cancelled while pending; ``unmatched`` rests on the book after that window;
+# every cancel endpoint answers 200 with ``{"canceled": [...], "not_canceled":
+# {id: reason}}`` — a refusal is not an exception.
+
+
+def test_buy_delayed_order_retries_cancel_until_window_expires(store, no_sleep) -> None:
+    """A ``delayed`` order refuses the first cancel (pending window); the
+    executor waits and retries instead of reading one ``size_matched: 0`` and
+    forgetting an order that goes on to match."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("delayed"),
+        cancel_responses=[_refused(), _cancelled()],
+        order_status={"size_matched": "0", "status": "LIVE"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.skip_reason == "live_no_match"
+    assert clob.cancelled == ["0x1", "0x1"]
+    assert len(no_sleep) == 1  # one wait between the refusal and the retry
+    assert store.get_open_position("m1", "yes") is None
+
+
+def test_buy_cancel_refused_every_attempt_reports_cancel_failed(store, no_sleep, caplog) -> None:
+    """Every attempt refused with the order still LIVE: the bounded loop gives
+    up with a distinct reason, a RESTING ORDER ALERT and the resting order's id
+    — not the ``live_no_match`` a clean cancel returns, so callers do not retry
+    blind on top of a resting order."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status={"size_matched": "0", "status": "LIVE"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.skip_reason == "live_cancel_failed"
+    assert r.resting_order_id == "0x1"
+    assert len(clob.cancelled) == _SETTLE_ATTEMPTS
+    assert len(no_sleep) == _SETTLE_ATTEMPTS - 1
+    assert "RESTING ORDER ALERT" in caplog.text
+    assert store.get_open_position("m1", "yes") is None
+
+
+def test_buy_cancel_refused_because_already_matched_records_full_fill(store) -> None:
+    """The cancel is refused with "order already matched" and the in-loop read
+    shows the whole size filled: nothing rests, the fill — invisible in the
+    zero-amount response — is recorded at the limit price, and that read is the
+    final word (no second GET for a number already in hand)."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused(reason="order already matched")],
+        order_status={"size_matched": "10.0", "status": "MATCHED"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=10.0)
+    r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert r.price == pytest.approx(intent.price)
+    assert len(clob.cancelled) == 1  # refused, but the re-read settled it
+    assert clob.order_reads == 1  # two round-trips in total
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(10.0)
+
+
+def test_buy_get_order_failure_falls_back_to_balance_delta(store) -> None:
+    """A clean cancel, then ``get_order`` raises: the fill that may have raced
+    the cancel is confirmed through the CTF balance (the lost-response
+    mechanism, whose baseline is already in hand) instead of being dropped."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        order_status=[RuntimeError("order lookup failed")],
+        ctf_balance_sequence=[0, 10_000_000],  # baseline 0; confirm sees 10 shares
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=10.0)
+    r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert r.price == pytest.approx(intent.price)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(10.0)
+
+
+def test_buy_get_order_failure_and_balance_failure_is_fill_unknown(store) -> None:
+    """Neither the order read nor the balance read works after the cancel: the
+    executor cannot say whether anything filled and must not claim
+    ``live_no_match``."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        order_status=[RuntimeError("order lookup failed")],
+        ctf_balance_sequence=[0, RuntimeError("clob down")],  # baseline ok, then dark
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_fill_unknown"
+    assert clob.cancelled == ["0x1"]
+    assert store.get_open_position("m1", "yes") is None
+
+
+def test_buy_zero_fill_without_order_id_is_cancel_failed(store, caplog) -> None:
+    """An accepted zero-fill answer with no order id cannot be cancelled by id.
+    That is a resting-order alert, not a silent ``live_no_match``."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(order_response=_zero_fill_response("live", order_id=None))
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.skip_reason == "live_cancel_failed"
+    assert clob.cancelled == []
+    assert "RESTING ORDER ALERT" in caplog.text
+
+
+def test_buy_unparseable_amounts_still_cancel(store) -> None:
+    """Garbage amount fields must not skip the settle step: the order id is
+    read first, the order is cancelled, and only then is the skip reported."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(order_response={**_zero_fill_response("live"), "makingAmount": "n/a"})
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.skip_reason == "live_unparseable"
+    assert clob.cancelled == ["0x1"]
+
+
+def test_buy_missing_usdc_amount_records_at_limit_price(store) -> None:
+    """Shares reported but no USDC amount: a 0.0 price must never reach the
+    ledger (the exit section skips a position whose entry price is invalid);
+    fall back to the limit like every other unknown-price fill."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0x1",
+            "status": "matched",
+            "takingAmount": "10",
+            "makingAmount": "",
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=10.0)
+    r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.price == pytest.approx(intent.price)
+    assert clob.cancelled == []  # full fill — nothing to settle
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.avg_entry_price == pytest.approx(intent.price)
+
+
+def test_buy_retries_open_position_after_transient_failure(store) -> None:
+    """The on-chain buy is irreversible, exactly like the sell: a locked SQLite
+    file must not turn a confirmed fill into an unmanaged wallet position."""
+    m = _market("m1")
+    _populate(m)
+    flaky = _FlakyStore(store, method="open_position", fail_times=2)
+    le = LiveExecutor(portfolio=flaky, clob_client=_FakeClob())
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert flaky.attempts == 3
+    assert store.get_open_position("m1", "yes") is not None
+
+
+def test_buy_open_position_persistent_failure_never_raises(store, caplog) -> None:
+    m = _market("m1")
+    _populate(m)
+    flaky = _FlakyStore(store, method="open_position", fail_times=None)
+    le = LiveExecutor(portfolio=flaky, clob_client=_FakeClob())
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "open_persist_failed:RuntimeError"
+    assert flaky.attempts == _PERSIST_ATTEMPTS
+    assert "CRITICAL" in caplog.text
+
+
+def test_sell_delayed_order_retries_cancel_until_window_expires(store) -> None:
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("delayed"),
+        cancel_responses=[_refused(), _cancelled()],
+        order_status={"size_matched": "0", "status": "LIVE"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.skip_reason == "live_no_match"
+    assert clob.cancelled == ["0x1", "0x1"]
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
+    assert rec.qty == pytest.approx(10.0)
+
+
+def test_sell_get_order_failure_and_balance_failure_is_fill_unknown(store) -> None:
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        order_status=[RuntimeError("order lookup failed")],
+        ctf_balance_sequence=[10_000_000, RuntimeError("clob down")],  # gate ok, then dark
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_fill_unknown"
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
+    assert rec.qty == pytest.approx(10.0)
+
+
+def test_sell_missing_usdc_amount_records_at_limit_price(store) -> None:
+    """Tokens sold but no pUSD amount: booking a 0.0 sale would fabricate a
+    total loss; record at the bid (proceeds can only be ≥ bid)."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xS",
+            "status": "matched",
+            "makingAmount": "10",
+            "takingAmount": "",
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
+    assert r.filled is True
+    assert r.price == pytest.approx(0.55)
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "closed"
+    assert rec.realized_pnl == pytest.approx((0.55 - 0.40) * 10.0)
+
+
+# ---------- resting signal: an unconfirmed cancel is typed, not just logged ----------
+#
+# ``ExecResult.resting_order_id`` names an order of ours the venue may still
+# hold after every cancel attempt was refused or raised. It is set on skips AND
+# on fills (a partial fill is persisted regardless — it happened on-chain), so
+# a caller can back off instead of posting a second order on top of it.
+
+
+def test_buy_partial_fill_with_unconfirmed_cancel_reports_resting_order(store) -> None:
+    """12 of 30 filled, every cancel refused with the order still LIVE: the
+    known fill is persisted AND the result names the order that may rest."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xPART",
+            "status": "matched",
+            "makingAmount": "6.0",
+            "takingAmount": "12.0",
+            "transactionsHashes": ["0xTX"],
+        },
+        cancel_responses=[_refused("0xPART")],
+        order_status={"size_matched": "12.0", "status": "LIVE"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=30.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(12.0)
+    assert r.resting_order_id == "0xPART"
+    assert len(clob.cancelled) == _SETTLE_ATTEMPTS
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(12.0)
+
+
+def test_sell_partial_fill_with_unconfirmed_cancel_reports_resting_order(store) -> None:
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m, qty=18.0)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xSPART",
+            "status": "matched",
+            "makingAmount": "15.0",
+            "takingAmount": "8.25",
+            "transactionsHashes": ["0xSTX"],
+        },
+        cancel_responses=[_refused("0xSPART")],
+        order_status={"size_matched": "15.0", "status": "LIVE"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(15.0)
+    assert r.resting_order_id == "0xSPART"
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
+    assert rec.qty == pytest.approx(3.0)
+
+
+# ---------- settle bounds + the venue's last word on the fill ----------
+#
+# The settle loop is bounded by BOTH a retry count and a wall clock, and every
+# ending except a read that already showed the order terminal is followed by one
+# fresh read: an acknowledged cancel does not undo a fill the venue reported
+# mid-loop, and an exhausted budget is not proof that something still rests.
+
+
+def _stepping_clock(step: float):
+    """A ``time.monotonic`` stand-in that jumps ``step`` seconds per call —
+    models round-trips slow enough to eat the settle budget."""
+    ticks = itertools.count(0.0, step)
+    return lambda: next(ticks)
+
+
+def test_settle_stops_at_the_wall_clock_deadline(store, monkeypatch, no_sleep) -> None:
+    """Attempts alone do not bound the settle: 16 attempts of two un-timed HTTP
+    calls each can outlast the exit monitor's 30 s in-flight drain. With every
+    round-trip costing 3 s the loop must give up on the deadline, long before
+    the attempt count, and still report the order as possibly resting."""
+    import openpoly.execution.live_executor as le_mod
+
+    step = 3.0
+    monkeypatch.setattr(le_mod.time, "monotonic", _stepping_clock(step))
+    expected = math.ceil(le_mod._SETTLE_DEADLINE_S / step)
+    assert expected < _SETTLE_ATTEMPTS  # the deadline, not the count, bounds this run
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status={"size_matched": "0", "status": "LIVE"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert len(clob.cancelled) == expected
+    assert len(no_sleep) == expected - 1  # never a wait after the last attempt
+    assert r.skip_reason == "live_cancel_failed"
+    assert r.resting_order_id == "0x1"
+
+
+def test_settle_keeps_the_largest_matched_size_seen_mid_loop(store) -> None:
+    """A refused cancel whose read reported 20 of 30 matched, then an
+    acknowledged cancel and a dead post-settle read: the 20 the venue already
+    reported must survive the acknowledgement (a later cancel cannot un-fill
+    it), so 20 is persisted — not the 12 of the POST response."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0x1",
+            "status": "matched",
+            "makingAmount": "6.0",
+            "takingAmount": "12.0",
+        },
+        cancel_responses=[_refused(), _cancelled()],
+        order_status=[
+            {"size_matched": "20.0", "status": "LIVE"},
+            RuntimeError("order lookup failed"),
+        ],
+        ctf_balance_sequence=[0, 0],  # the balance lags: it confirms nothing
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=30.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(20.0)
+    assert r.resting_order_id is None  # the cancel was acknowledged
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(20.0)
+
+
+def test_settle_falls_back_to_the_balance_after_a_stale_in_loop_read(store) -> None:
+    """One successful in-loop read (0 matched) must not suppress the fallbacks:
+    every later read goes dark and every cancel is refused, so the CTF balance
+    is the only source left — and it says 10 filled."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[
+            {"size_matched": "0", "status": "LIVE"},
+            RuntimeError("order lookup failed"),
+        ],
+        ctf_balance_sequence=[0, 10_000_000],  # baseline 0; confirm sees 10 shares
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=10.0)
+    r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert r.price == pytest.approx(intent.price)
+    assert r.resting_order_id == "0x1"  # no cancel was ever acknowledged
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(10.0)
+
+
+def test_settle_exhausted_but_fresh_read_shows_a_full_fill_does_not_alert(store, caplog) -> None:
+    """The budget ran out with the order still LIVE, but the post-loop read
+    shows it fully matched: nothing rests, so no RESTING ORDER ALERT and no
+    resting id — the alert belongs after that read, not before it."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status=[{"size_matched": "0", "status": "LIVE"}] * _SETTLE_ATTEMPTS
+        + [{"size_matched": "10.0", "status": "MATCHED"}],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    intent = _intent(price=0.5, qty=10.0)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(intent, news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert r.resting_order_id is None
+    assert len(clob.cancelled) == _SETTLE_ATTEMPTS
+    assert "RESTING ORDER ALERT" not in caplog.text
+
+
+def test_settle_keeps_retrying_a_partially_matched_order(store) -> None:
+    """``MATCHED`` on a GET is reported for a partial match too: 12 of 30 with
+    the cancel refused is an order still resting, so the loop must retry instead
+    of walking away from the untouched 18."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused(), _cancelled()],
+        order_status={"size_matched": "12.0", "status": "MATCHED"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=30.0), news_id="n", ts=1.0)
+    assert clob.cancelled == ["0x1", "0x1"]  # the partial MATCHED did not end it
+    assert r.filled is True
+    assert r.qty == pytest.approx(12.0)
+    assert r.resting_order_id is None
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(12.0)
+
+
+def test_settle_alerts_when_a_partially_matched_order_cannot_be_cancelled(store, caplog) -> None:
+    """Same partial ``MATCHED``, but no cancel is ever acknowledged: the 18 that
+    never filled is still on the book, so the fill is persisted AND the order is
+    named as resting with the alert — not silently abandoned."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        order_response=_zero_fill_response("live"),
+        cancel_responses=[_refused()],
+        order_status={"size_matched": "12.0", "status": "MATCHED"},
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(price=0.5, qty=30.0), news_id="n", ts=1.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(12.0)
+    assert r.resting_order_id == "0x1"
+    assert len(clob.cancelled) == _SETTLE_ATTEMPTS
+    assert "RESTING ORDER ALERT" in caplog.text
+    held = store.get_open_position("m1", "yes")
+    assert held is not None and held.qty == pytest.approx(12.0)

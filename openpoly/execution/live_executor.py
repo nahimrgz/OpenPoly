@@ -1,8 +1,27 @@
-"""LiveExecutor — submit IOC (FAK) orders to Polymarket V2 CLOB.
+"""LiveExecutor — submit crossing GTC orders to Polymarket V2 CLOB and settle
+whatever did not fill immediately.
 
 Same ``ExecResult`` contract as ``PaperExecutor`` — failures map to
-``skip(reason)``, never raise. Order type is FAK (Fill And Kill = IOC); see
-slice C design doc §3 D2 / D3 for why no GTC fallback and no retry.
+``skip(reason)``, never raise. The order type is GTC at the level-1 price (see
+the note at the order call for why not FAK); the executor then treats every
+order the server answered as fill-or-cancel: unless the response reports the
+whole size filled, the order is cancelled and its final matched size re-read.
+
+POST /order answers with a ``status`` (order lifecycle docs): ``matched`` —
+filled immediately; ``live`` — resting on the book; ``delayed`` — marketable
+but held in the venue's matching-delay window (250 ms taker delay on
+crypto/finance markets, configured seconds on sports markets) and NOT
+cancellable while pending; ``unmatched`` — placed on the book after that window
+expired without a match. None of these means "not placed" (a rejection is
+``success: false``), so every one of them goes through the same settle step,
+which retries the cancel across the delay window. The cancel endpoints answer
+200 with ``{"canceled": [...], "not_canceled": {id: reason}}``: a refusal is a
+body, not an exception, and is read as one.
+
+A lost response (the ``except`` branch around the post) is the remaining
+window: the order id is never learned, so nothing can be cancelled by id and
+the CTF balance delta is the only signal. There is no retry of the order itself
+(slice C design doc §3 D2 / D3).
 
 Auth model is Polymarket V2 DepositWallet:
   * signer EOA = ``wallet.private_key_ref`` (resolved at factory time)
@@ -40,7 +59,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Protocol
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Protocol, TypeVar
 
 # Cloudflare patch MUST be applied before any other SDK import. The patch
 # module re-exports the SDK symbols we need so this single import covers
@@ -71,11 +92,51 @@ SIGTYPE_POLY_1271 = 3
 _CTF_DECIMALS = 6  # CTF / Polymarket shares are 1e6 base units
 _CTF_POLL_ATTEMPTS = 5  # SELL right after BUY can hit cache lag; ~5s total
 _CTF_POLL_SLEEP = 1.0
-# The on-chain SELL is irreversible; persisting the DB close must survive a
-# transient write failure (locked SQLite, brief error) or the position is left
-# phantom-open with its tokens already gone (root cause of stuck phantom-open positions).
-_CLOSE_PERSIST_ATTEMPTS = 5
-_CLOSE_PERSIST_SLEEP = 0.5
+# Settle loop: cancel what did not fill, re-reading the order whenever the venue
+# refuses (an order in its matching-delay window cannot be cancelled yet).
+# 16 × 0.5 s ≈ 8 s covers the 250 ms taker delay and typical seconds-long sports
+# windows; exhausting it surfaces as ``live_cancel_failed`` plus a RESTING ORDER
+# ALERT rather than as a silent miss. The attempt count alone does NOT bound the
+# loop in time — each attempt issues up to two requests whose only limit is the
+# SDK's httpx default — so a wall-clock deadline bounds it as well, and whichever
+# runs out first ends the loop.
+_SETTLE_ATTEMPTS = 16
+_SETTLE_SLEEP = 0.5
+_SETTLE_DEADLINE_S = 8.0
+# GET /data/order ``status`` values after which nothing can rest on the book.
+# ``MATCHED`` is NOT one of them: the venue reports it for a PARTIAL match too,
+# so believing it would abandon the unmatched remainder of a partially filled
+# order on the book. A match ends the settle only through the size comparison.
+_ORDER_DONE_STATUSES = frozenset({"CANCELED", "CANCELLED"})
+# An on-chain fill is irreversible; persisting it (open for BUY, close for SELL)
+# must survive a transient write failure (locked SQLite, brief error) or the
+# ledger drifts from the wallet: a phantom-open position whose tokens are gone,
+# or tokens no exit monitor manages.
+_PERSIST_ATTEMPTS = 5
+_PERSIST_SLEEP = 0.5
+# Budget, honestly: the settle loop ends at min(16 attempts, 8 s of wall clock),
+# and is followed by one final order read plus — only when that read fails — the
+# balance-confirm fallback (≈ 4 s of sleeps). With the CTF poll (≈ 4 s) and the
+# persist retries (≈ 2 s) that is ≈ 18 s of waiting worst case, which must stay
+# inside the exit monitor's 30 s in-flight drain (``runtime/exit_monitor.py``
+# INFLIGHT_DRAIN_TIMEOUT_SECONDS). What is NOT bounded here is a single request:
+# each one is limited only by the SDK's httpx default timeout, so the totals hold
+# only as long as that default does — an explicit client timeout is the gap.
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _Fill:
+    """What the venue actually did with one order: final matched size, the
+    price to book it at, the identifiers the ledger keeps, and whether part of
+    the order may still be resting (no cancel could be confirmed)."""
+
+    qty: float
+    price: float
+    tx_hash: str | None
+    order_id: str | None
+    resting: bool = False
 
 
 class _ClobClient(Protocol):
@@ -92,7 +153,8 @@ class _ClobClient(Protocol):
 
 
 class LiveExecutor:
-    """V2 CLOB IOC executor. Construct via ``build_live_executor``."""
+    """V2 CLOB executor — crossing GTC, anything short of a full fill cancelled
+    and re-read. Construct via ``build_live_executor``."""
 
     def __init__(
         self,
@@ -103,32 +165,319 @@ class LiveExecutor:
         self._store = portfolio
         self._clob = clob_client
 
-    def _settle_resting_remainder(
-        self, order_id: str | None, reported_qty: float, size: float
-    ) -> float:
-        """After a partial immediate fill, cancel the GTC remainder so it
-        cannot fill later untracked (a live orphan incident: a partial fill whose
-        resting remainder filled later invisibly). Returns the order's
-        final matched qty — ``get_order`` after the cancel covers a fill that
-        raced it; never less than what the response already reported."""
-        if reported_qty >= size - 1e-9 or not order_id:
-            return reported_qty  # full fill — nothing resting
+    def _post_order(self, order_args: OrderArgs, *, neg_risk: bool) -> dict[str, Any]:
+        """POST the order (GTC — see the note in ``execute_buy``) and return the
+        parsed answer. A 200 with a non-JSON body reaches here as raw text (the
+        SDK's http helper returns ``resp.text`` then): whether the order landed
+        is unknown, so it is raised and takes the lost-response path."""
+        resp = self._clob.create_and_post_order(
+            order_args=order_args,
+            options=PartialCreateOrderOptions(neg_risk=neg_risk),
+            order_type=OrderType.GTC,
+        )
+        if not isinstance(resp, dict):
+            raise TypeError(f"non-dict order response: {type(resp).__name__}")
+        return resp
+
+    def _read_order(self, order_id: str) -> tuple[float, str] | None:
+        """``GET /data/order``: (size matched so far, upper-cased status), or
+        None when the read fails — logged here, interpreted by the caller."""
         try:
-            self._clob.cancel_order(OrderPayload(orderID=order_id))
+            order = self._clob.get_order(order_id)
+            matched = float(order.get("size_matched") or 0)
+            status = str(order.get("status") or "").upper()
         except Exception as exc:  # noqa: BLE001
+            logger.warning("get_order for %s failed: %s", order_id, exc)
+            return None
+        return matched, status
+
+    def _cancel_with_retry(
+        self, order_id: str, size: float
+    ) -> tuple[str | None, float | None, bool]:
+        """Cancel ``order_id``, retrying across the venue's matching-delay window.
+
+        Returns ``(refusal, seen, settled)``. ``refusal`` is None once nothing
+        rests: the venue acknowledged the cancel, or the order itself reports it
+        fully matched / already cancelled. Otherwise it is the last refusal
+        reason after the loop ran out of attempts or of wall clock, whichever
+        came first (``_SETTLE_ATTEMPTS`` / ``_SETTLE_DEADLINE_S``).
+
+        ``seen`` is the LARGEST ``size_matched`` any successful read reported,
+        None when no read succeeded. It is a maximum and never a last-write-wins
+        value: a fill the venue already reported cannot be undone by a later
+        acknowledged cancel or contradicted by a lagging read, so dropping it
+        would persist less than the wallet actually holds.
+
+        ``settled`` says a read ENDED the loop by showing the order terminal
+        (fully matched, or a cancelled status): only then is ``seen`` the venue's
+        last word. Every other ending — acknowledged cancel, exhausted budget,
+        reads that never landed — leaves the caller one fresh read to do.
+        """
+        reason = "cancel never attempted"
+        seen: float | None = None
+        start = time.monotonic()
+        for attempt in range(_SETTLE_ATTEMPTS):
+            try:
+                res = self._clob.cancel_order(OrderPayload(orderID=order_id))
+            except Exception as exc:  # noqa: BLE001
+                res = {"not_canceled": {order_id: f"{type(exc).__name__}: {exc}"}}
+            if not isinstance(res, dict):
+                res = {"not_canceled": {order_id: f"unexpected response {type(res).__name__}"}}
+            if order_id in (res.get("canceled") or []):
+                return None, seen, False
+            reason = str((res.get("not_canceled") or {}).get(order_id, "refused without a reason"))
+            state = self._read_order(order_id)
+            if state is not None:
+                matched, status = state
+                seen = matched if seen is None else max(seen, matched)
+                # The size comparison — not a ``MATCHED`` status, which the
+                # venue also reports on a partial — is what proves nothing rests.
+                if seen >= size - 1e-9 or status in _ORDER_DONE_STATUSES:
+                    return None, seen, True
+            logger.info(
+                "cancel attempt %d/%d for %s refused (%s)",
+                attempt + 1,
+                _SETTLE_ATTEMPTS,
+                order_id,
+                reason,
+            )
+            # Whichever budget runs out first ends the loop: slow round-trips
+            # must not stretch one settle past the exit monitor's drain window.
+            remaining = _SETTLE_DEADLINE_S - (time.monotonic() - start)
+            if remaining <= 0 or attempt >= _SETTLE_ATTEMPTS - 1:
+                break
+            time.sleep(min(_SETTLE_SLEEP, remaining))
+        return reason, seen, False
+
+    def _settle_resting_remainder(
+        self,
+        order_id: str | None,
+        reported_qty: float,
+        size: float,
+        *,
+        confirm: Callable[[], float],
+    ) -> tuple[float, str | None]:
+        """Cancel whatever of this order is still resting and return
+        ``(final_matched_qty, failure)``.
+
+        ``reported_qty`` is the immediate fill from the POST response; a full
+        fill returns at once. ``confirm`` is the CTF balance-delta fallback for
+        when the order cannot be re-read. ``failure`` is None, or one of the
+        skip reasons: ``"live_cancel_failed"`` — something may still rest (no
+        order id, or every cancel refused / raised and no later read showed the
+        order terminal), logged as a RESTING ORDER ALERT; ``"live_fill_unknown"``
+        — nothing filled as far as could be told, but neither the order read nor
+        the balance could establish it. The returned qty is the LARGEST fill any
+        source reported and is never less than ``reported_qty``.
+        """
+        if reported_qty >= size - 1e-9:
+            return reported_qty, None  # full fill — nothing resting, no round-trip
+        if not order_id:
             logger.error(
-                "RESTING ORDER ALERT: cancel failed for %s (%s) — remainder "
-                "may fill untracked; reverse-reconciliation will flag it",
+                "RESTING ORDER ALERT: %.4f of %.4f filled but the response carried no "
+                "order id — nothing to cancel by; reverse-reconciliation will flag it",
+                reported_qty,
+                size,
+            )
+            return reported_qty, "live_cancel_failed"
+
+        failure: str | None = None
+        reason, seen, settled = self._cancel_with_retry(order_id, size)
+        final = seen or 0.0
+        if not settled:
+            # No read ended the loop, so the venue's last word is still unread —
+            # an acknowledged cancel, an exhausted budget and reads that never
+            # landed are alike here. This read is the only place a fill that
+            # raced the cancel, or one a stale in-loop read missed, is visible,
+            # and the only thing that can show the order is no longer resting.
+            state = self._read_order(order_id)
+            if state is not None:
+                fresh, status = state
+                final = max(final, fresh)
+                if final >= size - 1e-9 or status in _ORDER_DONE_STATUSES:
+                    reason = None  # the order is terminal — nothing rests after all
+            else:
+                logger.error(
+                    "order %s could not be re-read after settle — confirming the fill "
+                    "through the CTF balance instead",
+                    order_id,
+                )
+                try:
+                    confirmed = min(confirm(), size)
+                except Exception as cexc:  # noqa: BLE001
+                    logger.error("balance confirmation for %s failed too: %s", order_id, cexc)
+                    confirmed = 0.0
+                if confirmed > 0:
+                    logger.error(
+                        "fill for %s established through the CTF balance: %.4f",
+                        order_id,
+                        confirmed,
+                    )
+                elif reported_qty <= 0 and seen is None:
+                    # No source could establish a fill. Not "no match":
+                    # the caller must not treat this as a clean miss.
+                    failure = "live_fill_unknown"
+                final = max(final, confirmed)
+        if reason is not None:
+            logger.error(
+                "RESTING ORDER ALERT: could not cancel %s within %d attempts / %.1fs "
+                "(last: %s) — remainder may fill untracked; reverse-reconciliation "
+                "will flag it",
+                order_id,
+                _SETTLE_ATTEMPTS,
+                _SETTLE_DEADLINE_S,
+                reason,
+            )
+            failure = "live_cancel_failed"
+        return max(final, reported_qty), failure
+
+    def _resolve_fill(
+        self,
+        resp: dict[str, Any],
+        *,
+        side: str,
+        size: float,
+        limit_price: float,
+        confirm: Callable[[], float],
+    ) -> _Fill | ExecResult:
+        """Turn a successful POST /order response into what actually filled, or
+        into the ``ExecResult.skip`` to return. The settle step runs whenever the
+        reported fill is short of ``size``, garbage amounts included — the order
+        id is read first so a bad number can never skip the cancel."""
+        # ``makingAmount`` is what our order gives, ``takingAmount`` what it
+        # receives: a BUY receives shares (and gives pUSD), a SELL the reverse.
+        shares_key, usdc_key = (
+            ("takingAmount", "makingAmount") if side == "buy" else ("makingAmount", "takingAmount")
+        )
+        order_id = resp.get("orderID") or None
+        no_fill_reason = "live_no_match"
+        try:
+            shares = float(resp.get(shares_key) or 0)
+            usdc = float(resp.get(usdc_key) or 0)
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "%s response amounts unparseable for order %s (%s) — treating as "
+                "unfilled and settling",
+                side,
                 order_id,
                 exc,
             )
-            return reported_qty
+            shares = usdc = 0.0
+            no_fill_reason = "live_unparseable"
+        qty, failure = self._settle_resting_remainder(order_id, shares, size, confirm=confirm)
+        resting_id = order_id if failure == "live_cancel_failed" else None
+        if qty <= 0:
+            return ExecResult.skip(failure or no_fill_reason, resting_order_id=resting_id)
+        if shares > 0 and usdc > 0:
+            # The raced-extra portion (if any) filled at our limit price, so
+            # pricing it at the response average is conservative-enough (≤1 tick).
+            price = usdc / shares
+        else:
+            # No usable amounts for this fill (nothing had crossed at response
+            # time, or a field is missing): the real price is unknown. Record
+            # at our limit — BUY cost can only be ≤ it, SELL proceeds ≥ it.
+            logger.warning(
+                "%s: %.4f filled but the response carried no usable amounts — "
+                "recording fill at limit price %.4f (order=%s)",
+                side,
+                qty,
+                limit_price,
+                order_id,
+            )
+            price = limit_price
+        return _Fill(
+            qty=qty,
+            price=price,
+            tx_hash=(resp.get("transactionsHashes") or [None])[0],
+            order_id=order_id,
+            resting=resting_id is not None,
+        )
+
+    def _fill_from_balance(
+        self, confirm: Callable[[], float], *, size: float, limit_price: float
+    ) -> _Fill | None:
+        """The fill as the CTF balance tells it, for when the venue's own account
+        of the order is unavailable (lost response): the balance delta clamped
+        to ``size``, booked at our limit — BUY cost can only be ≤ it, SELL
+        proceeds ≥ it — with no order id or tx hash to keep. None when nothing
+        moved."""
+        qty = min(confirm(), size)
+        if qty <= 0:
+            return None
+        return _Fill(qty=qty, price=limit_price, tx_hash=None, order_id=None)
+
+    def _persist_irreversible(self, write: Callable[[], _T], *, what: str) -> _T:
+        """Run a ledger write for a fill that already happened on-chain, retrying
+        transient failures; re-raises after the last attempt so the caller can
+        log the loss with its own context."""
+        for attempt in range(_PERSIST_ATTEMPTS - 1):
+            try:
+                return write()
+            except Exception as exc:  # noqa: BLE001 — on-chain fill already happened
+                logger.warning("%s attempt %d failed: %s; retrying", what, attempt + 1, exc)
+                time.sleep(_PERSIST_SLEEP)
+        return write()
+
+    def _persist_open(
+        self,
+        intent: OrderIntent,
+        fill: _Fill,
+        *,
+        token_id: str,
+        condition_id: str,
+        ts: float,
+        news_id: str | None,
+    ) -> ExecResult:
+        """Persist an already-executed on-chain buy (``_persist_irreversible``);
+        on final failure log CRITICAL and skip — never raise."""
         try:
-            final = float(self._clob.get_order(order_id).get("size_matched") or 0)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("get_order after cancel failed for %s: %s", order_id, exc)
-            return reported_qty
-        return max(final, reported_qty)
+            held = self._persist_irreversible(
+                lambda: self._store.open_position(
+                    market_id=intent.market_id,
+                    side=intent.side,
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    price=fill.price,
+                    qty=fill.qty,
+                    ts=ts,
+                    news_id=news_id,
+                    order_id=fill.order_id,
+                    tx_hash=fill.tx_hash,
+                    entry_p_model=intent.p_model,
+                    entry_confidence=intent.confidence,
+                    entry_edge=intent.edge,
+                ),
+                what=f"open_position {intent.market_id} {intent.side}",
+            )
+        except Exception as exc:  # noqa: BLE001 — on-chain fill already happened
+            logger.error(
+                "CRITICAL: on-chain buy filled (order=%s qty=%.4f @ %.4f) but "
+                "open_position failed after %d attempts for %s %s: %s — the wallet "
+                "holds tokens no ledger row manages; reconciliation will flag them",
+                fill.order_id,
+                fill.qty,
+                fill.price,
+                _PERSIST_ATTEMPTS,
+                intent.market_id,
+                intent.side,
+                exc,
+            )
+            return ExecResult.skip(f"open_persist_failed:{type(exc).__name__}")
+        logger.info(
+            "live buy filled: %s %s qty=%.4f @ %.4f order=%s tx=%s",
+            intent.market_id,
+            intent.side,
+            fill.qty,
+            fill.price,
+            fill.order_id,
+            (fill.tx_hash[:10] + "…" if fill.tx_hash else None),
+        )
+        return ExecResult.ok(
+            price=fill.price,
+            qty=fill.qty,
+            position_id=held.position_id,
+            resting_order_id=fill.order_id if fill.resting else None,
+        )
 
     def get_collateral_balance_raw(self) -> int | None:
         """Wallet USDC (collateral) balance in raw 1e6 units — None when the
@@ -235,102 +584,55 @@ class LiveExecutor:
             )
             return ExecResult.skip("ctf_balance_unavailable")
 
-        # GTC + crossing the spread acts like an aggressive market order. We
-        # use GTC (not FAK) because a prior project's production verified it end-to-end
-        # on 2026-05-05 / smoke verified again 2026-05-24; FAK hits stricter
-        # server precision rules we haven't fully mapped.
+        # GTC + crossing the spread acts like an aggressive market order, and
+        # the settle step cancels whatever did not fill. GTC (not FAK)
+        # because a prior project's production verified it end-to-end on
+        # 2026-05-05 / smoke verified again 2026-05-24, while FAK failed then
+        # for a reason never diagnosed. sizing.py's two-decimal floor does not
+        # address that (the SDK builder applies the same floor to every order
+        # type), so FAK is not a known-safe swap: switching requires a live
+        # smoke. Do not change without one.
+        def confirm() -> float:
+            # The balance delta against the baseline read above — the only
+            # signal when the venue's account of the order is unavailable.
+            return self._confirm_lost_order_qty(token_id, pre_raw, "rise")
+
+        fill: _Fill | ExecResult | None
         try:
-            resp = self._clob.create_and_post_order(
-                order_args=OrderArgs(
-                    token_id=token_id,
-                    price=intent.price,
-                    size=size,
-                    side=Side.BUY,
-                ),
-                options=PartialCreateOrderOptions(neg_risk=market.neg_risk),
-                order_type=OrderType.GTC,
+            resp = self._post_order(
+                OrderArgs(token_id=token_id, price=intent.price, size=size, side=Side.BUY),
+                neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
             # The order may have filled despite the lost response — confirm via
             # the balance before declaring failure (R5 at-least-once).
-            got = self._confirm_lost_order_qty(token_id, pre_raw, "rise")
-            if got > 0:
-                actual_qty = min(got, size)
-                # Response (and with it the real fill price) is lost; record at
-                # our limit — actual cost can only be ≤ limit, so conservative.
-                logger.warning(
-                    "buy response lost (%s) but CTF balance rose %.4f — "
-                    "recording fill at limit price %.4f",
-                    type(exc).__name__,
-                    actual_qty,
-                    intent.price,
-                )
-                held = self._store.open_position(
-                    market_id=intent.market_id,
-                    side=intent.side,
-                    token_id=token_id,
-                    condition_id=market.condition_id,
-                    price=intent.price,
-                    qty=actual_qty,
-                    ts=ts,
-                    news_id=news_id,
-                    order_id=None,
-                    tx_hash=None,
-                    entry_p_model=intent.p_model,
-                    entry_confidence=intent.confidence,
-                    entry_edge=intent.edge,
-                )
-                return ExecResult.ok(
-                    price=intent.price,
-                    qty=actual_qty,
-                    position_id=held.position_id,
-                )
-            logger.error("live buy submit failed (%s): %s", type(exc).__name__, exc)
-            return ExecResult.skip(f"live_error:{type(exc).__name__}")
-
-        if not resp.get("success"):
-            return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
-        try:
-            making = float(resp.get("makingAmount") or 0)  # pUSD paid
-            taking = float(resp.get("takingAmount") or 0)  # tokens received
-        except (TypeError, ValueError):
-            return ExecResult.skip("live_unparseable")
-        if taking <= 0:
-            return ExecResult.skip("live_no_match")
-        order_id = resp.get("orderID")
-        # Partial fill → cancel the resting remainder + take the final matched
-        # qty. The raced-extra portion (if any) filled at our limit price, so
-        # pricing it at the response average is conservative-enough (≤1 tick).
-        actual_qty = self._settle_resting_remainder(order_id, taking, size)
-        actual_price = making / taking
-        tx_hashes = resp.get("transactionsHashes") or []
-        tx_hash = tx_hashes[0] if tx_hashes else None
-
-        held = self._store.open_position(
-            market_id=intent.market_id,
-            side=intent.side,
+            fill = self._fill_from_balance(confirm, size=size, limit_price=intent.price)
+            if fill is None:
+                logger.error("live buy submit failed (%s): %s", type(exc).__name__, exc)
+                return ExecResult.skip(f"live_error:{type(exc).__name__}")
+            logger.warning(
+                "buy response lost (%s) but CTF balance rose %.4f — "
+                "recording fill at limit price %.4f",
+                type(exc).__name__,
+                fill.qty,
+                fill.price,
+            )
+        else:
+            if not resp.get("success"):
+                return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
+            fill = self._resolve_fill(
+                resp, side="buy", size=size, limit_price=intent.price, confirm=confirm
+            )
+            if isinstance(fill, ExecResult):
+                return fill
+        return self._persist_open(
+            intent,
+            fill,
             token_id=token_id,
             condition_id=market.condition_id,
-            price=actual_price,
-            qty=actual_qty,
             ts=ts,
             news_id=news_id,
-            order_id=order_id,
-            tx_hash=tx_hash,
-            entry_p_model=intent.p_model,
-            entry_confidence=intent.confidence,
-            entry_edge=intent.edge,
         )
-        logger.info(
-            "live buy filled: %s %s qty=%.4f @ %.4f order=%s tx=%s",
-            intent.market_id,
-            intent.side,
-            actual_qty,
-            actual_price,
-            order_id,
-            (tx_hash[:10] + "…" if tx_hash else None),
-        )
-        return ExecResult.ok(price=actual_price, qty=actual_qty, position_id=held.position_id)
 
     def execute_sell(
         self,
@@ -376,132 +678,94 @@ class LiveExecutor:
         if not synced:
             return ExecResult.skip("ctf_cache_not_synced")
 
+        def confirm() -> float:
+            return self._confirm_lost_order_qty(position.token_id, pre_raw, "drop")
+
+        fill: _Fill | ExecResult | None
         try:
-            resp = self._clob.create_and_post_order(
-                order_args=OrderArgs(
-                    token_id=position.token_id,
-                    price=bid_price,
-                    size=size,
-                    side=Side.SELL,
-                ),
-                options=PartialCreateOrderOptions(neg_risk=market.neg_risk),
-                order_type=OrderType.GTC,
+            resp = self._post_order(
+                OrderArgs(token_id=position.token_id, price=bid_price, size=size, side=Side.SELL),
+                neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
             # The order may have filled despite the lost response — confirm via
             # the balance before declaring failure (R5 at-least-once).
-            sold = self._confirm_lost_order_qty(position.token_id, pre_raw, "drop")
-            if sold > 0:
-                # Response (and with it the real fill price) is lost; record at
-                # our limit (bid) — actual proceeds can only be ≥ bid, so
-                # conservative.
-                logger.warning(
-                    "sell response lost (%s) but CTF balance dropped %.4f — "
-                    "recording fill at limit price %.4f",
-                    type(exc).__name__,
-                    sold,
-                    bid_price,
-                )
-                return self._persist_sell(
-                    position,
-                    actual_price=bid_price,
-                    actual_qty=min(sold, size),
-                    ts=ts,
-                    close_reason=close_reason,
-                    trigger=trigger,
-                    order_id=None,
-                    tx_hash=None,
-                )
-            logger.error("live sell submit failed (%s): %s", type(exc).__name__, exc)
-            return ExecResult.skip(f"live_error:{type(exc).__name__}")
-
-        if not resp.get("success"):
-            return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
-        try:
-            making = float(resp.get("makingAmount") or 0)  # tokens sent
-            taking = float(resp.get("takingAmount") or 0)  # pUSD received
-        except (TypeError, ValueError):
-            return ExecResult.skip("live_unparseable")
-        if making <= 0:
-            return ExecResult.skip("live_no_match")
-        sell_order_id = resp.get("orderID")
-        # Same resting hygiene as BUY: an unsold remainder must not sit on the
-        # book filling invisibly (record_sell keeps the position open with the
-        # truly-unsold qty instead).
-        sold_qty = self._settle_resting_remainder(sell_order_id, making, size)
-        return self._persist_sell(
-            position,
-            actual_price=taking / making,
-            actual_qty=sold_qty,
-            ts=ts,
-            close_reason=close_reason,
-            trigger=trigger,
-            order_id=sell_order_id,
-            tx_hash=(resp.get("transactionsHashes") or [None])[0],
-        )
+            fill = self._fill_from_balance(confirm, size=size, limit_price=bid_price)
+            if fill is None:
+                logger.error("live sell submit failed (%s): %s", type(exc).__name__, exc)
+                return ExecResult.skip(f"live_error:{type(exc).__name__}")
+            logger.warning(
+                "sell response lost (%s) but CTF balance dropped %.4f — "
+                "recording fill at limit price %.4f",
+                type(exc).__name__,
+                fill.qty,
+                fill.price,
+            )
+        else:
+            if not resp.get("success"):
+                return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
+            fill = self._resolve_fill(
+                resp, side="sell", size=size, limit_price=bid_price, confirm=confirm
+            )
+            if isinstance(fill, ExecResult):
+                return fill
+        return self._persist_sell(position, fill, ts=ts, close_reason=close_reason, trigger=trigger)
 
     def _persist_sell(
         self,
         position: HeldPosition,
+        fill: _Fill,
         *,
-        actual_price: float,
-        actual_qty: float,
         ts: float,
         close_reason: CloseReason,
         trigger: str | None,
-        order_id: str | None,
-        tx_hash: str | None,
     ) -> ExecResult:
-        """Persist an already-executed on-chain sell. The fill is irreversible,
-        so the DB write retries transient failures — dropping it would leave a
-        phantom-open position for the reconciliation monitor to clean up.
+        """Persist an already-executed on-chain sell (``_persist_irreversible``).
         Records the ACTUAL filled qty: a GTC sell can partially fill, and
-        record_sell keeps the position open with the remainder in that case."""
-        for attempt in range(_CLOSE_PERSIST_ATTEMPTS):
-            try:
-                self._store.record_sell(
+        record_sell keeps the position open with the remainder in that case.
+        On final failure log CRITICAL and skip — never raise."""
+        try:
+            self._persist_irreversible(
+                lambda: self._store.record_sell(
                     position.position_id,
-                    sold_qty=actual_qty,
-                    sell_price=actual_price,
+                    sold_qty=fill.qty,
+                    sell_price=fill.price,
                     ts=ts,
                     close_reason=close_reason,
                     trigger=trigger,
-                    order_id=order_id,
-                    tx_hash=tx_hash,
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 — on-chain fill already happened
-                if attempt < _CLOSE_PERSIST_ATTEMPTS - 1:
-                    logger.warning(
-                        "close_position attempt %d failed for position %d: %s; retrying",
-                        attempt + 1,
-                        position.position_id,
-                        exc,
-                    )
-                    time.sleep(_CLOSE_PERSIST_SLEEP)
-                    continue
-                logger.error(
-                    "CRITICAL: on-chain sell filled (order=%s tx=%s) but close_position "
-                    "failed after %d attempts for position %d: %s — tokens are gone; "
-                    "leaving open for reconciliation",
-                    order_id,
-                    tx_hash,
-                    _CLOSE_PERSIST_ATTEMPTS,
-                    position.position_id,
-                    exc,
-                )
-                return ExecResult.skip(f"close_persist_failed:{type(exc).__name__}")
+                    order_id=fill.order_id,
+                    tx_hash=fill.tx_hash,
+                ),
+                what=f"close_position {position.position_id}",
+            )
+        except Exception as exc:  # noqa: BLE001 — on-chain fill already happened
+            logger.error(
+                "CRITICAL: on-chain sell filled (order=%s tx=%s) but close_position "
+                "failed after %d attempts for position %d: %s — tokens are gone; "
+                "leaving open for reconciliation",
+                fill.order_id,
+                fill.tx_hash,
+                _PERSIST_ATTEMPTS,
+                position.position_id,
+                exc,
+            )
+            return ExecResult.skip(f"close_persist_failed:{type(exc).__name__}")
         logger.info(
             "live sell filled: %s %s qty=%.4f @ %.4f (position %d, %s) order=%s",
             position.market_id,
             position.side,
-            actual_qty,
-            actual_price,
+            fill.qty,
+            fill.price,
             position.position_id,
             close_reason,
-            order_id,
+            fill.order_id,
         )
-        return ExecResult.ok(price=actual_price, qty=actual_qty, position_id=position.position_id)
+        return ExecResult.ok(
+            price=fill.price,
+            qty=fill.qty,
+            position_id=position.position_id,
+            resting_order_id=fill.order_id if fill.resting else None,
+        )
 
 
 # ---------- factory ----------
