@@ -3,10 +3,14 @@ executors share, plus the paper/live parity it is meant to guarantee."""
 
 from __future__ import annotations
 
+import time
+import types
+
 import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.execution import PaperExecutor
+from openpoly.execution import live_executor as le_mod
 from openpoly.execution.live_executor import LiveExecutor
 from openpoly.execution.sizing import (
     MAX_TOKEN_PRICE,
@@ -103,6 +107,22 @@ def _isolate_market_store():
     market_source_manager.store = saved
 
 
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch) -> None:
+    """Rebind ``live_executor``'s own ``time`` name to a fake namespace so any
+    retry loop a test drives through ``LiveExecutor`` (settle retries, CTF
+    polls, persist retries) never sleeps for real.
+
+    Rebinding the module-level name, rather than patching attributes on the
+    real ``time`` module object, keeps this scoped to ``live_executor.py``:
+    ``sys.modules["time"]`` — the one real module every other piece of code in
+    the process sees — is left untouched. See ``tests/test_live_executor.py``'s
+    identically-shaped ``no_sleep`` fixture for the full rationale.
+    """
+    fake_time = types.SimpleNamespace(sleep=lambda *_a, **_k: None, monotonic=time.monotonic)
+    monkeypatch.setattr(le_mod, "time", fake_time)
+
+
 @pytest.fixture
 def store(tmp_path):
     engine = make_engine(f"sqlite:///{tmp_path}/p.db")
@@ -144,7 +164,7 @@ class _NoopClob:
         return {"balance": str(self._ctf_balance_raw), "allowances": {}}
 
     def cancel_order(self, payload):
-        return None
+        return {"canceled": [payload.orderID], "not_canceled": {}}
 
     def get_order(self, order_id):
         return {"size_matched": "0"}

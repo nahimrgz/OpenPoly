@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import itertools
 import math
+import time
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -230,11 +232,25 @@ def _settle_waits(no_sleep: list[float]) -> list[float]:
 def no_sleep(monkeypatch) -> list[float]:
     """Patch the executor's ``time.sleep`` (settle retries, CTF polls, persist
     retries) for every test and record the requested delays; tests that assert
-    on the delays request it by name."""
+    on the delays request it by name.
+
+    This rebinds the module-level ``time`` name inside ``live_executor.py``'s
+    own namespace to a fake, rather than mutating attributes on the real
+    ``time`` module object (``le_mod.time is time`` — modules are singletons
+    in ``sys.modules``, so patching attributes on it would be process-wide,
+    not scoped to this test). ``monotonic`` defaults to the real
+    ``time.monotonic`` so a test that only cares about not sleeping still gets
+    real elapsed-time behaviour; ``test_settle_stops_at_the_wall_clock_deadline``
+    overrides it with a fake clock on top of this fake namespace.
+    """
     import openpoly.execution.live_executor as le_mod
 
     calls: list[float] = []
-    monkeypatch.setattr(le_mod.time, "sleep", lambda secs=0.0, *_a, **_k: calls.append(secs))
+    fake_time = types.SimpleNamespace(
+        sleep=lambda secs=0.0, *_a, **_k: calls.append(secs),
+        monotonic=time.monotonic,
+    )
+    monkeypatch.setattr(le_mod, "time", fake_time)
     return calls
 
 
