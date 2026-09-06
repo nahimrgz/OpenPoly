@@ -9,9 +9,12 @@ from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.execution import PaperExecutor
 from openpoly.execution.live_executor import LiveExecutor
 from openpoly.execution.sizing import (
+    MAX_TOKEN_PRICE,
     MIN_NOTIONAL_USD,
     MIN_SELL_SHARES,
+    MIN_TOKEN_PRICE,
     SIZE_DECIMALS,
+    in_price_band,
     is_dust_qty,
     quantize_size,
 )
@@ -64,6 +67,29 @@ def test_portfolio_sellable_minimum_tracks_the_venue_size_precision() -> None:
     """``MIN_SELLABLE_QTY`` is duplicated in the portfolio layer (which must
     not import execution); this pins the two definitions together."""
     assert MIN_SELLABLE_QTY == pytest.approx(10**-SIZE_DECIMALS)
+
+
+# ---------- in_price_band ----------
+
+
+def test_in_price_band_true_at_the_exact_edges() -> None:
+    """0.0001 and 0.9999 are the finest tick's own edges — venue-legal."""
+    assert MIN_TOKEN_PRICE == pytest.approx(0.0001)
+    assert MAX_TOKEN_PRICE == pytest.approx(0.9999)
+    assert in_price_band(MIN_TOKEN_PRICE) is True
+    assert in_price_band(MAX_TOKEN_PRICE) is True
+
+
+def test_in_price_band_false_just_outside_the_edges() -> None:
+    """0.00005 and 0.99995 are legal book prices in (0, 1) but the SDK's own
+    order builder would refuse them — the tighter venue band must reject
+    both."""
+    assert in_price_band(0.00005) is False
+    assert in_price_band(0.99995) is False
+
+
+def test_in_price_band_false_for_none() -> None:
+    assert in_price_band(None) is False
 
 
 # ---------- paper / live parity ----------

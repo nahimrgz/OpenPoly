@@ -62,7 +62,7 @@ import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeGuard, TypeVar
+from typing import Any, Protocol, TypeVar
 
 # Cloudflare patch MUST be applied before any other SDK import. The patch
 # module re-exports the SDK symbols we need so this single import covers
@@ -81,6 +81,7 @@ from openpoly.execution.sizing import (
     MIN_NOTIONAL_USD,
     MIN_TOKEN_PRICE,
     dust_remainder_skip,
+    in_price_band,
     quantize_size,
 )
 from openpoly.execution.types import ExecResult
@@ -173,12 +174,6 @@ _PERSIST_SLEEP = 0.5
 _T = TypeVar("_T")
 
 
-def _in_price_band(price: float | None) -> TypeGuard[float]:
-    """A price the venue could have produced: inside the band, which no
-    non-finite value can be."""
-    return price is not None and MIN_TOKEN_PRICE <= price <= MAX_TOKEN_PRICE
-
-
 def _bookable_price(
     price: float | None, *, fallback: float, side: str, order_id: str | None
 ) -> float:
@@ -205,11 +200,11 @@ def _bookable_price(
     A non-finite value is out of band by the same comparison, so it never
     survives to become a basis.
     """
-    if _in_price_band(price):
+    if in_price_band(price):
         return price
     if price is not None:
         logger.error(
-            "%s: %r is not a price the venue could produce (outside [%.4f, %.1f]) — "
+            "%s: %r is not a price the venue could produce (outside [%.4f, %.4f]) — "
             "recording the limit %.4f instead (order=%s)",
             side,
             price,
@@ -218,7 +213,7 @@ def _bookable_price(
             fallback,
             order_id,
         )
-    if _in_price_band(fallback):
+    if in_price_band(fallback):
         return fallback
     worst = MAX_TOKEN_PRICE if side == "buy" else MIN_TOKEN_PRICE
     logger.error(
@@ -1047,10 +1042,10 @@ class LiveExecutor:
         # Same rule as the SELL below: the order is signed at this price, which
         # the entry section read off the book's asks and guards only against a
         # non-positive one.
-        if not _in_price_band(intent.price):
+        if not in_price_band(intent.price):
             logger.error(
                 "buy aborted for %s %s: %r is not a price the venue could produce "
-                "(outside [%.4f, %.1f]) — refusing to sign against a wrong-scale book",
+                "(outside [%.4f, %.4f]) — refusing to sign against a wrong-scale book",
                 intent.market_id,
                 intent.side,
                 intent.price,
@@ -1165,10 +1160,10 @@ class LiveExecutor:
         # The order is SIGNED at this price. Refusing afterwards only declines to
         # RECORD a price we already traded at, so a book the venue could not have
         # produced stops the trade here — nothing upstream validates its levels.
-        if not _in_price_band(bid_price):
+        if not in_price_band(bid_price):
             logger.error(
                 "sell aborted for position %d: the book's best bid %r is not a price "
-                "the venue could produce (outside [%.4f, %.1f]) — refusing to sign "
+                "the venue could produce (outside [%.4f, %.4f]) — refusing to sign "
                 "against a wrong-scale book",
                 position.position_id,
                 bid_price,

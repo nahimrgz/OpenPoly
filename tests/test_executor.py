@@ -128,6 +128,17 @@ def test_buy_no_ask_liquidity_skip(store) -> None:
     assert r.skip_reason == "no_ask_liquidity"
 
 
+def test_buy_out_of_band_ask_skip(store) -> None:
+    """A book level of 0.00005 is legal in (0, 1) but outside the venue's
+    tighter tick band — paper must skip it exactly as live would refuse it,
+    never open a position at a price the venue could not have produced."""
+    _populate(_market(), _book("yes-m1", ask=0.00005))
+    r = Executor(store).execute_buy(_intent(qty=20.0), news_id="n1", ts=1.0)
+    assert not r.filled
+    assert r.skip_reason == "price_out_of_band"
+    assert store.get_open_position("m1", "yes") is None
+
+
 def test_buy_no_token_skip(store) -> None:
     # Market carries only the YES token; side=no has no token.
     _populate(_market(clob='["yes-m1"]'), _book("yes-m1", ask=0.42))
@@ -158,6 +169,23 @@ def test_sell_fills_at_level1_bid(store) -> None:
     assert r.filled
     assert r.price == 0.40  # level-1 bid
     assert store.get_open_position("m1", "yes") is None  # now closed
+
+
+def test_sell_out_of_band_bid_skip(store) -> None:
+    """Twin of the buy-side check: a bid of 0.99995 is legal in (0, 1) but
+    outside the venue's tighter tick band — paper must skip and leave the
+    position open, never book a sell at a price the venue could not have
+    produced."""
+    _populate(_market(), _book("yes-m1", bid=0.40, ask=0.42))
+    ex = Executor(store)
+    ex.execute_buy(_intent(qty=20.0), news_id="n1", ts=1.0)
+    held = store.get_open_position("m1", "yes")
+    assert held is not None
+    market_source_manager.store.set_order_books([_book("yes-m1", bid=0.99995, ask=1.0)])
+    r = ex.execute_sell(held, close_reason="take_profit", ts=200.0)
+    assert not r.filled
+    assert r.skip_reason == "price_out_of_band"
+    assert store.get_open_position("m1", "yes") is not None
 
 
 def test_sell_no_order_book_skip(store) -> None:
