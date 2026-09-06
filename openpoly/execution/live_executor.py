@@ -58,8 +58,9 @@ Revisit if the SDK ever gains a client-supplied order id.
 from __future__ import annotations
 
 import logging
+import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
@@ -82,6 +83,45 @@ from openpoly.portfolio import CloseReason, HeldPosition, PortfolioStore
 from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_amount(raw: Any) -> float | None:
+    """One amount field from an order response. Absent or empty is a clean 0.0;
+    anything unparseable is None — unknown, never a silent zero, so the caller
+    can keep the fields that did parse and say which did not.
+
+    ``NaN`` and the infinities parse without raising, so ``float()`` alone is
+    not the validation this claims to be: a non-finite amount makes every
+    comparison downstream False (neither over-size nor a miss) and divides into
+    an infinite price. They are unusable values, so they are None like the rest.
+    """
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _parse_order_id(raw: Any) -> str | None:
+    """The ``orderID`` of an order response, as a string we can put in a cancel
+    payload, or None. The venue documents a string; a whole number is kept too,
+    because an id we can still send is worth a cancel attempt and dropping one
+    leaves the order on the book with nothing to cancel it by.
+
+    Everything else is None, and each for its own reason: a container or an
+    empty value is not an id at all; a bool is an int in Python and ``str()``
+    would turn it into nonsense; a float is a *different* id once stringified
+    (``12345.0``, not ``12345``), and cancelling the wrong id is worse than
+    reporting this one as unreachable.
+    """
+    if isinstance(raw, str):
+        return raw or None
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw:
+        return str(raw)
+    return None
+
 
 CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
@@ -139,6 +179,34 @@ class _Fill:
     resting: bool = False
 
 
+@dataclass(frozen=True)
+class _OrderResponse:
+    """The POST /order body, parsed once and validated by construction, so no
+    field of it can reach the ledger — or an exception — in a shape the venue
+    never documented. ``shares`` / ``usdc`` are None when unparseable (see
+    ``_parse_amount``); ``tx_hash`` is None unless it is the string it is
+    supposed to be, and ``order_id`` None unless it is an id we could still
+    send (see ``_parse_order_id``)."""
+
+    order_id: str | None
+    shares: float | None
+    usdc: float | None
+    tx_hash: str | None
+
+    @classmethod
+    def parse(cls, resp: dict[str, Any], *, shares_key: str, usdc_key: str) -> _OrderResponse:
+        hashes = resp.get("transactionsHashes")
+        # A bare string is indexable, so ``[0]`` on one would store its first
+        # character as the transaction hash.
+        first = hashes[0] if isinstance(hashes, (list, tuple)) and hashes else None
+        return cls(
+            order_id=_parse_order_id(resp.get("orderID")),
+            shares=_parse_amount(resp.get(shares_key)),
+            usdc=_parse_amount(resp.get(usdc_key)),
+            tx_hash=first if isinstance(first, str) and first else None,
+        )
+
+
 class _ClobClient(Protocol):
     def create_and_post_order(
         self,
@@ -181,13 +249,27 @@ class LiveExecutor:
 
     def _read_order(self, order_id: str) -> tuple[float, str] | None:
         """``GET /data/order``: (size matched so far, upper-cased status), or
-        None when the read fails — logged here, interpreted by the caller."""
+        None when the read fails — logged here, interpreted by the caller.
+
+        A ``size_matched`` that will not parse is a failed read, not a fill of
+        zero: this is the source the settle trusts once an over-size POST amount
+        is discarded, and a non-finite value cannot even be clamped
+        (``min(nan, size)`` is ``nan``), so it would reach the ledger unbounded.
+        """
         try:
             order = self._clob.get_order(order_id)
-            matched = float(order.get("size_matched") or 0)
+            matched = _parse_amount(order.get("size_matched"))
             status = str(order.get("status") or "").upper()
         except Exception as exc:  # noqa: BLE001
             logger.warning("get_order for %s failed: %s", order_id, exc)
+            return None
+        if matched is None:
+            logger.error(
+                "get_order for %s returned an unusable size_matched (%r) — "
+                "treating the order as unreadable",
+                order_id,
+                order.get("size_matched"),
+            )
             return None
         return matched, status
 
@@ -223,12 +305,25 @@ class LiveExecutor:
                 res = {"not_canceled": {order_id: f"{type(exc).__name__}: {exc}"}}
             if not isinstance(res, dict):
                 res = {"not_canceled": {order_id: f"unexpected response {type(res).__name__}"}}
-            if order_id in (res.get("canceled") or []):
+            # Both halves are read defensively: the acknowledgement must be a
+            # list holding our id (a bare string would make ``in`` a substring
+            # test and acknowledge an order we never sent), and the refusal must
+            # be a mapping. An unexpected shape is a refusal, not an exception —
+            # raising here would abandon the order on the book.
+            acked = res.get("canceled")
+            if isinstance(acked, list) and order_id in acked:
                 return None, seen, False
-            reason = str((res.get("not_canceled") or {}).get(order_id, "refused without a reason"))
+            refusals = res.get("not_canceled")
+            if isinstance(refusals, Mapping):
+                reason = str(refusals.get(order_id, "refused without a reason"))
+            else:
+                reason = f"unexpected cancel body shape ({type(refusals).__name__})"
             state = self._read_order(order_id)
             if state is not None:
                 matched, status = state
+                # Clamped like the balance source is: an order cannot match more
+                # than it asked for, and the caller books this straight down.
+                matched = min(matched, size)
                 seen = matched if seen is None else max(seen, matched)
                 # The size comparison — not a ``MATCHED`` status, which the
                 # venue also reports on a partial — is what proves nothing rests.
@@ -260,15 +355,16 @@ class LiveExecutor:
         """Cancel whatever of this order is still resting and return
         ``(final_matched_qty, failure)``.
 
-        ``reported_qty`` is the immediate fill from the POST response; a full
-        fill returns at once. ``confirm`` is the CTF balance-delta fallback for
-        when the order cannot be re-read. ``failure`` is None, or one of the
-        skip reasons: ``"live_cancel_failed"`` — something may still rest (no
-        order id, or every cancel refused / raised and no later read showed the
-        order terminal), logged as a RESTING ORDER ALERT; ``"live_fill_unknown"``
-        — nothing filled as far as could be told, but neither the order read nor
-        the balance could establish it. The returned qty is the LARGEST fill any
-        source reported and is never less than ``reported_qty``.
+        ``reported_qty`` is the immediate fill from the POST response, already
+        vetted by the caller; a full fill returns at once. ``confirm`` is the CTF
+        balance-delta fallback for when the order cannot be re-read. ``failure``
+        is None, or one of the skip reasons: ``"live_cancel_failed"`` — something
+        may still rest (no order id, or every cancel refused / raised and no
+        later read showed the order terminal), logged as a RESTING ORDER ALERT;
+        ``"live_fill_unknown"`` — nothing filled as far as could be told, but
+        neither the order read nor the balance could establish it. The returned
+        qty is the LARGEST fill any source reported and is never less than
+        ``reported_qty``.
         """
         if reported_qty >= size - 1e-9:
             return reported_qty, None  # full fill — nothing resting, no round-trip
@@ -293,7 +389,11 @@ class LiveExecutor:
             state = self._read_order(order_id)
             if state is not None:
                 fresh, status = state
-                final = max(final, fresh)
+                final = max(final, min(fresh, size))  # clamped, as in the loop
+                # Only this order's own read can clear the alert, and only by
+                # showing the whole order matched or a terminal status.
+                # ``reported_qty`` has no say in it: the early return above
+                # already proved it short of ``size``.
                 if final >= size - 1e-9 or status in _ORDER_DONE_STATUSES:
                     reason = None  # the order is terminal — nothing rests after all
             else:
@@ -313,10 +413,18 @@ class LiveExecutor:
                         order_id,
                         confirmed,
                     )
-                elif reported_qty <= 0 and seen is None:
-                    # No source could establish a fill. Not "no match":
+                elif reported_qty <= 0 and not seen:
+                    # No source could establish a fill — a read of 0.0 counts
+                    # for nothing here, it predates the cancel. Not "no match":
                     # the caller must not treat this as a clean miss.
                     failure = "live_fill_unknown"
+                # The balance never clears a refused cancel, however much it
+                # accounts for: it is a wallet-wide delta against a pre-order
+                # baseline, attributed to no order id, so an EARLIER order's
+                # remainder filling in this poll window is indistinguishable
+                # from this one filling. A false alert on an order the wallet
+                # suggests is filled costs a reconciliation look; suppressing a
+                # true one leaves an answered order resting unannounced.
                 final = max(final, confirmed)
         if reason is not None:
             logger.error(
@@ -341,28 +449,48 @@ class LiveExecutor:
         confirm: Callable[[], float],
     ) -> _Fill | ExecResult:
         """Turn a successful POST /order response into what actually filled, or
-        into the ``ExecResult.skip`` to return. The settle step runs whenever the
-        reported fill is short of ``size``, garbage amounts included — the order
-        id is read first so a bad number can never skip the cancel."""
+        into the ``ExecResult.skip`` to return. This is where the venue's own
+        account of the order is either believed or thrown away; the settle step
+        below is handed only numbers that survived that, and runs whenever what
+        did survive is short of ``size``."""
         # ``makingAmount`` is what our order gives, ``takingAmount`` what it
         # receives: a BUY receives shares (and gives pUSD), a SELL the reverse.
         shares_key, usdc_key = (
             ("takingAmount", "makingAmount") if side == "buy" else ("makingAmount", "takingAmount")
         )
-        order_id = resp.get("orderID") or None
+        parsed = _OrderResponse.parse(resp, shares_key=shares_key, usdc_key=usdc_key)
+        order_id = parsed.order_id
         no_fill_reason = "live_no_match"
-        try:
-            shares = float(resp.get(shares_key) or 0)
-            usdc = float(resp.get(usdc_key) or 0)
-        except (TypeError, ValueError) as exc:
+        # Each amount stands on its own: a garbage price field must not erase a
+        # share count the venue reported, or an executed fill would be dropped
+        # from the ledger.
+        bad = [k for k, v in ((shares_key, parsed.shares), (usdc_key, parsed.usdc)) if v is None]
+        shares, usdc = parsed.shares or 0.0, parsed.usdc or 0.0
+        if shares > size + 1e-9:
+            # More filled than the order asked for is not a fill to book down.
+            # It is a number the venue cannot mean, so it earns no trust at all:
+            # drop it and let the order read or the wallet say what happened.
+            # Booking it down to ``size`` instead would pin a full-size floor
+            # under the answer — a phantom position against an empty wallet,
+            # which blocks re-entry and can never be sold.
             logger.error(
-                "%s response amounts unparseable for order %s (%s) — treating as "
-                "unfilled and settling",
+                "%s response reported %.4f filled for an order of %.4f (%s) — "
+                "discarding it; the settle establishes the fill instead",
                 side,
+                shares,
+                size,
                 order_id,
-                exc,
             )
-            shares = usdc = 0.0
+            shares = 0.0
+            bad.append(shares_key)
+        if bad:
+            logger.error(
+                "%s response carried unusable %s for order %s — settling and "
+                "recording only what could be read",
+                side,
+                " and ".join(bad),
+                order_id,
+            )
             no_fill_reason = "live_unparseable"
         qty, failure = self._settle_resting_remainder(order_id, shares, size, confirm=confirm)
         resting_id = order_id if failure == "live_cancel_failed" else None
@@ -388,7 +516,7 @@ class LiveExecutor:
         return _Fill(
             qty=qty,
             price=price,
-            tx_hash=(resp.get("transactionsHashes") or [None])[0],
+            tx_hash=parsed.tx_hash,
             order_id=order_id,
             resting=resting_id is not None,
         )
