@@ -10,6 +10,31 @@ Dates are US-style (MM/DD/YYYY).
 
 ---
 
+## 09/05/2026 — An order that did not fill is cancelled, not left on the book
+
+**Nothing rests behind the ledger's back.** The live executor posts a crossing
+GTC limit at the level-1 price. When nothing crossed, it reported no match and
+left the order resting at a price that was already stale, where it could fill
+minutes later with no position row — the orphan the partial-fill cancel was
+written for, one branch over. Every answered order that is short of a full
+fill is now cancelled, with a bounded retry across Polymarket's matching-delay
+window, and the cancel response is actually read: the venue answers 200 even
+when it refuses. A refused cancel is checked against the order itself, and
+only a full match or a cancelled status counts as "nothing rests" — `MATCHED`
+alone does not, because a partial fill reports it too. A fill that raced the
+cancel is booked at the limit price, the conservative bound. When the executor
+cannot prove the order is gone it says so (`live_cancel_failed`,
+`live_fill_unknown`) instead of claiming a clean miss, and it carries the order
+id so callers can back off rather than post a second order on top of the
+first.
+
+**Trailing-stop peaks survive a restart.** The Phase 4 note below recorded
+that `bootstrap_peaks` was not wired. The same-day code-review follow-up wired
+it into the startup path, so a lock that armed on an earlier run-up is no
+longer disarmed by a restart; the runtime docs now say so.
+
+---
+
 ## 08/30/2026 — Phase 4: the canvas can now tell you the truth about the strategy
 
 Phase 4 is mostly engineering — a test framework, a base class, docs, hooks —
@@ -68,8 +93,9 @@ CI), a shared `TickLoopMonitor` base for the three runtime monitors, the
 module-scope monkey-patched methods folded back into their classes, mypy and
 pre-commit wired up, and
 [docs/architecture/07-runtime-monitors.md](docs/architecture/07-runtime-monitors.md)
-documenting the runtime — including that `bootstrap_peaks` is **not wired**, so
-trailing-stop peaks reset on every restart.
+documenting the runtime — including, as of that day, that `bootstrap_peaks` was
+**not wired**, so trailing-stop peaks reset on every restart. The same-day
+code-review follow-up wired it; see the 09/05/2026 entry above.
 
 ---
 

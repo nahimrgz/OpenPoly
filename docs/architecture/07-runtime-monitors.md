@@ -89,16 +89,16 @@ The exit section's trailing lock needs a peak; the monitor is what tracks it.
   would re-seed the stop at the next tick's mark and throw away the run-up the
   position already had.
 
-> **`bootstrap_peaks` exists but is not wired.** The method rebuilds each open
-> position's peak from the `order_book_snapshot` table at startup (applying the
-> same depth guard, so a recorded dust bid cannot seed an unreachable peak), but
-> nothing calls it — the FastAPI lifespan goes straight from `configure()` to
-> `start()`. **Peaks therefore reset on every restart**: after a restart a
-> position's peak re-seeds at the first mark observed, so a trailing lock that
-> had armed on an earlier run-up is disarmed until the price makes a new high.
-> The stop-loss is unaffected. Wiring it is a one-line lifespan change plus the
-> session factory; it is listed here rather than fixed silently because it
-> changes exit behavior on restart.
+> **`bootstrap_peaks` is wired at startup.** The FastAPI lifespan calls it
+> between `configure()` and `start()` (`openpoly/api/main.py`), so each open
+> position's peak is rebuilt from the `order_book_snapshot` table before the
+> first tick — with the same depth guard, so a recorded dust bid cannot seed an
+> unreachable peak. A trailing lock that armed on an earlier run-up therefore
+> survives a restart, as long as the snapshot retention window
+> (`order_book_retention_days`, 7 days by default) still covers the position's
+> lifetime; a position older than the window re-seeds at the first mark
+> observed after the restart. The stop-loss is unaffected either way. The
+> wiring is pinned by a regression test in `tests/test_exit_monitor.py`.
 
 ### Dust skip
 
