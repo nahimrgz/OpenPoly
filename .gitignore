@@ -52,6 +52,7 @@ CLAUDE.md
 # Skills CLI tooling (personal; not part of openPoly)
 .agents/
 skills-lock.json
+.atl/
 
 # Personal AI-workflow docs (local-only; kept off the public repo).
 # Published design docs live in docs/architecture/ and docs/deploy/.
@@ -61,3 +62,6 @@ docs/superpowers/
 
 # Live trade source data (real on-chain tx hashes) — kept local, never published
 material/
+
+# Coverage data (pytest-cov)
+.coverage
