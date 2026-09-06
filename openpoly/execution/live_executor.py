@@ -137,20 +137,40 @@ def _parse_order_id(raw: Any) -> str | None:
 def _order_was_rejected(resp: dict[str, Any]) -> bool:
     """Whether a POST /order response says the venue rejected the order.
 
-    ``True`` only when ``"success"`` is present AND definitively falsy in the
+    ``True`` when ``"success"`` is present AND definitively falsy in the
     venue's terms: the boolean ``False``, or a string equal — case-insensitive,
-    stripped of surrounding whitespace — to ``"false"``. An ABSENT key is not a
-    rejection (some response variants omit it entirely; the order may still
-    have been placed, with an ``orderID`` and amounts in the body), and neither
-    is any other value (``True``, a truthy non-"false" string, ...). Both cases
-    return ``False`` — not rejected, proceed to settle.
+    stripped of surrounding whitespace — to ``"false"``. Any other present
+    value (``True``, a truthy non-"false" string, ...) is not a rejection.
+
+    An ABSENT ``"success"`` key is not a rejection *by itself*: some response
+    variants omit it entirely and the order may still have been placed, with
+    an ``orderID`` and amounts in the body — that body must be settled. But an
+    absent key with no ``orderID`` either is an error-shaped body
+    (``{"error": ...}``), not an order: settling it would log a false RESTING
+    ORDER ALERT for an order id we never had, spend the balance-poll budget,
+    and — if the wallet moves in that window for an unrelated reason, an
+    earlier order's remainder settling being the obvious one — book a fill for
+    an order that was never placed. That case is a rejection.
     """
     if "success" not in resp:
-        return False
+        return not resp.get("orderID")
     value = resp["success"]
     if value is False:
         return True
     return isinstance(value, str) and value.strip().lower() == "false"
+
+
+def _rejection_reason(resp: dict[str, Any]) -> str:
+    """The venue's own words for a rejection, for the ``live_rejected:`` skip.
+
+    ``errorMsg`` is the documented field; an error-shaped body that carries no
+    ``"success"`` key tends to name it ``error`` instead, and discarding that
+    text would leave the skip reason saying nothing at all."""
+    for key in ("errorMsg", "error"):
+        value = resp.get(key)
+        if value:
+            return str(value)
+    return "unknown"
 
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -177,7 +197,7 @@ _SETTLE_DEADLINE_S = 8.0
 # ``MATCHED`` is NOT one of them: the venue reports it for a PARTIAL match too,
 # so believing it would abandon the unmatched remainder of a partially filled
 # order on the book. A match ends the settle only through the size comparison.
-_ORDER_DONE_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "PURGED"})
+_ORDER_DONE_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"})
 # An on-chain fill is irreversible; persisting it (open for BUY, close for SELL)
 # must survive a transient write failure (SQLite lock contention, surfaced as
 # ``sqlalchemy.exc.OperationalError``) or the ledger drifts from the wallet: a
@@ -556,23 +576,20 @@ class LiveExecutor:
         missing size spends the whole retry budget on an order the venue has
         already reported cancelled.
 
-        A 404 from this endpoint is not a transient read failure like every
-        other exception: the venue purges old/settled orders from its records,
-        so a 404 here means the order is definitely gone. It is reported as the
-        synthetic terminal status ``PURGED`` (in ``_ORDER_DONE_STATUSES``)
-        rather than spending the retry budget on a read that will never
-        succeed again.
+        A 404 is NOT special-cased as terminal. This endpoint's data API lags
+        the matching engine (see the settle loop), so a just-placed order —
+        especially one still inside the venue's non-cancellable matching-delay
+        window — can 404 purely because it has not been indexed yet, which is
+        indistinguishable here from an order the venue purged. Reading it as
+        terminal would abandon a still-live, uncancelled order on the book
+        after a single attempt; it is a failed read like any other, and the
+        caller's retry budget is what decides when to stop.
         """
         try:
             order = self._clob.get_order(order_id)
             raw_matched = order.get("size_matched")
             matched = _parse_amount(raw_matched)
             status = str(order.get("status") or "").upper()
-        except PolyApiException as exc:
-            if exc.status_code == 404:
-                return None, "PURGED"
-            logger.warning("get_order for %s failed: %s", order_id, exc)
-            return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("get_order for %s failed: %s", order_id, exc)
             return None
@@ -1164,10 +1181,22 @@ class LiveExecutor:
                 neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, PolyApiException) and exc.status_code is not None:
-                # The venue answered and refused (bad precision, min-size,
-                # closed-only mode, ...): the order was never placed, so
-                # there is nothing to confirm via the CTF balance.
+            if (
+                isinstance(exc, PolyApiException)
+                and exc.status_code is not None
+                and 400 <= exc.status_code < 500
+            ):
+                # A 4xx is the venue answering and refusing the REQUEST (bad
+                # precision, min-size, closed-only mode, ...): the order was
+                # never placed, so there is nothing to confirm via the CTF
+                # balance. Only a 4xx says that. A 5xx is the SDK's own
+                # ``_is_transient_error`` class (``500 <= code < 600``) — the
+                # matching engine may already have accepted and matched the
+                # order and only the RESPONSE leg failed — so it falls through
+                # to the balance-confirm below with every other exception. Not
+                # doing so would leave a real on-chain fill with no ledger row,
+                # the untracked position the baseline read exists to prevent
+                # (see this module's header).
                 logger.warning(
                     "buy rejected for %s %s: status=%s body=%s",
                     intent.market_id,
@@ -1193,7 +1222,7 @@ class LiveExecutor:
             )
         else:
             if _order_was_rejected(resp):
-                return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
+                return ExecResult.skip(f"live_rejected:{_rejection_reason(resp)}")
             fill = self._resolve_fill(
                 resp, side="buy", size=size, limit_price=intent.price, confirm=confirm
             )
@@ -1276,9 +1305,16 @@ class LiveExecutor:
                 neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, PolyApiException) and exc.status_code is not None:
-                # The venue answered and refused: the order was never placed,
-                # so there is nothing to confirm via the CTF balance.
+            if (
+                isinstance(exc, PolyApiException)
+                and exc.status_code is not None
+                and 400 <= exc.status_code < 500
+            ):
+                # A 4xx is the venue refusing the REQUEST: the order was never
+                # placed, so there is nothing to confirm via the CTF balance.
+                # A 5xx is transient in the SDK's own terms and may follow an
+                # accepted, matched order whose response leg failed — it takes
+                # the balance-confirm path below, like every other exception.
                 logger.warning(
                     "sell rejected for position %d: status=%s body=%s",
                     position.position_id,
@@ -1303,7 +1339,7 @@ class LiveExecutor:
             )
         else:
             if _order_was_rejected(resp):
-                return ExecResult.skip(f"live_rejected:{resp.get('errorMsg', 'unknown')}")
+                return ExecResult.skip(f"live_rejected:{_rejection_reason(resp)}")
             fill = self._resolve_fill(
                 resp, side="sell", size=size, limit_price=bid_price, confirm=confirm
             )

@@ -13,7 +13,7 @@ uv run uvicorn openpoly.api.main:app
 # Tests
 uv run pytest
 
-# Lint / format (line length 100, target py312)
+# Lint / format (line length 100, target py313)
 uv run ruff check .
 uv run ruff format .
 

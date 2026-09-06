@@ -46,6 +46,14 @@ def _cancelled(order_id: str = "0x1") -> dict[str, Any]:
     return {"canceled": [order_id], "not_canceled": {}}
 
 
+def _poly_exc(error_msg: Any, status_code: int | None) -> PolyApiException:
+    """The SDK's API exception with a chosen ``status_code``: its constructor
+    only derives one from a real ``httpx.Response``, so tests set it after."""
+    exc = PolyApiException(error_msg=error_msg)
+    exc.status_code = status_code
+    return exc
+
+
 class _FakeClob:
     """Records calls; returns canned responses set per test.
 
@@ -392,18 +400,18 @@ def test_buy_clob_network_error_skips(store) -> None:
     assert r.skip_reason == "live_error:ConnectionError"
 
 
-def test_buy_definitive_rejection_skips_without_balance_confirm(store) -> None:
-    """A ``PolyApiException`` with a non-None ``status_code`` means the venue
-    answered and refused (bad precision, min-size, closed-only mode, ...) —
-    the order was never placed, so there is nothing to confirm via the CTF
-    balance. Polling it anyway would be dishonest about what happened and
-    would burn the lost-response recovery path on an order that never
-    existed."""
+@pytest.mark.parametrize("status_code", [400, 422])
+def test_buy_definitive_rejection_skips_without_balance_confirm(store, status_code) -> None:
+    """A ``PolyApiException`` with a 4xx ``status_code`` means the venue
+    answered and refused the request (bad precision, min-size, closed-only
+    mode, ...) — the order was never placed, so there is nothing to confirm
+    via the CTF balance. Polling it anyway would be dishonest about what
+    happened and would burn the lost-response recovery path on an order that
+    never existed. Only a 4xx says this (see the 5xx cases in
+    ``_LOST_RESPONSE``)."""
     m = _market("m1")
     _populate(m)
-    exc = PolyApiException(error_msg={"error": "invalid price"})
-    exc.status_code = 400
-    clob = _FakeClob(exception=exc)
+    clob = _FakeClob(exception=_poly_exc({"error": "invalid price"}, status_code))
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.filled is False
@@ -428,16 +436,21 @@ def test_buy_response_success_false_skips(store) -> None:
 
 # ---------- ``_order_was_rejected``: what "success" actually says ----------
 #
-# An absent key is not a rejection (some venue response variants omit it, and
-# an order the venue placed must still be settled). A truthy non-bool string
-# such as ``"true"`` is not a rejection either. Only the boolean ``False`` or a
-# string equal, case-insensitively and stripped, to ``"false"`` is.
+# An absent key is not a rejection BY ITSELF (some venue response variants omit
+# it, and an order the venue placed — one that named an ``orderID`` — must still
+# be settled); an absent key with no ``orderID`` either is an error-shaped body
+# with nothing to settle on, and is. A truthy non-bool string such as ``"true"``
+# is not a rejection. Neither is the boolean ``False`` or a string equal,
+# case-insensitively and stripped, to ``"false"`` anything else.
 
 
 @pytest.mark.parametrize(
     ("resp", "expected"),
     [
-        pytest.param({}, False, id="absent-key"),
+        pytest.param({}, True, id="absent-key-no-order-id"),
+        pytest.param({"error": "some message"}, True, id="error-shaped-body"),
+        pytest.param({"orderID": ""}, True, id="absent-key-empty-order-id"),
+        pytest.param({"orderID": "0x1"}, False, id="absent-key-with-order-id"),
         pytest.param({"success": True}, False, id="bool-true"),
         pytest.param({"success": False}, True, id="bool-false"),
         pytest.param({"success": "true"}, False, id="string-true"),
@@ -449,6 +462,54 @@ def test_buy_response_success_false_skips(store) -> None:
 )
 def test_order_was_rejected(resp, expected) -> None:
     assert _order_was_rejected(resp) is expected
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_error_shaped_response_is_rejected_not_settled(store, side, caplog) -> None:
+    """No ``success`` key AND no ``orderID``: an error body, not an order. It
+    must skip at once rather than run the settle with a None order id, which
+    logs a false RESTING ORDER ALERT, burns the balance-poll budget, and can
+    book a fill out of an unrelated balance move in that window. The venue's
+    own words survive into the skip reason even under the ``error`` key."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    clob = _FakeClob(order_response={"error": "invalid order arguments"})
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    if side == "buy":
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    else:
+        r = le.execute_sell(_held(store, m), close_reason="take_profit", ts=200.0)
+    assert r.filled is False
+    assert r.skip_reason == "live_rejected:invalid order arguments"
+    assert clob.order_reads == 0
+    assert clob.cancelled == []
+    assert "RESTING ORDER ALERT" not in caplog.text
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_error_shaped_response_cannot_book_an_unrelated_balance_move(store, side) -> None:
+    """The concrete harm the check above prevents: the wallet moves during the
+    settle window for a reason of its own (an earlier order's remainder), and
+    the balance fallback reads that delta as this order's fill."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m) if side == "sell" else None
+    clob = _FakeClob(
+        order_response={"error": "invalid order arguments"},
+        # Buy: baseline 0 then a rise. Sell: gate read full, then a drop.
+        ctf_balance_sequence=[0, 10_000_000] if side == "buy" else [10_000_000, 0],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    if side == "buy":
+        r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
+        assert store.get_open_position("m1", "yes") is None
+    else:
+        assert held is not None
+        r = le.execute_sell(held, close_reason="take_profit", ts=200.0)
+        rec = store.get_position(held.position_id)
+        assert rec is not None and rec.status == "open"
+    assert r.filled is False
+    assert r.skip_reason == "live_rejected:invalid order arguments"
 
 
 def test_buy_response_without_success_key_still_settles(store) -> None:
@@ -810,11 +871,21 @@ _LOST_RESPONSE = {
     # own signal for this is a ``PolyApiException`` with ``status_code is
     # None`` — must NOT be mistaken for a definitive rejection.
     "poly-api-transport": {"exception": PolyApiException(error_msg="Request exception!")},
+    # A 5xx (gateway, overload, upstream failure). The SDK's own
+    # ``_is_transient_error`` classes ``500 <= code < 600`` as transient, i.e.
+    # NOT proof the order was never placed: the matching engine can have
+    # accepted and matched it and only the response leg failed. Short-circuiting
+    # past the balance-confirm here would leave a real on-chain fill with no
+    # ledger row, so a 5xx is a lost response, not a rejection.
+    "poly-api-502": {"exception": _poly_exc("Bad Gateway", 502)},
+    "poly-api-503": {"exception": _poly_exc("Service Unavailable", 503)},
 }
 _LOST_RESPONSE_REASON = {
     "exception": "live_error:RuntimeError",
     "non-json-200": "live_error:TypeError",
     "poly-api-transport": "live_error:PolyApiException",
+    "poly-api-502": "live_error:PolyApiException",
+    "poly-api-503": "live_error:PolyApiException",
 }
 
 
@@ -860,17 +931,16 @@ def test_sell_lost_response_without_balance_change_skips(store, case) -> None:
     assert rec is not None and rec.status == "open"
 
 
-def test_sell_definitive_rejection_skips_without_balance_confirm(store) -> None:
-    """Mirrors the buy case: a ``PolyApiException`` with a non-None
-    ``status_code`` means the venue refused the sell outright — no balance
-    poll, and the position must stay open exactly as it was, not recorded as
-    (even partially) sold."""
+@pytest.mark.parametrize("status_code", [400, 422])
+def test_sell_definitive_rejection_skips_without_balance_confirm(store, status_code) -> None:
+    """Mirrors the buy case: a ``PolyApiException`` with a 4xx ``status_code``
+    means the venue refused the sell outright — no balance poll, and the
+    position must stay open exactly as it was, not recorded as (even
+    partially) sold."""
     m = _market("m1")
     _populate(m, _book(m.yes_token_id, bid=0.55))
     held = _held(store, m)
-    exc = PolyApiException(error_msg="closed only mode")
-    exc.status_code = 400
-    clob = _FakeClob(exception=exc)
+    clob = _FakeClob(exception=_poly_exc("closed only mode", status_code))
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
     assert r.filled is False
@@ -883,6 +953,51 @@ def test_sell_definitive_rejection_skips_without_balance_confirm(store) -> None:
     rec = store.get_position(held.position_id)
     assert rec is not None and rec.status == "open"
     assert rec.qty == pytest.approx(held.qty)
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_sell_5xx_confirms_the_balance_instead_of_calling_it_a_rejection(
+    store, status_code
+) -> None:
+    """A 5xx is not the venue saying the order was never placed: the matching
+    engine can have accepted and matched it while only the response leg
+    failed. The balance-confirm must still run — here it sees the tokens gone,
+    which is a real fill that would otherwise have been lost as
+    ``live_rejected`` with the position left open against an empty wallet."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    # Gate read sees 10 tokens (synced); post-exception confirm sees 0 → sold.
+    clob = _FakeClob(
+        exception=_poly_exc("upstream error", status_code),
+        ctf_balance_sequence=[10_000_000, 0],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert clob.balance_reads > 1  # the confirm poll ran; it was not short-circuited
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "closed"
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_buy_5xx_confirms_the_balance_instead_of_calling_it_a_rejection(store, status_code) -> None:
+    """The buy mirror: a 5xx that followed an accepted, matched order must be
+    recovered from the CTF balance rise, not discarded as a rejection — that
+    is the untracked on-chain position the baseline read exists to prevent."""
+    m = _market("m1")
+    _populate(m)
+    clob = _FakeClob(
+        exception=_poly_exc("upstream error", status_code),
+        ctf_balance_sequence=[0, 10_000_000],
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n1", ts=100.0)
+    assert r.filled is True
+    assert r.qty == pytest.approx(10.0)
+    assert clob.balance_reads > 1
+    assert store.get_open_position("m1", "yes") is not None
 
 
 def test_sell_partial_fill_keeps_position_open(store) -> None:
@@ -2342,49 +2457,40 @@ def test_buy_expired_or_rejected_status_ends_the_loop_at_once(store, status) -> 
     assert r.skip_reason == "live_fill_unknown"  # the size was never established
 
 
-# ---------- ``_read_order``: a 404 read means the order was purged ----------
+# ---------- ``_read_order``: a 404 read is a failed read, not a verdict ------
 #
-# The venue purges old/settled orders from its records; for this endpoint a 404
-# means the order is definitely gone, not a transient read failure worth
-# retrying like every other exception is.
+# GET /data/order lags the matching engine, so a just-placed order — especially
+# one still inside the venue's non-cancellable matching-delay window — can 404
+# purely because it has not been indexed yet. That is indistinguishable from an
+# order the venue purged, so a 404 is a failed read like every other exception
+# and the retry budget, not one answer, decides when to stop.
 
 
-def test_read_order_404_is_purged(store) -> None:
-    exc = PolyApiException(error_msg="not found")
-    exc.status_code = 404
-    clob = _FakeClob(order_status=[exc])
-    le = LiveExecutor(portfolio=store, clob_client=clob)
-    assert le._read_order("0x1") == (None, "PURGED")
-
-
-@pytest.mark.parametrize("status_code", [500, None])
-def test_read_order_non_404_poly_api_exception_returns_none(store, status_code) -> None:
-    exc = PolyApiException(error_msg="server error")
-    exc.status_code = status_code
-    clob = _FakeClob(order_status=[exc])
+@pytest.mark.parametrize("status_code", [404, 500, None])
+def test_read_order_poly_api_exception_returns_none(store, status_code) -> None:
+    clob = _FakeClob(order_status=[_poly_exc("read failed", status_code)])
     le = LiveExecutor(portfolio=store, clob_client=clob)
     assert le._read_order("0x1") is None
 
 
-def test_buy_purged_order_ends_the_settle_loop_at_once(store) -> None:
-    """A 404 read during the settle loop is treated as terminal (``PURGED`` is
-    in ``_ORDER_DONE_STATUSES``), not spent retrying a read that will never
-    succeed again."""
+def test_buy_404_read_keeps_retrying_the_cancel(store) -> None:
+    """A 404 read must NOT short-circuit the settle: with the venue refusing
+    every cancel (the matching-delay window), the loop has to spend its whole
+    attempt budget rather than abandon a possibly still-resting order after
+    one unindexed read."""
     m = _market("m1")
     _populate(m)
-    exc = PolyApiException(error_msg="not found")
-    exc.status_code = 404
     clob = _FakeClob(
         order_response=_zero_fill_response("live"),
         cancel_responses=[_refused()],
-        order_status=[exc],
+        order_status=[_poly_exc("not found", 404)],
         ctf_balance_sequence=[0, 0],
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(_intent(price=0.5, qty=10.0), news_id="n", ts=1.0)
-    assert len(clob.cancelled) == 1  # the purged read settled it; no budget spent
-    assert r.resting_order_id is None
-    assert r.skip_reason == "live_fill_unknown"  # the size was never established
+    assert len(clob.cancelled) == _SETTLE_ATTEMPTS  # the full budget, not one attempt
+    assert r.resting_order_id == "0x1"  # still unaccounted for — the alert stands
+    assert r.skip_reason == "live_cancel_failed"
 
 
 # ---------- the settle's evidence model ----------
