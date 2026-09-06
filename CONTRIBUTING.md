@@ -47,6 +47,7 @@ Run the full local gate and make sure it's green:
 uv run pytest
 uv run ruff check .
 uv run ruff format .
+uv run mypy
 
 # Frontend (from frontend/)
 yarn typecheck
@@ -54,12 +55,12 @@ yarn lint
 yarn test
 ```
 
-CI **blocks merges** on `ruff check` + `pytest` (backend) and `yarn typecheck` +
-`yarn lint` + `yarn test` (frontend). `ruff format` is **not** a CI gate — run it
-locally to keep formatting consistent, but it won't fail your PR. `mypy` runs in
-CI too, also **non-blocking**: the codebase predates it, so it reports rather
-than gates. Don't add new errors to files you touch; see `[tool.mypy]` in
-`pyproject.toml`.
+Every one of those blocks merges. On the backend that is `pytest`, `ruff check`,
+`ruff format --check` and `mypy`; on the frontend `yarn typecheck`, `yarn lint`
+and `yarn test`. Ruff and mypy are pinned in `pyproject.toml`, so a new release
+cannot change the rules under you between your run and CI's. The mypy config is
+deliberately lenient about third-party stubs and covers `openpoly/` only; see
+`[tool.mypy]`.
 
 ### Pre-commit hooks (optional but recommended)
 

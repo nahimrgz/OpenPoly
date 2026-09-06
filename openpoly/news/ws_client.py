@@ -28,8 +28,9 @@ from .ring_buffer import NewsItem, NewsRingBuffer
 OnEventHook = Callable[[str, str | None], None]
 
 # Single fresh news item — wired by manager to orchestrator.enqueue in v7
-# lifespan. Sync because orchestrator.enqueue is sync.
-OnItemHook = Callable[[NewsItem], None]
+# lifespan. Sync because orchestrator.enqueue is sync; called for its side
+# effect, the return value is ignored.
+OnItemHook = Callable[[NewsItem], object]
 
 logger = logging.getLogger(__name__)
 

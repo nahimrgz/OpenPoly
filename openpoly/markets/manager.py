@@ -144,7 +144,9 @@ class MarketSourceManager:
         self._started_at: float | None = None
         self._poll_count: int = 0
         self._last_error: str | None = None
-        self._book_persist: Callable[[OrderBook], None] | None = None
+        # The persist hook is called for its side effect; its return value is
+        # ignored (the writer's enqueue reports accepted/dropped as a bool).
+        self._book_persist: Callable[[OrderBook], object] | None = None
         self._book_observer: Callable[[OrderBook], None] | None = None
 
     # ---------- lifecycle ----------
@@ -188,7 +190,7 @@ class MarketSourceManager:
         with contextlib.suppress(Exception):
             await self.stop()
 
-    def set_book_persist(self, persist: Callable[[OrderBook], None] | None) -> None:
+    def set_book_persist(self, persist: Callable[[OrderBook], object] | None) -> None:
         """Install / clear the order-book persist hook — the write-behind
         writer's ``enqueue``. Wired by the FastAPI lifespan; ``None`` in tests."""
         self._book_persist = persist

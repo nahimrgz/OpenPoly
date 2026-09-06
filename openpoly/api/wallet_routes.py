@@ -349,9 +349,9 @@ def get_mode() -> SetModeResponse:
 # ---------- wallet balance (dashboard) ----------
 
 _BALANCE_CACHE_TTL_SECONDS = 30.0
-# (fetched_at, payload) — one wallet, one slot. Keeps the frontend's poll from
+# (fetched_at, response) — one wallet, one slot. Keeps the frontend's poll from
 # hammering the CLOB / data-api; 30s staleness is fine for a display card.
-_balance_cache: tuple[float, dict] | None = None
+_balance_cache: tuple[float, WalletBalanceResponse] | None = None
 
 
 class WalletBalanceResponse(BaseModel):
@@ -378,7 +378,7 @@ async def get_wallet_balance() -> WalletBalanceResponse:
 
     now = time.time()
     if _balance_cache is not None and now - _balance_cache[0] < _BALANCE_CACHE_TTL_SECONDS:
-        return WalletBalanceResponse(**_balance_cache[1])
+        return _balance_cache[1]
 
     # The collateral read is a sync CLOB network round-trip — offload it so a
     # slow CLOB can't starve the event loop (docs/architecture/05).
@@ -392,12 +392,12 @@ async def get_wallet_balance() -> WalletBalanceResponse:
         positions_value = None
 
     total = usdc + positions_value if usdc is not None and positions_value is not None else None
-    payload = {
-        "configured": True,
-        "usdc": usdc,
-        "positions_value": positions_value,
-        "total": total,
-        "ts": now,
-    }
-    _balance_cache = (now, payload)
-    return WalletBalanceResponse(**payload)
+    response = WalletBalanceResponse(
+        configured=True,
+        usdc=usdc,
+        positions_value=positions_value,
+        total=total,
+        ts=now,
+    )
+    _balance_cache = (now, response)
+    return response

@@ -19,6 +19,7 @@ import logging
 from typing import Any
 
 import anthropic
+from anthropic.types import ToolParam
 
 from openpoly.news.secrets import SecretsError, resolve
 
@@ -32,9 +33,14 @@ _STRUCTURAL_RETRIES = 2
 # Per-request timeout — a small completion should never take this long.
 _TIMEOUT_SECONDS = 60.0
 
+# A tool definition as the SDK types it (``name`` / ``description`` /
+# ``input_schema``); re-exported so section impls type their tool constants
+# without importing the SDK themselves.
+ToolDefinition = ToolParam
+
 # Minimal tool for the connectivity probe (``ping``): its only job is to make
 # the model emit one forced tool_use block.
-_PING_TOOL: dict[str, Any] = {
+_PING_TOOL: ToolDefinition = {
     "name": "ack",
     "description": "Acknowledge the connectivity check.",
     "input_schema": {
@@ -92,7 +98,7 @@ class LLMClient:
             self._client = anthropic.Anthropic(**kwargs)
         return self._client
 
-    def analyze(self, *, system: str, user: str, tool: dict[str, Any]) -> dict[str, Any]:
+    def analyze(self, *, system: str, user: str, tool: ToolDefinition) -> dict[str, Any]:
         """Run one completion forced to call ``tool``; return its input dict.
 
         ``tool`` is a full tool definition (``name`` / ``description`` /
@@ -100,7 +106,7 @@ class LLMClient:
         model returns no usable tool call.
         """
         client = self._ensure_client()
-        tool_name = str(tool["name"])
+        tool_name = tool["name"]
         # temperature is rejected by claude-opus-4-7; omit it for that model.
         extra: dict[str, Any] = (
             {} if self._model == "claude-opus-4-7" else {"temperature": self._temperature}

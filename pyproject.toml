@@ -54,12 +54,13 @@ asyncio_mode = "auto"
 line-length = 100
 target-version = "py312"
 
-# Lenient on purpose. mypy is being introduced onto a codebase that was never
-# written against it, so it runs as a NON-BLOCKING CI step (see
-# .github/workflows/ci.yml): its job right now is to report, not to gate. The
-# third-party surface (py-clob-client, sentence-transformers, web3) ships no
-# usable stubs, hence ignore_missing_imports; tightening any of this is a
-# deliberate later step, taken once the current error count is worked down.
+# A blocking CI gate (see .github/workflows/ci.yml): the tree type-checks clean
+# and must stay that way. Still lenient on purpose about third-party stubs —
+# the SDK surface (py-clob-client, sentence-transformers, web3) ships no usable
+# ones, hence ignore_missing_imports. `tests/` is outside `files` on purpose:
+# it carries a ~100-error backlog of duck-typed fakes, and adding it now would
+# only bring continue-on-error back. Tightening beyond that is a deliberate
+# later step.
 [tool.mypy]
 python_version = "3.12"
 files = ["openpoly"]

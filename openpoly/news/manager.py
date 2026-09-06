@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
 
 from openpoly.news.ring_buffer import NewsItem, NewsRingBuffer
+from openpoly.news.ws_client import OnItemHook
 from openpoly.sections.news_source.tradingnews_ws import (
     TradingNewsWSConfig,
     TradingNewsWSSource,
@@ -114,18 +115,18 @@ class NewsSourceManager:
         self._first_msg_pending: bool = False
         # Pipeline hook is wired in main.py's lifespan (v7) — forwards each
         # fresh NewsItem to the orchestrator queue. Sync, must be non-blocking.
-        self._pipeline_hook: Callable[[NewsItem], None] | None = None
+        self._pipeline_hook: OnItemHook | None = None
         # Persistence hook (B2) — the write-behind writer's enqueue. Sync,
         # non-blocking; independent of the pipeline hook.
-        self._news_persist: Callable[[NewsItem], None] | None = None
+        self._news_persist: OnItemHook | None = None
 
     # ---------- Event recording (sync; called from ws_client) ----------
 
-    def set_pipeline_hook(self, hook: Callable[[NewsItem], None] | None) -> None:
+    def set_pipeline_hook(self, hook: OnItemHook | None) -> None:
         """Install / clear the pipeline forwarding hook. Called by lifespan."""
         self._pipeline_hook = hook
 
-    def set_news_persist(self, hook: Callable[[NewsItem], None] | None) -> None:
+    def set_news_persist(self, hook: OnItemHook | None) -> None:
         """Install / clear the persistence hook — the write-behind writer's
         ``enqueue``. Wired by lifespan; ``None`` in tests."""
         self._news_persist = hook

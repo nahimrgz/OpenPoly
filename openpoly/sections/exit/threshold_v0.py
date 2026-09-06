@@ -287,6 +287,7 @@ class ThresholdExitV0:
         )
         out_sl = inst.run(SectionInput(tick_type="hard", payload=loss))
         assert out_sl.verdict == "ok"
+        assert isinstance(out_sl.payload, CloseIntent)
         assert out_sl.payload.trigger == "stop_loss"
 
         # Peak drawdown: ran up to 0.70 (peak gain $4.00 ≥ the $3.00 arming
@@ -304,6 +305,7 @@ class ThresholdExitV0:
         )
         out_pd = trailing.run(SectionInput(tick_type="hard", payload=retrace))
         assert out_pd.verdict == "ok"
+        assert isinstance(out_pd.payload, CloseIntent)
         assert out_pd.payload.trigger == "peak_drawdown"
 
         # A single tick down from the same peak must NOT close — this is the

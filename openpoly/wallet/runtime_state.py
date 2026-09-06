@@ -157,6 +157,7 @@ class RuntimeState:
         )
 
     def _save(self) -> None:
+        updated_at = time.time()
         payload = {
             "wallet": (
                 None
@@ -167,14 +168,14 @@ class RuntimeState:
                 }
             ),
             "exec_mode": self._exec_mode,
-            "updated_at": time.time(),
+            "updated_at": updated_at,
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2))
         os.chmod(tmp, _DESIRED_MODE)
         os.replace(tmp, self._path)
-        self._updated_at = payload["updated_at"]
+        self._updated_at = updated_at
 
 
 # Module-level singleton — production code imports this; tests new their own.
