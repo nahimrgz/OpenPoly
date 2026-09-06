@@ -94,11 +94,13 @@ The exit section's trailing lock needs a peak; the monitor is what tracks it.
 > position's peak is rebuilt from the `order_book_snapshot` table before the
 > first tick — with the same depth guard, so a recorded dust bid cannot seed an
 > unreachable peak. A trailing lock that armed on an earlier run-up therefore
-> survives a restart, as long as the snapshot retention window
-> (`order_book_retention_days`, 7 days by default) still covers the position's
-> lifetime; a position older than the window re-seeds at the first mark
-> observed after the restart. The stop-loss is unaffected either way. The
-> wiring is pinned by a regression test in `tests/test_exit_monitor.py`.
+> survives a restart. What bounds it is the snapshot retention window
+> (`order_book_retention_days`, 7 days by default): the prune deletes rows by
+> age alone, so a position older than the window still rebuilds its peak from
+> the snapshots that survive, and only a run-up that happened before the window
+> is forgotten. A position with no surviving snapshot at all falls back to its
+> own entry price. The stop-loss is unaffected either way, and the wiring is
+> pinned by a regression test in `tests/test_exit_monitor.py`.
 
 ### Dust skip
 

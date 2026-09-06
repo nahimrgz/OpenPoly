@@ -489,8 +489,9 @@ class ExitMonitor(TickLoopMonitor):
         finally:
             clear_closing(held.position_id)
         if result.filled and result.price is not None:
-            # A sell is not necessarily the whole position: an IOC order fills
-            # against whatever depth was resting, and ``record_sell`` reduces
+            # A sell is not necessarily the whole position: a crossing order
+            # takes whatever depth was resting and the executor cancels the
+            # rest rather than leaving it on the book; ``record_sell`` reduces
             # ``qty`` and leaves the row open when the residual is still
             # sellable. Realizing against ``held.qty`` therefore booked the
             # gain on shares that were never sold.
