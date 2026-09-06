@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 from py_clob_client_v2.http_helpers import helpers as _v2_helpers
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,13 @@ def _patched_request(*args, **kwargs):
 
 _v2_helpers.request = _patched_request
 
+# The SDK's module-level client carries no explicit timeout (see the budget
+# comment near ``_PERSIST_ATTEMPTS`` in live_executor.py) — pin one so a
+# single request stays bounded regardless of what httpx's own default does
+# in some future version.
+_patched_http_client = httpx.Client(http2=True, timeout=httpx.Timeout(5.0))
+_v2_helpers._http_client = _patched_http_client
+
 
 # Re-export the SDK surface so callers don't risk importing the SDK without
 # the patch in place.
@@ -75,6 +83,7 @@ from py_clob_client_v2.clob_types import (  # noqa: E402
     OrderPayload,
     PartialCreateOrderOptions,
 )
+from py_clob_client_v2.exceptions import PolyApiException  # noqa: E402
 
 __all__ = [
     "AssetType",
@@ -84,5 +93,6 @@ __all__ = [
     "OrderPayload",
     "OrderType",
     "PartialCreateOrderOptions",
+    "PolyApiException",
     "Side",
 ]

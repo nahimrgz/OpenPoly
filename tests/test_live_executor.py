@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
+from openpoly.execution.clob_patch import PolyApiException
 from openpoly.execution.live_executor import (
     _PERSIST_ATTEMPTS,
     _SETTLE_ATTEMPTS,
@@ -96,6 +97,7 @@ class _FakeClob:
         self.allowance_updates: list[Any] = []
         self.cancelled: list[str] = []
         self.order_reads = 0
+        self.balance_reads = 0
 
     def create_and_post_order(self, order_args, options, order_type):
         self.posted.append({"order_args": order_args, "options": options, "order_type": order_type})
@@ -135,6 +137,7 @@ class _FakeClob:
     def get_balance_allowance(self, params):
         # CONDITIONAL queries return the CTF balance the SELL poll checks;
         # COLLATERAL queries don't matter for these tests.
+        self.balance_reads += 1
         if self._ctf_balance_sequence is not None:
             val = self._next(self._ctf_balance_sequence)
             if isinstance(val, Exception):
@@ -359,6 +362,30 @@ def test_buy_clob_network_error_skips(store) -> None:
     r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.filled is False
     assert r.skip_reason == "live_error:ConnectionError"
+
+
+def test_buy_definitive_rejection_skips_without_balance_confirm(store) -> None:
+    """A ``PolyApiException`` with a non-None ``status_code`` means the venue
+    answered and refused (bad precision, min-size, closed-only mode, ...) —
+    the order was never placed, so there is nothing to confirm via the CTF
+    balance. Polling it anyway would be dishonest about what happened and
+    would burn the lost-response recovery path on an order that never
+    existed."""
+    m = _market("m1")
+    _populate(m)
+    exc = PolyApiException(error_msg={"error": "invalid price"})
+    exc.status_code = 400
+    clob = _FakeClob(exception=exc)
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason is not None
+    assert r.skip_reason.startswith("live_rejected:")
+    assert "invalid price" in r.skip_reason
+    # Exactly the pre-order baseline read (1) — no additional balance-confirm
+    # poll must follow a definitive rejection.
+    assert clob.balance_reads == 1
+    assert store.get_open_position("m1", "yes") is None
 
 
 def test_buy_response_success_false_skips(store) -> None:
@@ -656,10 +683,15 @@ def test_sell_network_error_partial_drop_records_partial(store, caplog) -> None:
 _LOST_RESPONSE = {
     "exception": {"exception": RuntimeError("request exception")},
     "non-json-200": {"order_response": ""},
+    # A transport failure (DNS, connection refused, timeout, ...): the SDK's
+    # own signal for this is a ``PolyApiException`` with ``status_code is
+    # None`` — must NOT be mistaken for a definitive rejection.
+    "poly-api-transport": {"exception": PolyApiException(error_msg="Request exception!")},
 }
 _LOST_RESPONSE_REASON = {
     "exception": "live_error:RuntimeError",
     "non-json-200": "live_error:TypeError",
+    "poly-api-transport": "live_error:PolyApiException",
 }
 
 
@@ -703,6 +735,31 @@ def test_sell_lost_response_without_balance_change_skips(store, case) -> None:
     assert r.skip_reason == _LOST_RESPONSE_REASON[case]
     rec = store.get_position(held.position_id)
     assert rec is not None and rec.status == "open"
+
+
+def test_sell_definitive_rejection_skips_without_balance_confirm(store) -> None:
+    """Mirrors the buy case: a ``PolyApiException`` with a non-None
+    ``status_code`` means the venue refused the sell outright — no balance
+    poll, and the position must stay open exactly as it was, not recorded as
+    (even partially) sold."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = _held(store, m)
+    exc = PolyApiException(error_msg="closed only mode")
+    exc.status_code = 400
+    clob = _FakeClob(exception=exc)
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0)
+    assert r.filled is False
+    assert r.skip_reason is not None
+    assert r.skip_reason.startswith("live_rejected:")
+    assert "closed only mode" in r.skip_reason
+    # Exactly the CTF-sync poll's one read — no additional balance-confirm
+    # poll must follow a definitive rejection.
+    assert clob.balance_reads == 1
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open"
+    assert rec.qty == pytest.approx(held.qty)
 
 
 def test_sell_partial_fill_keeps_position_open(store) -> None:

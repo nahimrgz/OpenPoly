@@ -74,6 +74,7 @@ from openpoly.execution.clob_patch import (
     OrderPayload,
     OrderType,
     PartialCreateOrderOptions,
+    PolyApiException,
     Side,
 )
 from openpoly.execution.sizing import (
@@ -1108,6 +1109,18 @@ class LiveExecutor:
                 neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, PolyApiException) and exc.status_code is not None:
+                # The venue answered and refused (bad precision, min-size,
+                # closed-only mode, ...): the order was never placed, so
+                # there is nothing to confirm via the CTF balance.
+                logger.warning(
+                    "buy rejected for %s %s: status=%s body=%s",
+                    intent.market_id,
+                    intent.side,
+                    exc.status_code,
+                    exc.error_msg,
+                )
+                return ExecResult.skip(f"live_rejected:{exc.error_msg}")
             # The order may have filled despite the lost response — confirm via
             # the balance before declaring failure (R5 at-least-once).
             fill = self._fill_from_balance(confirm, side="buy", size=size, limit_price=intent.price)
@@ -1208,6 +1221,16 @@ class LiveExecutor:
                 neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, PolyApiException) and exc.status_code is not None:
+                # The venue answered and refused: the order was never placed,
+                # so there is nothing to confirm via the CTF balance.
+                logger.warning(
+                    "sell rejected for position %d: status=%s body=%s",
+                    position.position_id,
+                    exc.status_code,
+                    exc.error_msg,
+                )
+                return ExecResult.skip(f"live_rejected:{exc.error_msg}")
             # The order may have filled despite the lost response — confirm via
             # the balance before declaring failure (R5 at-least-once).
             fill = self._fill_from_balance(confirm, side="sell", size=size, limit_price=bid_price)

@@ -11,6 +11,7 @@ No network: the transport is replaced with a recorder.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 from py_clob_client_v2.http_helpers import helpers as v2_helpers
 
@@ -26,6 +27,19 @@ def test_sdk_request_is_the_patched_callable() -> None:
     """Import order matters: everything else imports the SDK through this
     module precisely so the helper is already swapped."""
     assert v2_helpers.request is clob_patch._patched_request
+
+
+def test_sdk_http_client_is_the_patched_client_with_an_explicit_timeout() -> None:
+    """The SDK's module-level ``_http_client`` carries no timeout of its own
+    (see live_executor.py's budget comment near ``_PERSIST_ATTEMPTS``) — this
+    patch replaces it with one that pins the timeout explicitly, so a future
+    httpx default change can't silently widen every request's worst case.
+
+    Identity, not just the value, is asserted: httpx's own current default
+    already happens to be 5.0, so a value-only check would pass even without
+    the patch in place."""
+    assert v2_helpers._http_client is clob_patch._patched_http_client
+    assert v2_helpers._http_client.timeout == httpx.Timeout(5.0)
 
 
 # ---------- header injection ----------
@@ -150,6 +164,7 @@ def test_reexports_cover_every_symbol_the_executor_imports() -> None:
         "OrderPayload",
         "OrderType",
         "PartialCreateOrderOptions",
+        "PolyApiException",
         "Side",
     }
     assert expected <= set(clob_patch.__all__)
@@ -203,6 +218,10 @@ def test_reexports_are_the_sdk_objects() -> None:
 
     assert clob_patch.ClobClient is py_clob_client_v2.ClobClient
     assert clob_patch.Side is py_clob_client_v2.Side
+
+    from py_clob_client_v2.exceptions import PolyApiException
+
+    assert clob_patch.PolyApiException is PolyApiException
 
 
 @pytest.mark.parametrize("name", ["OrderArgs", "OrderPayload"])
