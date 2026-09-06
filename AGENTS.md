@@ -25,12 +25,13 @@ yarn lint         # eslint
 yarn test         # vitest run
 ```
 
-CI enforces (must pass to merge): **`pytest` + `ruff check`** (backend) and
-**`yarn typecheck` + `yarn lint` + `yarn test`** (frontend). Two backend steps are
-**informational only** (`continue-on-error`): **`ruff format --check`** — a local
-convention, run it before pushing, but ruff-version drift must not block merges —
-and **`mypy`**, whose lenient config lives in `pyproject.toml` under
-`[tool.mypy]`; tighten it first, then promote the step to a gate.
+CI enforces (must pass to merge): **`pytest` + `ruff check` + `ruff format
+--check`** (backend) and **`yarn typecheck` + `yarn lint` + `yarn test`**
+(frontend). Ruff is pinned in `pyproject.toml`, so the format gate cannot drift;
+run `uv run ruff format .` before pushing. One backend step is **informational
+only** (`continue-on-error`): **`mypy`**, whose lenient config lives in
+`pyproject.toml` under `[tool.mypy]`; tighten it first, then promote the step to
+a gate.
 `.pre-commit-config.yaml` runs ruff check + format locally
 (`uv run pre-commit install` to enable).
 
