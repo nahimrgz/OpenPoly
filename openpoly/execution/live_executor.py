@@ -64,6 +64,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
+from sqlalchemy.exc import OperationalError
+
 # Cloudflare patch MUST be applied before any other SDK import. The patch
 # module re-exports the SDK symbols we need so this single import covers
 # both concerns.
@@ -158,19 +160,30 @@ _SETTLE_DEADLINE_S = 8.0
 # order on the book. A match ends the settle only through the size comparison.
 _ORDER_DONE_STATUSES = frozenset({"CANCELED", "CANCELLED"})
 # An on-chain fill is irreversible; persisting it (open for BUY, close for SELL)
-# must survive a transient write failure (locked SQLite, brief error) or the
-# ledger drifts from the wallet: a phantom-open position whose tokens are gone,
-# or tokens no exit monitor manages.
+# must survive a transient write failure (SQLite lock contention, surfaced as
+# ``sqlalchemy.exc.OperationalError``) or the ledger drifts from the wallet: a
+# phantom-open position whose tokens are gone, or tokens no exit monitor
+# manages. Only ``OperationalError`` is retried — see ``_persist_irreversible``.
 _PERSIST_ATTEMPTS = 5
 _PERSIST_SLEEP = 0.5
 # Budget, honestly: the settle loop ends at min(16 attempts, 8 s of wall clock),
 # and is followed by one final order read plus — only when that read fails — the
-# balance-confirm fallback (≈ 4 s of sleeps). With the CTF poll (≈ 4 s) and the
-# persist retries (≈ 2 s) that is ≈ 18 s of waiting worst case, which must stay
-# inside the exit monitor's 30 s in-flight drain (``runtime/exit_monitor.py``
-# INFLIGHT_DRAIN_TIMEOUT_SECONDS). What is NOT bounded here is a single request:
-# each one is limited only by the SDK's httpx default timeout, so the totals hold
-# only as long as that default does — an explicit client timeout is the gap.
+# balance-confirm fallback (≈ 4 s of sleeps). With the CTF poll (≈ 4 s) that is
+# ≈ 16 s of waiting worst case before persisting even starts.
+#
+# The persist retries are NOT the small, cheap term they look like: the engine
+# sets ``PRAGMA busy_timeout=5000`` (``db/engine.py``), so a single locked-DB
+# call can already block up to 5 s inside SQLite before it even raises
+# ``OperationalError``. A full retry budget for that error class is therefore
+# closer to ``_PERSIST_ATTEMPTS × (5 s busy_timeout + _PERSIST_SLEEP)`` ≈ 27.5 s
+# worst case, not "~2 s" — added to the ≈ 16 s above, the true worst case can
+# exceed the exit monitor's 30 s in-flight drain (``runtime/exit_monitor.py``
+# INFLIGHT_DRAIN_TIMEOUT_SECONDS). A permanent failure (``ValueError``,
+# ``IntegrityError``, anything else) pays none of this: ``_persist_irreversible``
+# does not retry it, so it costs one call and no sleep. What is NOT bounded here
+# is a single request: each one is limited only by the SDK's httpx default
+# timeout, so the totals hold only as long as that default does — an explicit
+# client timeout is the gap.
 
 _T = TypeVar("_T")
 
@@ -897,13 +910,18 @@ class LiveExecutor:
         return _Fill(qty=qty, price=price, tx_hash=None, order_id=None, resting=resting)
 
     def _persist_irreversible(self, write: Callable[[], _T], *, what: str) -> _T:
-        """Run a ledger write for a fill that already happened on-chain, retrying
-        transient failures; re-raises after the last attempt so the caller can
-        log the loss with its own context."""
+        """Run a ledger write for a fill that already happened on-chain,
+        retrying only ``OperationalError`` (transient: SQLite lock
+        contention) up to ``_PERSIST_ATTEMPTS`` times; re-raises after the
+        last attempt so the caller can log the loss with its own context.
+        Any other exception — ``IntegrityError`` (a genuine duplicate),
+        ``ValueError`` (a logic-level problem), or anything else — can never
+        be fixed by retrying, so it propagates immediately on the first
+        attempt with no sleep."""
         for attempt in range(_PERSIST_ATTEMPTS - 1):
             try:
                 return write()
-            except Exception as exc:  # noqa: BLE001 — on-chain fill already happened
+            except OperationalError as exc:
                 logger.warning("%s attempt %d failed: %s; retrying", what, attempt + 1, exc)
                 time.sleep(_PERSIST_SLEEP)
         return write()

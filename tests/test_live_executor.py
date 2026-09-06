@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.execution.clob_patch import PolyApiException
 from openpoly.execution.live_executor import (
     _PERSIST_ATTEMPTS,
+    _PERSIST_SLEEP,
     _SETTLE_ATTEMPTS,
     _SETTLE_SLEEP,
     LiveExecutor,
@@ -234,12 +237,20 @@ def no_sleep(monkeypatch) -> list[float]:
     return calls
 
 
+def _locked_db_error() -> OperationalError:
+    """The one class of failure ``_persist_irreversible`` treats as transient:
+    SQLite lock contention surfaced through SQLAlchemy."""
+    return OperationalError("stmt", {}, Exception("database is locked"))
+
+
 class _FlakyStore:
     """Wraps a PortfolioStore; ``method`` raises for the first ``fail_times``
-    calls (``None`` = always), then delegates. Models a transient DB write
-    failure *after* an irreversible on-chain fill — the window that leaves the
-    ledger out of step with the wallet if the persist is dropped instead of
-    retried."""
+    calls (``None`` = always), then delegates. Defaults to modeling a
+    transient DB write failure (``OperationalError``, e.g. SQLite lock
+    contention) *after* an irreversible on-chain fill — the window that
+    leaves the ledger out of step with the wallet if the persist is dropped
+    instead of retried. Pass ``make_exc`` to model a permanent failure
+    (``ValueError``, ``IntegrityError``) instead."""
 
     def __init__(
         self,
@@ -247,12 +258,12 @@ class _FlakyStore:
         *,
         method: str,
         fail_times: int | None,
-        exc: type[Exception] = RuntimeError,
+        make_exc: Callable[[], Exception] = _locked_db_error,
     ) -> None:
         self._inner = inner
         self._method = method
         self._remaining = fail_times
-        self._exc = exc
+        self._make_exc = make_exc
         self.attempts = 0
 
     def __getattr__(self, name: str) -> Any:
@@ -265,7 +276,7 @@ class _FlakyStore:
         if self._remaining is None or self._remaining > 0:
             if self._remaining is not None:
                 self._remaining -= 1
-            raise self._exc("database is locked")
+            raise self._make_exc()
         return getattr(self._inner, self._method)(*args, **kwargs)
 
 
@@ -800,9 +811,10 @@ def test_sell_partial_fill_keeps_position_open(store) -> None:
 
 
 def test_sell_retries_db_close_after_transient_failure(store) -> None:
-    """The on-chain sell is irreversible. A transient close_position failure must
-    be retried so the position is not left phantom-open while its tokens are
-    already gone — the root cause of stuck phantom-open positions."""
+    """The on-chain sell is irreversible. A transient close_position failure
+    (``OperationalError``) must be retried so the position is not left
+    phantom-open while its tokens are already gone — the root cause of stuck
+    phantom-open positions."""
     m = _market("m1")
     _populate(m, _book(m.yes_token_id, bid=0.55))
     held = store.open_position(
@@ -1338,7 +1350,8 @@ def test_buy_unusable_usdc_amount_records_shares_at_limit_price(store, making) -
 
 def test_buy_retries_open_position_after_transient_failure(store) -> None:
     """The on-chain buy is irreversible, exactly like the sell: a locked SQLite
-    file must not turn a confirmed fill into an unmanaged wallet position."""
+    file (``OperationalError``) must not turn a confirmed fill into an
+    unmanaged wallet position."""
     m = _market("m1")
     _populate(m)
     flaky = _FlakyStore(store, method="open_position", fail_times=2)
@@ -1350,6 +1363,8 @@ def test_buy_retries_open_position_after_transient_failure(store) -> None:
 
 
 def test_buy_open_position_persistent_failure_never_raises(store, caplog) -> None:
+    """Even a persistently locked DB (every attempt raises ``OperationalError``)
+    exhausts the retry budget and then skips instead of raising."""
     m = _market("m1")
     _populate(m)
     flaky = _FlakyStore(store, method="open_position", fail_times=None)
@@ -1357,8 +1372,52 @@ def test_buy_open_position_persistent_failure_never_raises(store, caplog) -> Non
     with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
         r = le.execute_buy(_intent(), news_id="n", ts=1.0)
     assert r.filled is False
-    assert r.skip_reason == "open_persist_failed:RuntimeError"
+    assert r.skip_reason == "open_persist_failed:OperationalError"
     assert flaky.attempts == _PERSIST_ATTEMPTS
+    assert "CRITICAL" in caplog.text
+
+
+def test_buy_open_position_value_error_is_not_retried(store, no_sleep, caplog) -> None:
+    """A ``ValueError`` (logic-level: position not found / already closed) is
+    permanent — retrying it can never succeed, so it must propagate on the
+    very first attempt with no sleep in between."""
+    m = _market("m1")
+    _populate(m)
+    flaky = _FlakyStore(
+        store,
+        method="open_position",
+        fail_times=None,
+        make_exc=lambda: ValueError("position already open"),
+    )
+    le = LiveExecutor(portfolio=flaky, clob_client=_FakeClob())
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "open_persist_failed:ValueError"
+    assert flaky.attempts == 1
+    assert _PERSIST_SLEEP not in no_sleep
+    assert "CRITICAL" in caplog.text
+
+
+def test_buy_open_position_integrity_error_is_not_retried(store, no_sleep, caplog) -> None:
+    """An ``IntegrityError`` (a genuine duplicate against the partial unique
+    index) fails identically on every attempt — retrying it is pointless, so
+    it must propagate on the very first attempt with no sleep in between."""
+    m = _market("m1")
+    _populate(m)
+    flaky = _FlakyStore(
+        store,
+        method="open_position",
+        fail_times=None,
+        make_exc=lambda: IntegrityError("stmt", {}, Exception("UNIQUE constraint failed")),
+    )
+    le = LiveExecutor(portfolio=flaky, clob_client=_FakeClob())
+    with caplog.at_level("ERROR", logger="openpoly.execution.live_executor"):
+        r = le.execute_buy(_intent(), news_id="n", ts=1.0)
+    assert r.filled is False
+    assert r.skip_reason == "open_persist_failed:IntegrityError"
+    assert flaky.attempts == 1
+    assert _PERSIST_SLEEP not in no_sleep
     assert "CRITICAL" in caplog.text
 
 
