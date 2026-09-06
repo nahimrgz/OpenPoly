@@ -84,6 +84,50 @@ def test_parse_skips_malformed_levels():
     assert book.bids == [(0.5, 10.0)]
 
 
+def test_parse_drops_out_of_band_levels():
+    raw = {
+        "bids": [
+            {"price": "1.5", "size": "10"},  # above domain — garbage
+            {"price": "0.0", "size": "10"},  # at the edge — never rests on the CLOB
+            {"price": "-0.1", "size": "10"},  # negative
+            {"price": "0.5", "size": "10"},  # valid
+        ],
+        "asks": [
+            {"price": "1.0", "size": "5"},  # at the edge
+            {"price": "0.6", "size": "5"},  # valid
+        ],
+    }
+    book = parse_clob_book(raw, "t")
+    assert book.bids == [(0.5, 10.0)]
+    assert book.asks == [(0.6, 5.0)]
+
+
+def test_parse_drops_non_positive_size():
+    raw = {
+        "bids": [
+            {"price": "0.5", "size": "0"},
+            {"price": "0.4", "size": "-3"},
+            {"price": "0.3", "size": "10"},
+        ],
+        "asks": [],
+    }
+    book = parse_clob_book(raw, "t")
+    assert book.bids == [(0.3, 10.0)]
+
+
+def test_parse_drops_nan_and_inf_levels():
+    raw = {
+        "bids": [
+            {"price": "nan", "size": "10"},
+            {"price": "0.5", "size": "inf"},
+            {"price": "0.4", "size": "10"},
+        ],
+        "asks": [],
+    }
+    book = parse_clob_book(raw, "t")
+    assert book.bids == [(0.4, 10.0)]
+
+
 def test_parse_timestamp_absent_falls_back_to_now():
     before = time.time()
     book = parse_clob_book({"bids": [], "asks": []}, "t")

@@ -10,6 +10,7 @@ that must fail closed when absent.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,13 +77,20 @@ def _parse_json_array(value: Any) -> list[Any]:
 
 
 def _to_float(value: Any) -> float | None:
-    """Coerce to float; None on failure. Bools are rejected (not numbers here)."""
+    """Coerce to float; None on failure. Bools are rejected (not numbers here).
+
+    NaN and +/-inf are rejected too: they parse as valid floats but are not
+    valid market data, and left unchecked they propagate into arithmetic
+    (division, comparisons) that silently produces NaN/inf downstream instead
+    of failing where the bad value was read.
+    """
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -212,7 +220,12 @@ def _book_levels(raw: Any, *, descending: bool, depth: int) -> list[tuple[float,
 
     Sorts explicitly rather than trusting the API's array order: bids
     best-first = price descending, asks best-first = price ascending. Then
-    trims to ``depth`` levels. Malformed levels are dropped.
+    trims to ``depth`` levels. Malformed levels are dropped, and so are
+    out-of-domain ones: a price must fall strictly between 0 and 1 (a
+    Polymarket price is a probability; the CLOB never lets an order rest at
+    the 0/1 edges) and size must be positive. Left unchecked, a garbage price
+    like 1.5 sorts to the front of the book and a 0.0 ask becomes a
+    ZeroDivisionError wherever a caller divides notional by it.
     """
     if not isinstance(raw, list):
         return []
@@ -223,6 +236,8 @@ def _book_levels(raw: Any, *, descending: bool, depth: int) -> list[tuple[float,
         price = _to_float(level.get("price"))
         size = _to_float(level.get("size"))
         if price is None or size is None:
+            continue
+        if not (0.0 < price < 1.0) or size <= 0.0:
             continue
         levels.append((price, size))
     levels.sort(key=lambda pair: pair[0], reverse=descending)
