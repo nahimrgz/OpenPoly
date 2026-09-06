@@ -3,7 +3,7 @@ name = "openpoly"
 version = "0.0.0"
 description = "Experimental Polymarket live-trading system."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 license = { text = "MIT" }
 authors = [{ name = "KoNananachan" }]
 maintainers = [{ name = "KoNananachan" }]
@@ -30,7 +30,7 @@ Issues = "https://github.com/KoNananachan/OpenPoly/issues"
 
 [dependency-groups]
 dev = [
-    "mypy>=1.14",
+    "mypy==2.3.1",
     "pre-commit>=4.0",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
@@ -52,7 +52,7 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py313"
 
 # A blocking CI gate (see .github/workflows/ci.yml): the tree type-checks clean
 # and must stay that way. Still lenient on purpose about third-party stubs —
@@ -62,7 +62,7 @@ target-version = "py312"
 # only bring continue-on-error back. Tightening beyond that is a deliberate
 # later step.
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.13"
 files = ["openpoly"]
 ignore_missing_imports = true
 warn_unused_configs = true
