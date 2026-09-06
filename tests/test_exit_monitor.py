@@ -726,7 +726,17 @@ async def test_observe_book_with_no_bids_is_a_noop() -> None:
 async def test_execute_sell_runs_off_the_event_loop() -> None:
     """The live executor sleeps seconds inside execute_sell (CTF cache polling
     + close-persist retries). It must run in a worker thread, or every other
-    runtime task — WS reconnects, market polls — stalls behind it."""
+    runtime task — WS reconnects, market polls — stalls behind it.
+
+    This races a fast heartbeat against the slow call instead of counting
+    heartbeats within a fixed wall-clock window: counting is inherently racy
+    under CPU load/scheduling jitter (a loaded box can starve the heartbeat
+    below whatever minimum count the assertion picks, even though the loop
+    never actually stalled). Racing sidesteps that — the heartbeat's 10ms
+    timer only fails to win against the slow call's 300ms sleep if the event
+    loop was genuinely blocked for the whole 300ms, a 30x margin no ordinary
+    scheduling jitter can close.
+    """
     import time as _time
 
     class _SlowExecutor(_FakeExecutor):
@@ -737,24 +747,32 @@ async def test_execute_sell_runs_off_the_event_loop() -> None:
     market_source_manager.store.set_order_books([_book("t1", bid=0.55)])
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), _SlowExecutor())
 
-    beats = 0
+    first_beat = asyncio.Event()
 
     async def _heartbeat() -> None:
-        nonlocal beats
         while True:
             await asyncio.sleep(0.01)
-            beats += 1
+            first_beat.set()
 
     hb = asyncio.create_task(_heartbeat())
+    tick_task = asyncio.create_task(m._tick_once())
+    beat_task = asyncio.create_task(first_beat.wait())
     try:
-        await m._tick_once()
+        done, _pending = await asyncio.wait(
+            {tick_task, beat_task}, timeout=2.0, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert beat_task in done, (
+            "event loop stalled: no heartbeat ticked before execute_sell returned"
+        )
+        assert tick_task not in done, (
+            "execute_sell's blocking sleep finished before a single heartbeat could "
+            "tick — the sell ran on the event loop, not a worker thread"
+        )
+        await tick_task
     finally:
         hb.cancel()
-        with __import__("contextlib").suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError):
             await hb
-    # ~30 beats are possible in 0.3s; anything above a handful proves the loop
-    # kept running while execute_sell slept.
-    assert beats >= 10, f"event loop stalled: only {beats} heartbeats"
 
 
 async def test_closed_position_stops_being_observed() -> None:
