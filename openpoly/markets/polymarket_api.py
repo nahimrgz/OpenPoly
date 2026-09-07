@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
@@ -263,7 +263,7 @@ async def fetch_wallet_positions_value(
 
 async def _get_json(
     url: str,
-    params: dict[str, str | list[str]],
+    params: Mapping[str, str | list[str]],
     timeout: float,
     client: httpx.AsyncClient | None,
 ) -> Any:

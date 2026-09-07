@@ -7,7 +7,7 @@
 
   <a href="https://konananachan.github.io/OpenPoly/"><img src="https://img.shields.io/badge/live-demo-8957e5?style=for-the-badge&logo=react&logoColor=white" alt="Live demo" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT" /></a>
-  <img src="https://img.shields.io/badge/python-3.12-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/python-3.13-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/node-%E2%89%A520-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node >= 20" />
   <img src="https://img.shields.io/badge/mode-paper%20by%20default-2ea043?style=for-the-badge" alt="Paper mode by default" />
   <br />

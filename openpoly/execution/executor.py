@@ -9,11 +9,11 @@ no fees (zero-fee rule). At micro-stakes ($5-$50) an order rarely walks past
 level 1, so this is not worth more.
 
 Paper is the simulation of live, so the two must not disagree about *whether*
-an order is fillable or *how much* of it fills: order size and the minimum
-notional come from ``openpoly.execution.sizing``, the same module the live
-executor sizes through, and a partial sell leaves the remainder open exactly
-as the live path does. What stays paper-only is the price model (level-1, no
-venue round-trip).
+an order is fillable or *how much* of it fills: the price band, order size,
+and the minimum notional all come from ``openpoly.execution.sizing``, the same
+module the live executor sizes through, and a partial sell leaves the
+remainder open exactly as the live path does. What stays paper-only is the
+price model (level-1, no venue round-trip).
 
 Entry and exit share this one executor so their accounting is symmetric. It
 reads the live ``MarketStore`` singleton directly (same pattern as the
@@ -25,7 +25,12 @@ from __future__ import annotations
 
 import logging
 
-from openpoly.execution.sizing import MIN_NOTIONAL_USD, dust_remainder_skip, quantize_size
+from openpoly.execution.sizing import (
+    MIN_NOTIONAL_USD,
+    dust_remainder_skip,
+    in_price_band,
+    quantize_size,
+)
 from openpoly.execution.types import ExecResult
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.portfolio import CloseReason, HeldPosition, PortfolioStore
@@ -56,8 +61,9 @@ class PaperExecutor:
         """Open a position from an entry ``OrderIntent`` at the level-1 ask.
 
         Skips (nothing opened) when the market / order book / ask liquidity is
-        missing, when a position for (market, side) is already open, or when the
-        fill notional rounds to dust.
+        missing, when a position for (market, side) is already open, when the
+        ask is outside the venue's price band, or when the fill notional
+        rounds to dust.
         """
         catalog = market_source_manager.store
         market = catalog.get(intent.market_id)
@@ -78,8 +84,11 @@ class PaperExecutor:
             return ExecResult.skip("position_exists")
 
         ask_price, ask_size = book.asks[0]
+        if not in_price_band(ask_price):
+            return ExecResult.skip("price_out_of_band")
+
         # Depth cap, then the venue's whole-share + min-notional rules — the
-        # same two gates the live executor applies before it signs an order.
+        # same gates the live executor applies before it signs an order.
         qty = quantize_size(min(intent.qty, ask_size), ask_price)
         if qty * ask_price < MIN_NOTIONAL_USD:
             return ExecResult.skip("dust")
@@ -125,10 +134,10 @@ class PaperExecutor:
         Selling the whole position into a bid that could not hold it was the
         one place paper reported an exit price live could never have realized.
 
-        Skips when the order book / bid liquidity is missing, and when what is
-        left is below one share — that remainder is not a placeable order but
-        is still worth its resolution price, so it stays open (see
-        ``dust_remainder_skip``).
+        Skips when the order book / bid liquidity is missing, when the bid is
+        outside the venue's price band, and when what is left is below one
+        share — that remainder is not a placeable order but is still worth its
+        resolution price, so it stays open (see ``dust_remainder_skip``).
         """
         book = market_source_manager.store.get_order_book(position.token_id)
         if book is None:
@@ -137,6 +146,9 @@ class PaperExecutor:
             return ExecResult.skip("no_bid_liquidity")
 
         bid_price, bid_size = book.bids[0]
+        if not in_price_band(bid_price):
+            return ExecResult.skip("price_out_of_band")
+
         qty = quantize_size(min(position.qty, bid_size), bid_price)
         if qty <= 0:
             # Either the position itself is a sub-share remainder (not

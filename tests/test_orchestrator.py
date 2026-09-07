@@ -473,6 +473,42 @@ async def test_entry_fill_skipped_records_skip_reason() -> None:
     assert e_entry.position_id is None
 
 
+async def test_entry_fill_ledger_persist_failure_records_error() -> None:
+    # The on-chain buy filled but the ledger write permanently failed —
+    # execute_buy never raises for this (it's a skip, not an exception), so
+    # verdict must be flipped to "error" here rather than staying "ok".
+    orch, _, _, e_log = make_orchestrator(
+        executor=FakeExecutor(filled=False, skip_reason="open_persist_failed:IntegrityError")
+    )
+    await orch.start()
+    try:
+        orch.enqueue(_item("n1"))
+        await _drain(orch)
+    finally:
+        await orch.stop()
+    e_entry = e_log.entries()[0]
+    assert e_entry.verdict == "error"
+    assert e_entry.fill_status == "open_persist_failed:IntegrityError"
+    assert e_entry.error is not None
+    assert "open_persist_failed:IntegrityError" in e_entry.error
+
+
+async def test_entry_fill_benign_skip_stays_ok() -> None:
+    # A routine, expected skip (e.g. dust, price out of band) must not be
+    # mistaken for the ledger-persist-failure gap above.
+    orch, _, _, e_log = make_orchestrator(executor=FakeExecutor(filled=False, skip_reason="dust"))
+    await orch.start()
+    try:
+        orch.enqueue(_item("n1"))
+        await _drain(orch)
+    finally:
+        await orch.stop()
+    e_entry = e_log.entries()[0]
+    assert e_entry.verdict == "ok"
+    assert e_entry.fill_status == "dust"
+    assert e_entry.error is None
+
+
 async def test_executor_raises_logs_error() -> None:
     bad = FakeExecutor(raise_exc=RuntimeError("database is locked"))
     orch, _, _, e_log = make_orchestrator(executor=bad)

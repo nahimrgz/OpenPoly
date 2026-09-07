@@ -353,6 +353,16 @@ class PipelineOrchestrator:
                     position_id = result.position_id
                 else:
                     fill_status = result.skip_reason
+                    # Most skip reasons are benign, routine strategy outcomes
+                    # (dust, price out of band, position already open) and
+                    # keep verdict="ok". The one exception: the on-chain buy
+                    # already filled but the ledger write permanently failed
+                    # (``_persist_open``'s never-raise contract turns that
+                    # into a skip, not an exception) — the wallet now holds
+                    # tokens no ledger row manages, which is not benign.
+                    if fill_status is not None and fill_status.startswith("open_persist_failed:"):
+                        verdict = "error"
+                        error = f"on-chain buy filled but ledger write failed: {fill_status}"
             except Exception as exc:  # noqa: BLE001 — DB write may raise
                 verdict = "error"
                 error = repr(exc)[:200]

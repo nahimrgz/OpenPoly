@@ -3,15 +3,22 @@ executors share, plus the paper/live parity it is meant to guarantee."""
 
 from __future__ import annotations
 
+import time
+import types
+
 import pytest
 
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.execution import PaperExecutor
+from openpoly.execution import live_executor as le_mod
 from openpoly.execution.live_executor import LiveExecutor
 from openpoly.execution.sizing import (
+    MAX_TOKEN_PRICE,
     MIN_NOTIONAL_USD,
     MIN_SELL_SHARES,
+    MIN_TOKEN_PRICE,
     SIZE_DECIMALS,
+    in_price_band,
     is_dust_qty,
     quantize_size,
 )
@@ -66,6 +73,29 @@ def test_portfolio_sellable_minimum_tracks_the_venue_size_precision() -> None:
     assert MIN_SELLABLE_QTY == pytest.approx(10**-SIZE_DECIMALS)
 
 
+# ---------- in_price_band ----------
+
+
+def test_in_price_band_true_at_the_exact_edges() -> None:
+    """0.0001 and 0.9999 are the finest tick's own edges — venue-legal."""
+    assert MIN_TOKEN_PRICE == pytest.approx(0.0001)
+    assert MAX_TOKEN_PRICE == pytest.approx(0.9999)
+    assert in_price_band(MIN_TOKEN_PRICE) is True
+    assert in_price_band(MAX_TOKEN_PRICE) is True
+
+
+def test_in_price_band_false_just_outside_the_edges() -> None:
+    """0.00005 and 0.99995 are legal book prices in (0, 1) but the SDK's own
+    order builder would refuse them — the tighter venue band must reject
+    both."""
+    assert in_price_band(0.00005) is False
+    assert in_price_band(0.99995) is False
+
+
+def test_in_price_band_false_for_none() -> None:
+    assert in_price_band(None) is False
+
+
 # ---------- paper / live parity ----------
 
 
@@ -75,6 +105,22 @@ def _isolate_market_store():
     market_source_manager.store = MarketStore()
     yield
     market_source_manager.store = saved
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch) -> None:
+    """Rebind ``live_executor``'s own ``time`` name to a fake namespace so any
+    retry loop a test drives through ``LiveExecutor`` (settle retries, CTF
+    polls, persist retries) never sleeps for real.
+
+    Rebinding the module-level name, rather than patching attributes on the
+    real ``time`` module object, keeps this scoped to ``live_executor.py``:
+    ``sys.modules["time"]`` — the one real module every other piece of code in
+    the process sees — is left untouched. See ``tests/test_live_executor.py``'s
+    identically-shaped ``no_sleep`` fixture for the full rationale.
+    """
+    fake_time = types.SimpleNamespace(sleep=lambda *_a, **_k: None, monotonic=time.monotonic)
+    monkeypatch.setattr(le_mod, "time", fake_time)
 
 
 @pytest.fixture
@@ -118,7 +164,7 @@ class _NoopClob:
         return {"balance": str(self._ctf_balance_raw), "allowances": {}}
 
     def cancel_order(self, payload):
-        return None
+        return {"canceled": [payload.orderID], "not_canceled": {}}
 
     def get_order(self, order_id):
         return {"size_matched": "0"}

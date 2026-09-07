@@ -10,8 +10,10 @@
 # Run manually:  uv run pre-commit run --all-files
 #
 # Formatting is a fix-in-place hook: it rewrites the file and fails the commit,
-# so you re-stage and commit again. That mirrors CI, where the format check is
-# informational and only lint is a gate.
+# so you re-stage and commit again. CI runs the same check with --check, where
+# both lint and format block the merge. mypy is a CI gate too but is not wired
+# here: it type-checks the whole package, which is too slow for a per-commit
+# hook — run `uv run mypy` before pushing.
 repos:
   - repo: local
     hooks:

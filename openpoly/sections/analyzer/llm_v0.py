@@ -23,12 +23,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from openpoly.embedding.models import MarketCandidates
 from openpoly.llm import LLMClient, LLMError
+from openpoly.llm.client import ToolDefinition
 from openpoly.sections._base import SectionInput, SectionOutput
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,7 @@ mere topical overlap. You are not given the current market price — do not
 anchor to one; reason from the news and the market's resolution question."""
 
 
-SUBMIT_ANALYSIS_TOOL: dict[str, Any] = {
+SUBMIT_ANALYSIS_TOOL: ToolDefinition = {
     "name": "submit_analysis",
     "description": ("Report which candidate market the news moves and its YES probability."),
     "input_schema": {

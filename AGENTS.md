@@ -13,7 +13,7 @@ uv run uvicorn openpoly.api.main:app
 # Tests
 uv run pytest
 
-# Lint / format (line length 100, target py312)
+# Lint / format (line length 100, target py313)
 uv run ruff check .
 uv run ruff format .
 
@@ -25,12 +25,11 @@ yarn lint         # eslint
 yarn test         # vitest run
 ```
 
-CI enforces (must pass to merge): **`pytest` + `ruff check`** (backend) and
-**`yarn typecheck` + `yarn lint` + `yarn test`** (frontend). Two backend steps are
-**informational only** (`continue-on-error`): **`ruff format --check`** — a local
-convention, run it before pushing, but ruff-version drift must not block merges —
-and **`mypy`**, whose lenient config lives in `pyproject.toml` under
-`[tool.mypy]`; tighten it first, then promote the step to a gate.
+CI enforces (must pass to merge): **`pytest` + `ruff check` + `ruff format
+--check` + `mypy`** (backend) and **`yarn typecheck` + `yarn lint` + `yarn
+test`** (frontend). Ruff is pinned in `pyproject.toml`, so the format gate
+cannot drift; run `uv run ruff format .` before pushing. Run `uv run mypy`
+before pushing too (config: `[tool.mypy]` in `pyproject.toml`).
 `.pre-commit-config.yaml` runs ruff check + format locally
 (`uv run pre-commit install` to enable).
 

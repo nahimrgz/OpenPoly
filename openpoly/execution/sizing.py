@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from openpoly.execution.types import ExecResult
 
@@ -40,6 +40,29 @@ logger = logging.getLogger(__name__)
 
 # $1.00 server minimum + a $0.10 buffer for price/rounding wiggle.
 MIN_NOTIONAL_USD = 1.10
+
+# py-clob-client-v2's own rule is symmetric: a price must satisfy
+# ``tick_size <= price <= 1 - tick_size``, not merely land in (0, 1]. No quote
+# is finer than the smallest tick in the SDK's ROUNDING_CONFIG (0.0001), so
+# that tick's own upper edge is ``1 - 0.0001 = 0.9999`` — a price above it,
+# like 0.99995, is one the venue's own order builder would refuse even though
+# it is a perfectly legal book price. A price outside [MIN, MAX] is not a
+# price the venue could have produced — it is a wrong-scale or garbage field,
+# and booking one as a cost basis poisons every later exit decision.
+MIN_TOKEN_PRICE = 0.0001
+MAX_TOKEN_PRICE = 1.0 - MIN_TOKEN_PRICE
+
+
+def in_price_band(price: float | None) -> TypeGuard[float]:
+    """A price the venue could have produced: inside the band, which no
+    non-finite value can be.
+
+    Both executors book through this one predicate — paper as well as live —
+    so paper never simulates a fill live would have refused (see the module
+    docstring).
+    """
+    return price is not None and MIN_TOKEN_PRICE <= price <= MAX_TOKEN_PRICE
+
 
 # ``RoundConfig.size`` is 2 for every tick size in the SDK's ROUNDING_CONFIG,
 # so the tick size is not needed to floor a size. ``MIN_SELLABLE_QTY`` in

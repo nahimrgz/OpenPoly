@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal, TYPE_CHECKING
+from typing import Callable, Literal, NamedTuple, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -472,6 +472,14 @@ def _market_side_has_history(
     return False
 
 
+class _ClosedOutcome(NamedTuple):
+    """PositionRecord narrowed to closed rows (closed_at / realized_pnl non-None)."""
+
+    closed_at: float
+    realized_pnl: float
+    close_reason: str | None
+
+
 def _kill_switch_check(
     portfolio: "PortfolioStore",
     config: "EdgeThresholdConfig",
@@ -485,7 +493,11 @@ def _kill_switch_check(
     matching kill_* config field; the first one tripped wins (consecutive
     → daily → drawdown), no full scan after a hit."""
     positions = portfolio.list_positions(limit=500)
-    closed = [p for p in positions if p.closed_at is not None and p.realized_pnl is not None]
+    closed = [
+        _ClosedOutcome(p.closed_at, p.realized_pnl, p.close_reason)
+        for p in positions
+        if p.closed_at is not None and p.realized_pnl is not None
+    ]
     if not closed:
         return None
     now_ts = now if now is not None else time.time()
