@@ -1,19 +1,20 @@
-"""WS client live test using a local websockets.serve fixture.
-
-Verifies happy-path message ingest and reconnect-after-drop. Kept fast
-(sub-second) so it runs as part of the default pytest suite.
+"""Tests for NewsWSClient: message ingest, reconnect/backoff behavior,
+event lifecycle, and parsing. Uses a mix of a real local websockets.serve
+fixture and a fake-transport monkeypatch, depending on what each test
+needs to control.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import websockets
 from websockets.exceptions import InvalidStatus
 
 from openpoly.news.ring_buffer import NewsRingBuffer
-from openpoly.news.ws_client import NewsWSClient, default_parse
+from openpoly.news.ws_client import NewsWSClient, OnEventHook, default_parse
 
 
 async def _wait_for(predicate, *, timeout: float = 3.0, interval: float = 0.05) -> bool:
@@ -95,14 +96,12 @@ class _FakeConnection:
         return message
 
 
-async def test_ws_client_reconnects_after_drop(monkeypatch) -> None:
-    """Reconnect-after-drop through a fake ``websockets.connect`` (same
-    substitution mechanism as ``test_on_event_auth_fail_stops_loop`` below)
-    instead of a real socket, so the client's own retry loop is verified
-    without depending on OS-level TCP/accept timing.
-    """
-    from openpoly.news import ws_client as wsc_mod
-
+async def _fake_reconnect_twice(
+    monkeypatch, *, on_event: OnEventHook | None = None
+) -> NewsRingBuffer:
+    """Patches ``websockets.connect`` with a fake that records each 1-based
+    connect attempt onto a queue, runs the client until two attempts have
+    happened, then stops it. Returns the ring buffer."""
     attempts: asyncio.Queue[int] = asyncio.Queue()
     count = 0
 
@@ -115,7 +114,7 @@ async def test_ws_client_reconnects_after_drop(monkeypatch) -> None:
         )
         return _FakeConnection(message)
 
-    monkeypatch.setattr(wsc_mod.websockets, "connect", connect)
+    monkeypatch.setattr(websockets, "connect", connect)
     buf = NewsRingBuffer(maxsize=10)
     client = NewsWSClient(
         endpoint="ws://fake",
@@ -123,6 +122,7 @@ async def test_ws_client_reconnects_after_drop(monkeypatch) -> None:
         initial_backoff=0.05,
         max_backoff=0.1,
         ping_interval=None,
+        on_event=on_event,
     )
     task = asyncio.create_task(client.run_forever())
     try:
@@ -137,7 +137,59 @@ async def test_ws_client_reconnects_after_drop(monkeypatch) -> None:
         except asyncio.CancelledError:
             pass
 
+    return buf
+
+
+async def test_ws_client_reconnects_after_clean_close(monkeypatch) -> None:
+    """Reconnect-after-clean-close through a fake ``websockets.connect``
+    instead of a real socket, so the client's own retry loop is verified
+    without depending on OS-level TCP/accept timing."""
+    buf = await _fake_reconnect_twice(monkeypatch)
     assert len(buf) >= 2
+
+
+async def test_ws_client_backs_off_after_connection_drop(monkeypatch) -> None:
+    """A connection that dies (``OSError``/``ConnectionClosed``/
+    ``WebSocketException``) takes the exponential-backoff branch: unlike the
+    clean-close path (immediate retry), the next connect attempt waits
+    ~``initial_backoff`` instead of firing right away, and the emitted
+    ``disconnected`` detail is the exception text rather than the clean-close
+    message."""
+    attempts: asyncio.Queue[float] = asyncio.Queue()
+
+    def connect(*_args: object, **_kwargs: object):
+        attempts.put_nowait(time.monotonic())
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    events: list[tuple[str, str | None]] = []
+    buf = NewsRingBuffer(maxsize=10)
+    backoff = 0.05
+    client = NewsWSClient(
+        endpoint="ws://fake",
+        buffer=buf,
+        initial_backoff=backoff,
+        max_backoff=0.1,
+        ping_interval=None,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+    task = asyncio.create_task(client.run_forever())
+    try:
+        first = await asyncio.wait_for(attempts.get(), timeout=1.0)
+        second = await asyncio.wait_for(attempts.get(), timeout=3.0)
+    finally:
+        client.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    elapsed = second - first
+    assert elapsed >= backoff, f"expected >={backoff}s backoff, second attempt after {elapsed:.3f}s"
+    disconnect_ev = next((e for e in events if e[0] == "disconnected"), None)
+    assert disconnect_ev is not None, f"expected a disconnected event, got {[e[0] for e in events]}"
+    assert disconnect_ev[1] == "connection reset"
 
 
 def test_default_parse_malformed_json() -> None:
@@ -199,38 +251,11 @@ async def test_on_event_lifecycle_emits_connecting_connected_message_disconnecte
     assert msg_ev[1] == "x1"
 
 
-async def test_on_event_reconnect_attempt_after_drop() -> None:
+async def test_on_event_reconnect_attempt_after_drop(monkeypatch) -> None:
     """The first attempt emits ``connecting``; subsequent attempts emit
     ``reconnect_attempt`` so the manager can keep them out of the event ring."""
-    counter = {"connect": 0}
-
-    async def handler(ws):
-        counter["connect"] += 1
-        await ws.close()
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        port = server.sockets[0].getsockname()[1]
-        events: list[tuple[str, str | None]] = []
-        buf = NewsRingBuffer(maxsize=10)
-        client = NewsWSClient(
-            endpoint=f"ws://127.0.0.1:{port}",
-            buffer=buf,
-            initial_backoff=0.05,
-            max_backoff=0.1,
-            ping_interval=None,
-            on_event=lambda k, d: events.append((k, d)),
-        )
-        task = asyncio.create_task(client.run_forever())
-        try:
-            ok = await _wait_for(lambda: counter["connect"] >= 2, timeout=3.0)
-            assert ok, f"expected ≥2 connects, got {counter['connect']}"
-        finally:
-            client.stop()
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    events: list[tuple[str, str | None]] = []
+    await _fake_reconnect_twice(monkeypatch, on_event=lambda k, d: events.append((k, d)))
 
     kinds = [e[0] for e in events]
     assert kinds.count("connecting") == 1
@@ -240,8 +265,6 @@ async def test_on_event_reconnect_attempt_after_drop() -> None:
 async def test_on_event_auth_fail_stops_loop(monkeypatch) -> None:
     """InvalidStatus during upgrade should emit auth_fail and halt the loop."""
     import types as _types
-
-    from openpoly.news import ws_client as wsc_mod
 
     class FakeConnectCM:
         async def __aenter__(self):
@@ -253,7 +276,7 @@ async def test_on_event_auth_fail_stops_loop(monkeypatch) -> None:
     def fake_connect(*_args, **_kwargs):
         return FakeConnectCM()
 
-    monkeypatch.setattr(wsc_mod.websockets, "connect", fake_connect)
+    monkeypatch.setattr(websockets, "connect", fake_connect)
 
     events: list[tuple[str, str | None]] = []
     buf = NewsRingBuffer(maxsize=10)
