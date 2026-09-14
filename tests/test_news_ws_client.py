@@ -66,44 +66,76 @@ async def test_ws_client_receives_messages() -> None:
     assert ids == ["n0", "n1", "n2"]
 
 
-async def test_ws_client_reconnects_after_drop() -> None:
-    counter = {"connect": 0}
+class _FakeConnection:
+    """Stands in for ``async with websockets.connect(...) as ws``: an async
+    context manager wrapping an async iterator over one pre-scripted message.
 
-    async def handler(ws):
-        counter["connect"] += 1
-        await ws.send(
-            json.dumps(
-                {
-                    "id": f"hit{counter['connect']}",
-                    "content": "x",
-                    "urgency": "low",
-                    "published_at": 0.0,
-                }
-            )
-        )
-        await ws.close()
+    Ends the ``async for raw in ws:`` loop in ``_consume`` the same way a
+    real clean server-side close does on the installed websockets version —
+    silently, no exception — rather than raising ``ConnectionClosed``
+    (confirmed empirically against the installed build).
+    """
 
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        port = server.sockets[0].getsockname()[1]
-        buf = NewsRingBuffer(maxsize=10)
-        client = NewsWSClient(
-            endpoint=f"ws://127.0.0.1:{port}",
-            buffer=buf,
-            initial_backoff=0.05,
-            max_backoff=0.1,
-            ping_interval=None,
+    def __init__(self, message: str) -> None:
+        self._message: str | None = message
+
+    async def __aenter__(self) -> "_FakeConnection":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    def __aiter__(self) -> "_FakeConnection":
+        return self
+
+    async def __anext__(self) -> str:
+        if self._message is None:
+            raise StopAsyncIteration
+        message, self._message = self._message, None
+        return message
+
+
+async def test_ws_client_reconnects_after_drop(monkeypatch) -> None:
+    """Reconnect-after-drop through a fake ``websockets.connect`` (same
+    substitution mechanism as ``test_on_event_auth_fail_stops_loop`` below)
+    instead of a real socket, so the client's own retry loop is verified
+    without depending on OS-level TCP/accept timing.
+    """
+    from openpoly.news import ws_client as wsc_mod
+
+    attempts: asyncio.Queue[int] = asyncio.Queue()
+    count = 0
+
+    def connect(*_args: object, **_kwargs: object) -> _FakeConnection:
+        nonlocal count
+        count += 1
+        attempts.put_nowait(count)
+        message = json.dumps(
+            {"id": f"hit{count}", "content": "x", "urgency": "low", "published_at": 0.0}
         )
-        task = asyncio.create_task(client.run_forever())
+        return _FakeConnection(message)
+
+    monkeypatch.setattr(wsc_mod.websockets, "connect", connect)
+    buf = NewsRingBuffer(maxsize=10)
+    client = NewsWSClient(
+        endpoint="ws://fake",
+        buffer=buf,
+        initial_backoff=0.05,
+        max_backoff=0.1,
+        ping_interval=None,
+    )
+    task = asyncio.create_task(client.run_forever())
+    try:
+        first = await asyncio.wait_for(attempts.get(), timeout=1.0)
+        second = await asyncio.wait_for(attempts.get(), timeout=1.0)
+        assert (first, second) == (1, 2), f"expected attempts (1, 2), got ({first}, {second})"
+    finally:
+        client.stop()
+        task.cancel()
         try:
-            ok = await _wait_for(lambda: counter["connect"] >= 2, timeout=3.0)
-            assert ok, f"expected ≥2 connects, got {counter['connect']}"
-        finally:
-            client.stop()
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            await task
+        except asyncio.CancelledError:
+            pass
 
     assert len(buf) >= 2
 
