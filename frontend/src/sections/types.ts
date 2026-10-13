@@ -25,4 +25,6 @@ export type RuntimeCatalogEntry = {
   requires: Capability[]
   param_schema: Record<string, unknown>
   source: 'builtin' | 'user'
+  /** The impl the backend runs for this type (several may be registered). */
+  active?: boolean
 }

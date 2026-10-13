@@ -426,3 +426,80 @@ async def test_settlement_log_returns_appended_entries() -> None:
     assert body["entries"][1]["reason"] == "no_outcome_prices"
     assert body["counters"]["ok"] == 1
     assert body["counters"]["skip"] == 1
+
+
+def _reasoning_call(news_id: str, reasoning: str | None) -> AnalyzerCall:
+    return AnalyzerCall(
+        ts=1.0,
+        news_id=news_id,
+        news_content_preview="x",
+        urgency="high",
+        verdict="ok",
+        p_model=0.6,
+        confidence="medium",
+        market_id="m1",
+        latency_ms=1,
+        reasoning=reasoning,
+    )
+
+
+async def test_analyzer_log_list_omits_reasoning_but_flags_it() -> None:
+    """Regression: every 3s poll shipped every entry's (up to 2000-char)
+    reasoning. The list carries a flag; the text is fetched per entry."""
+    analyzer_log.append(_reasoning_call("n1", "Q1: new. " * 100))
+    analyzer_log.append(_reasoning_call("n2", None))
+    client = await _client()
+    try:
+        r = await client.get("/api/analyzer/log")
+    finally:
+        await client.aclose()
+    entries = r.json()["entries"]
+    assert all("reasoning" not in e for e in entries)
+    assert [e["has_reasoning"] for e in entries] == [True, False]
+
+
+async def test_analyzer_reasoning_endpoint_returns_one_entry() -> None:
+    analyzer_log.append(_reasoning_call("n1", "old"))
+    analyzer_log.append(_reasoning_call("n1", "Q1: new."))
+    client = await _client()
+    try:
+        r = await client.get("/api/analyzer/log/n1/reasoning")
+        missing = await client.get("/api/analyzer/log/nope/reasoning")
+    finally:
+        await client.aclose()
+    assert r.status_code == 200
+    assert r.json() == {"news_id": "n1", "reasoning": "Q1: new."}
+    assert missing.status_code == 404
+
+
+async def test_analyzer_reasoning_is_looked_up_by_ts_and_news_id() -> None:
+    """Regression: the lookup by news_id alone returned the newest call's
+    reasoning, which can be another call of the same news item."""
+    import dataclasses
+
+    analyzer_log.append(dataclasses.replace(_reasoning_call("n1", "first call"), ts=10.5))
+    analyzer_log.append(dataclasses.replace(_reasoning_call("n1", "second call"), ts=20.25))
+    client = await _client()
+    try:
+        first = await client.get("/api/analyzer/log/n1/reasoning", params={"ts": 10.5})
+        second = await client.get("/api/analyzer/log/n1/reasoning", params={"ts": 20.25})
+        gone = await client.get("/api/analyzer/log/n1/reasoning", params={"ts": 99.0})
+    finally:
+        await client.aclose()
+    assert first.json()["reasoning"] == "first call"
+    assert second.json()["reasoning"] == "second call"
+    assert gone.status_code == 404
+
+
+async def test_analyzer_reasoning_reports_truncation() -> None:
+    import dataclasses
+
+    analyzer_log.append(
+        dataclasses.replace(_reasoning_call("n1", "x" * 2000), reasoning_truncated=True)
+    )
+    client = await _client()
+    try:
+        r = await client.get("/api/analyzer/log/n1/reasoning", params={"ts": 1.0})
+    finally:
+        await client.aclose()
+    assert r.json()["truncated"] is True

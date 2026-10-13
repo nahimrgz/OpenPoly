@@ -461,9 +461,11 @@ def test_calibration_empty_returns_every_bucket(env) -> None:
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["sample_size"] == 0
-    assert len(body["buckets"]) == 5
-    assert body["buckets"][0]["lower"] == 0.5
+    # Full held-side range since entry v1 can hold a side rated below 0.5.
+    assert len(body["buckets"]) == 10
+    assert body["buckets"][0]["lower"] == 0.0
     assert body["buckets"][0]["win_rate"] is None
+    assert body["excluded"] == 0
 
 
 def test_calibration_reports_closed_labelled_positions(env) -> None:

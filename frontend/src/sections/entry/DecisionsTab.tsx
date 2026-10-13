@@ -136,6 +136,14 @@ function DecisionsTimeline({ entries }: { entries: EntryLogEntry[] }) {
             >
               {formatRelativeAgo(e.ts)}
             </span>
+            {e.book_age_s != null && (
+              <span
+                className="text-neutral-600"
+                title="Age of the order book the decision read"
+              >
+                book {e.book_age_s.toFixed(1)}s
+              </span>
+            )}
             <span className="text-neutral-600">{e.latency_ms}ms</span>
           </div>
           {e.ar_p_model !== null && (

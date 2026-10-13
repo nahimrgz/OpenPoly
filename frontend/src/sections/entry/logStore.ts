@@ -18,6 +18,8 @@ export type EntryLogEntry = {
   reason: string | null
   latency_ms: number
   error: string | null
+  /** Age (s) of the oldest order book the decision read; absent on older backends. */
+  book_age_s?: number | null
 }
 
 export type EntryLogResponse = {

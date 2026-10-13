@@ -230,7 +230,7 @@ def test_close_registers_and_releases_the_claim(env) -> None:
     seen: list[bool] = []
 
     class _Watching:
-        def execute_sell(self, position, *, close_reason, ts, trigger=None):
+        def execute_sell(self, position, *, close_reason, ts, trigger=None, floor_price=None):
             seen.append(is_closing(position.position_id))
             return Executor(store).execute_sell(
                 position, close_reason=close_reason, ts=ts, trigger=trigger
@@ -249,7 +249,7 @@ def test_close_releases_the_claim_when_the_sell_raises(env) -> None:
     held = _open(store)
 
     class _Boom:
-        def execute_sell(self, position, *, close_reason, ts, trigger=None):
+        def execute_sell(self, position, *, close_reason, ts, trigger=None, floor_price=None):
             raise RuntimeError("clob down")
 
     portfolio_routes.executor = _Boom()
@@ -383,7 +383,7 @@ async def test_close_keeps_the_event_loop_running(env, monkeypatch, route: str) 
     held = _open(store)
 
     class _Blocking:
-        def execute_sell(self, position, *, close_reason, ts, trigger=None):  # noqa: ANN001, ANN201
+        def execute_sell(self, position, *, close_reason, ts, trigger=None, floor_price=None):  # noqa: ANN001, ANN201
             _time.sleep(0.3)
             return ExecResult.ok(price=0.55, qty=position.qty, position_id=position.position_id)
 

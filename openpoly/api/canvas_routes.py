@@ -31,12 +31,17 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from openpoly.api.security import require_api_token
+from openpoly.runtime.active_sections import build_section
 from openpoly.runtime.canvas_store import (
     load_template_with_rev,
     save_template,
 )
 
 logger = logging.getLogger(__name__)
+
+# Sections owned by the orchestrator, rebuilt on a canvas edit (the exit
+# section is rebuilt too, but swapped into ExitMonitor separately).
+_ORCHESTRATOR_SECTION_TYPES = ("embedding", "analyzer", "entry")
 
 router = APIRouter(tags=["canvas"])
 
@@ -189,15 +194,13 @@ async def _apply_canvas_reload(
                 return dict(cfg) if isinstance(cfg, dict) else {}
         return {}
 
-    # Sections owned by the orchestrator.
-    orchestrator_section_types = ("embedding", "analyzer", "entry")
-    for stype in orchestrator_section_types:
+    for stype in _ORCHESTRATOR_SECTION_TYPES:
         old_cfg = _section_config(old_template, stype)
         new_cfg = _section_config(new_template, stype)
         if old_cfg == new_cfg:
             continue
         try:
-            new_inst = _build_section(stype)
+            new_inst = build_section(stype)
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to build %s section", stype)
             continue
@@ -206,6 +209,22 @@ async def _apply_canvas_reload(
             logger.info("canvas reload: rebuilt %s section", stype)
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to swap %s section", stype)
+
+    # News source: the orchestrator re-checks news age against its freshness
+    # window at decision time; it resolves that once at build, so re-read it.
+    # The running WS client filters arrivals with the same window: apply it
+    # there too, live (other news_source fields still need a restart).
+    if _section_config(old_template, "news_source") != _section_config(new_template, "news_source"):
+        try:
+            orch_mod.reload_news_max_age()
+            from openpoly.news.manager import manager as news_source_manager
+            from openpoly.sections.news_source.tradingnews_ws import TradingNewsWSConfig
+
+            news_cfg = orch_mod._canvas_config(TradingNewsWSConfig, "news_source")
+            news_source_manager.apply_freshness_seconds(news_cfg.freshness_seconds)
+            logger.info("canvas reload: applied news freshness window")
+        except Exception:  # noqa: BLE001
+            logger.exception("canvas reload: failed to apply news freshness window")
 
     # Database section: held by DatabaseManager, not the orchestrator, and its
     # one tunable (retention) is re-read by the prune loop each sweep — so a
@@ -229,7 +248,7 @@ async def _apply_canvas_reload(
     new_exit = _section_config(new_template, "exit")
     if old_exit != new_exit:
         try:
-            new_exit_inst = _build_section("exit")
+            new_exit_inst = build_section("exit")
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to build exit section")
             return
@@ -238,47 +257,3 @@ async def _apply_canvas_reload(
             logger.info("canvas reload: rebuilt exit section")
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to swap exit section")
-
-
-def _build_section(section_type: str):
-    """Build a fresh section instance from the canvas-resolved config."""
-    from openpoly.runtime.orchestrator import _canvas_config
-
-    if section_type == "embedding":
-        from openpoly.sections.embedding.minilm_v0 import (
-            EmbeddingFilterConfig,
-            EmbeddingFilterV0,
-        )
-
-        return EmbeddingFilterV0(_canvas_config(EmbeddingFilterConfig, "embedding"))
-    if section_type == "analyzer":
-        from openpoly.sections.analyzer.llm_v0 import (
-            LLMAnalyzerConfig,
-            LLMAnalyzerV0,
-        )
-
-        return LLMAnalyzerV0(_canvas_config(LLMAnalyzerConfig, "analyzer"))
-    if section_type == "entry":
-        from openpoly.execution import executor
-        from openpoly.sections.entry.edge_threshold_v0 import (
-            EdgeThresholdConfig,
-            EdgeThresholdEntryV0,
-        )
-
-        # Mirror orchestrator's portfolio_provider closure — entry asks for
-        # the live PortfolioStore lazily because the executor's portfolio is
-        # attached after sections are constructed.
-        return EdgeThresholdEntryV0(
-            _canvas_config(EdgeThresholdConfig, "entry"),
-            portfolio_provider=lambda: getattr(
-                getattr(executor, "_paper", executor), "_portfolio", None
-            ),
-        )
-    if section_type == "exit":
-        from openpoly.sections.exit.threshold_v0 import (
-            ThresholdExitConfig,
-            ThresholdExitV0,
-        )
-
-        return ThresholdExitV0(_canvas_config(ThresholdExitConfig, "exit"))
-    raise ValueError(f"unknown section_type: {section_type}")

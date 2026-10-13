@@ -239,3 +239,70 @@ def test_buy_without_signals_leaves_them_null(store) -> None:
     r = Executor(store).execute_buy(_intent(qty=20.0), news_id="n1", ts=1.0)
     rec = store.get_position(r.position_id)
     assert rec is not None and rec.entry_p_model is None
+
+
+# ---------- sell sweep down to the decision's mark (floor_price) ----------
+
+
+def _thin_top_book(token_id: str) -> OrderBook:
+    """A realistic thin top: 3 + 2 probe shares above real size at 0.33."""
+    return OrderBook(
+        token_id=token_id,
+        ts=1.0,
+        bids=[(0.48, 3.0), (0.40, 2.0), (0.33, 50.0)],
+        asks=[(0.50, 100.0)],
+    )
+
+
+def _open(store, qty: float = 20.0):
+    return store.open_position(
+        market_id="m1",
+        side="yes",
+        token_id="yes-m1",
+        condition_id="0xm1",
+        price=0.50,
+        qty=qty,
+        ts=1.0,
+        news_id="n",
+    )
+
+
+def test_sell_sweeps_levels_down_to_the_floor_at_vwap(store) -> None:
+    """Regression: the sell took min(qty, level-1 size) at the level-1 bid —
+    3 of 20 shares at 0.48 — and left the rest for another tick, though the
+    decision was made at the 0.33 mark."""
+    _populate(_market(), _thin_top_book("yes-m1"))
+    held = _open(store)
+    r = Executor(store).execute_sell(held, close_reason="stop_loss", ts=2.0, floor_price=0.33)
+    assert r.filled
+    assert r.qty == 20.0
+    assert r.price == pytest.approx((3 * 0.48 + 2 * 0.40 + 15 * 0.33) / 20)
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "closed"
+
+
+def test_sell_never_goes_below_the_floor(store) -> None:
+    _populate(_market(), _thin_top_book("yes-m1"))
+    held = _open(store)
+    r = Executor(store).execute_sell(held, close_reason="stop_loss", ts=2.0, floor_price=0.40)
+    assert r.filled
+    assert r.qty == 5.0  # 0.48 x3 + 0.40 x2; nothing at 0.33
+    assert r.price == pytest.approx((3 * 0.48 + 2 * 0.40) / 5)
+    rec = store.get_position(held.position_id)
+    assert rec is not None and rec.status == "open" and rec.qty == pytest.approx(15.0)
+
+
+def test_sell_floor_above_the_best_bid_still_sells_level_one(store) -> None:
+    """The book fell since the decision: fail toward closing at level 1."""
+    _populate(_market(), _thin_top_book("yes-m1"))
+    held = _open(store)
+    r = Executor(store).execute_sell(held, close_reason="stop_loss", ts=2.0, floor_price=0.60)
+    assert r.filled
+    assert (r.qty, r.price) == (3.0, 0.48)
+
+
+def test_sell_without_floor_keeps_level_one_behavior(store) -> None:
+    _populate(_market(), _thin_top_book("yes-m1"))
+    held = _open(store)
+    r = Executor(store).execute_sell(held, close_reason="manual", ts=2.0)
+    assert (r.qty, r.price) == (3.0, 0.48)

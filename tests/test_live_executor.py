@@ -2885,3 +2885,65 @@ def test_buy_partial_fill_that_may_rest_is_flagged_on_the_fill_path(store) -> No
     assert r.filled is True
     assert r.qty == pytest.approx(4.0)
     assert r.resting_order_id == "0x1"
+
+
+def test_sell_limit_is_the_decision_mark_when_below_the_best_bid(store) -> None:
+    """A crossing SELL limit at the exit decision's mark sweeps every bid level
+    down to it; only the limit price changes (same GTC order, same size)."""
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = store.open_position(
+        market_id="m1",
+        side="yes",
+        token_id=m.yes_token_id,
+        condition_id=m.condition_id,
+        price=0.60,
+        qty=10.0,
+        ts=100.0,
+        news_id="n",
+    )
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xSELL",
+            "status": "matched",
+            "makingAmount": "10.0",
+            "takingAmount": "5.0",
+            "transactionsHashes": ["0xSTX"],
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    r = le.execute_sell(held, close_reason="stop_loss", ts=200.0, floor_price=0.50)
+    assert r.filled
+    args = clob.posted[0]["order_args"]
+    assert args.price == pytest.approx(0.50)
+    assert args.size == pytest.approx(10.0)
+    assert str(clob.posted[0]["order_type"]).endswith("GTC")
+
+
+def test_sell_limit_stays_at_the_best_bid_without_a_lower_floor(store) -> None:
+    m = _market("m1")
+    _populate(m, _book(m.yes_token_id, bid=0.55))
+    held = store.open_position(
+        market_id="m1",
+        side="yes",
+        token_id=m.yes_token_id,
+        condition_id=m.condition_id,
+        price=0.40,
+        qty=10.0,
+        ts=100.0,
+        news_id="n",
+    )
+    clob = _FakeClob(
+        order_response={
+            "success": True,
+            "orderID": "0xSELL",
+            "status": "matched",
+            "makingAmount": "10.0",
+            "takingAmount": "5.5",
+            "transactionsHashes": ["0xSTX"],
+        }
+    )
+    le = LiveExecutor(portfolio=store, clob_client=clob)
+    le.execute_sell(held, close_reason="stop_loss", ts=200.0, floor_price=0.70)
+    assert clob.posted[0]["order_args"].price == pytest.approx(0.55)

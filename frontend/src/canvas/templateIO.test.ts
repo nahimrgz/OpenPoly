@@ -159,7 +159,7 @@ describe('migration chain', () => {
     expect(loaded).toEqual({
       status: 'ok',
       migrated: true,
-      template: { version: 3, name: 'headless', nodes: [], edges: [] },
+      template: { version: TEMPLATE_VERSION, name: 'headless', nodes: [], edges: [] },
     })
   })
 
@@ -409,5 +409,71 @@ describe('pushTemplateToBackend', () => {
       status: 'network_error',
       error: '409 with malformed current_template',
     })
+  })
+})
+
+describe('v3 → v4: entry cooldown', () => {
+  const v3 = (cooldown: number | undefined) => ({
+    version: 3,
+    name: 'v3',
+    nodes: [
+      {
+        id: 'e1',
+        sectionType: 'entry',
+        position: { x: 0, y: 0 },
+        config: cooldown === undefined ? {} : { same_market_cooldown_minutes: cooldown },
+      },
+    ],
+    edges: [],
+  })
+
+  it("lifts v0's persisted cooldown of 0 to v1's 60", () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(v3(0)))
+    const loaded = loadFromStorage()
+    expect(loaded?.status).toBe('ok')
+    if (loaded?.status !== 'ok') return
+    expect(loaded.migrated).toBe(true)
+    expect(loaded.template.version).toBe(TEMPLATE_VERSION)
+    expect(loaded.template.nodes[0].config.same_market_cooldown_minutes).toBe(60)
+  })
+
+  it('keeps a non-zero cooldown and an absent one as they are', () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(v3(15)))
+    const loaded = loadFromStorage()
+    if (loaded?.status !== 'ok') throw new Error('expected ok')
+    expect(loaded.template.nodes[0].config.same_market_cooldown_minutes).toBe(15)
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(v3(undefined)))
+    const absent = loadFromStorage()
+    if (absent?.status !== 'ok') throw new Error('expected ok')
+    expect(absent.template.nodes[0].config.same_market_cooldown_minutes).toBeUndefined()
+  })
+
+  it('treats a 409 carrying a v3 backend canvas as a conflict, migrated', async () => {
+    // Regression: the 409 handler required the current version, so a save
+    // racing a backend canvas still at v3 reported a network error and the
+    // canvas went offline instead of showing the conflict.
+    fetchMock().mockResolvedValue(
+      res(409, { detail: { current_rev: 'sha-theirs', template: v3(0) } }),
+    )
+    const result = await pushTemplateToBackend(
+      { ...v3(15), version: TEMPLATE_VERSION } as Template,
+      'sha-mine',
+    )
+    expect(result.status).toBe('conflict')
+    if (result.status !== 'conflict') return
+    expect(result.current_rev).toBe('sha-theirs')
+    expect(result.current_template.version).toBe(TEMPLATE_VERSION)
+    expect(result.current_template.nodes[0].config.same_market_cooldown_minutes).toBe(60)
+  })
+
+  it('never touches a deliberate 0 on a current-version canvas', () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ ...v3(0), version: TEMPLATE_VERSION }),
+    )
+    const loaded = loadFromStorage()
+    if (loaded?.status !== 'ok') throw new Error('expected ok')
+    expect(loaded.migrated).toBe(false)
+    expect(loaded.template.nodes[0].config.same_market_cooldown_minutes).toBe(0)
   })
 })

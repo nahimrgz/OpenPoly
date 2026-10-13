@@ -13,6 +13,23 @@ the Calls tab.
 Lifecycle is owned by ``PipelineOrchestrator.start() / stop()``. FastAPI
 lifespan wires this in P4 (shutdown order: orchestrator first, manager
 second).
+
+Two freshness guards run between stages, because a serial queue can hold an
+item for minutes and the book sampler polls only every 60s:
+
+* **News age** — the news source drops stale items on *arrival*, but an item
+  can age out while it waits in the queue. ``news_max_age_seconds`` is
+  re-checked when the item is dequeued, before the embedding encode and the
+  LLM call; an item past it is skipped as ``stale_news``.
+* **Book age** — the entry decision (and the paper fill after it) read the
+  cached order book. Before the entry section runs, any book it will read
+  that is older than ``max_book_age_seconds`` is re-fetched through
+  ``book_source``; if that fails the decision is skipped as ``stale_book``.
+  The refreshed book lands in the shared ``MarketStore``, so the entry
+  section, the paper fill and the live order price all read it.
+
+Both guards are opt-in at construction (``None`` disables them) and wired by
+``get_orchestrator``.
 """
 
 from __future__ import annotations
@@ -20,11 +37,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Literal, Protocol, TypeVar
+from collections.abc import Coroutine
+from typing import Any, Literal, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel
 
 from openpoly.embedding.models import MarketCandidates
+from openpoly.llm.client import cost_or_none, int_or
+from openpoly.llm.usage_store import usage_store
+from openpoly.markets.manager import MAX_BOOK_AGE_SECONDS, FreshBookSource
+from openpoly.markets.models import Market
 from openpoly.news.ring_buffer import NewsItem
 from openpoly.runtime.section_log import (
     AnalyzerCall,
@@ -36,11 +58,16 @@ from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.execution import ExecResult, executor
 from openpoly.sections.analyzer.llm_v0 import AnalysisResult
 from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
+from openpoly.sections.entry._types import FreshBooks, candidate_sides
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_QUEUE_MAXSIZE = 100
+
+# Cap on the analyzer reasoning kept per analyzer_log entry (the ring is
+# served whole to a 3s poll).
+MAX_LOGGED_REASONING_CHARS = 2000
 
 
 class _SyncSection(Protocol):
@@ -58,6 +85,15 @@ class _Executor(Protocol):
 State = Literal["stopped", "running"]
 
 
+class _BookCheck(NamedTuple):
+    """Outcome of the entry-time freshness check: the market and the ages of
+    the books (by token id) within budget after the refresh."""
+
+    market: Market
+    fresh: dict[str, float]
+    oldest: float | None  # oldest cached book read, fresh or not (None: no book)
+
+
 class PipelineOrchestrator:
     def __init__(
         self,
@@ -70,6 +106,9 @@ class PipelineOrchestrator:
         analyzer_log_store: SectionLogStore[AnalyzerCall],
         entry_log_store: SectionLogStore[EntryDecision],
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
+        book_source: FreshBookSource | None = None,
+        news_max_age_seconds: float | None = None,
+        max_book_age_seconds: float = MAX_BOOK_AGE_SECONDS,
     ) -> None:
         self._embedding = embedding_section
         self._analyzer = analyzer_section
@@ -78,6 +117,9 @@ class PipelineOrchestrator:
         self._embedding_log = embedding_log_store
         self._analyzer_log = analyzer_log_store
         self._entry_log = entry_log_store
+        self._book_source = book_source
+        self._news_max_age_seconds = news_max_age_seconds
+        self._max_book_age_seconds = max_book_age_seconds
         self._queue: asyncio.Queue[NewsItem] = asyncio.Queue(maxsize=queue_maxsize)
         self._worker_task: asyncio.Task[None] | None = None
         self._state: State = "stopped"
@@ -87,6 +129,9 @@ class PipelineOrchestrator:
         # the old instance alive until that call returns. Next call uses the
         # new instance.
         self._sections_lock = asyncio.Lock()
+        # Fire-and-forget bookkeeping (the ``llm_usage`` insert): referenced
+        # here so a task is not garbage-collected mid-flight, flushed on stop.
+        self._background: set[asyncio.Task[None]] = set()
 
     def __repr__(self) -> str:
         return f"PipelineOrchestrator(state={self._state}, queue_depth={self.queue_depth})"
@@ -110,17 +155,28 @@ class PipelineOrchestrator:
         self._worker_task = asyncio.create_task(self._worker())
 
     async def stop(self) -> None:
-        if self._worker_task is None:
-            self._state = "stopped"
-            return
-        self._worker_task.cancel()
         try:
-            await self._worker_task
-        except asyncio.CancelledError:
-            pass
+            if self._worker_task is None:
+                return
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
         finally:
             self._worker_task = None
             self._state = "stopped"
+            await self.flush_background()
+
+    async def flush_background(self) -> None:
+        """Wait for in-flight bookkeeping tasks (each logs its own failure)."""
+        if self._background:
+            await asyncio.gather(*self._background, return_exceptions=True)
+
+    def _spawn_background(self, coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     # ---------- canvas-sync v2: hot-reload section swap ----------
 
@@ -141,6 +197,10 @@ class PipelineOrchestrator:
                 self._entry = new_inst
             else:
                 raise ValueError(f"unknown orchestrator section_type: {section_type!r}")
+
+    def set_news_max_age(self, seconds: float | None) -> None:
+        """Replace the decision-time news age limit (canvas reload)."""
+        self._news_max_age_seconds = seconds
 
     # ---------- enqueue (sync, called from ws_client hook) ----------
 
@@ -191,7 +251,9 @@ class PipelineOrchestrator:
                 self._queue.task_done()
 
     async def _process(self, item: NewsItem) -> None:
-        candidates = self._run_embedding(item)
+        if self._news_is_stale(item):
+            return
+        candidates = await self._run_embedding(item)
         if candidates is None:
             return
         ar_payload = await self._run_analyzer(item, candidates)
@@ -199,11 +261,54 @@ class PipelineOrchestrator:
             return
         await self._run_entry(item, ar_payload)
 
-    def _run_embedding(self, item: NewsItem) -> MarketCandidates | None:
+    def _news_is_stale(self, item: NewsItem) -> bool:
+        """Re-check the item's age when it is dequeued.
+
+        The news source only checks freshness on arrival; the queue holds up
+        to ``DEFAULT_QUEUE_MAXSIZE`` items drained one LLM call at a time, so
+        an item can be well past the window by its turn. A stale item is
+        logged as an analyzer ``skip`` with reason ``stale_news`` and goes no
+        further (no encode, no LLM call). Returns True when it was skipped.
+        """
+        max_age = self._news_max_age_seconds
+        if max_age is None:
+            return False
+        now = time.time()
+        age = now - item.published_at
+        if age <= max_age:
+            return False
+        logger.info(
+            "orchestrator: skipping news_id=%s — %.0fs old at decision time (max %.0fs)",
+            item.id,
+            age,
+            max_age,
+        )
+        self._analyzer_log.append(
+            AnalyzerCall(
+                ts=now,
+                news_id=item.id,
+                news_content_preview=item.content[:80],
+                urgency=item.urgency,
+                verdict="skip",
+                p_model=None,
+                confidence=None,
+                market_id=None,
+                latency_ms=0,
+                reason=f"stale_news (age {age:.0f}s > {max_age:.0f}s)",
+            )
+        )
+        return True
+
+    async def _run_embedding(self, item: NewsItem) -> MarketCandidates | None:
         """Stage 1 — narrow the market catalog for this news item.
 
         Returns the ``MarketCandidates`` on ok, or None on skip / error (the
         pipeline then stops without calling the analyzer).
+
+        The section encodes the news text with the local sentence-transformer
+        — CPU-bound torch inference, and on the first call after a cache-warm
+        start the model load itself (seconds) — so ``run()`` is offloaded to a
+        worker thread like the other stages.
         """
         ts = time.time()
         start = time.monotonic()
@@ -211,7 +316,9 @@ class PipelineOrchestrator:
         error: str | None
         out: SectionOutput | None
         try:
-            out = self._embedding.run(SectionInput(tick_type="event", payload=item))
+            out = await asyncio.to_thread(
+                self._embedding.run, SectionInput(tick_type="event", payload=item)
+            )
             verdict = str(out.verdict)
             error = out.reason if verdict == "error" else None
         except Exception as exc:  # noqa: BLE001 — section impl is user code
@@ -277,6 +384,8 @@ class PipelineOrchestrator:
         latency_ms = int((time.monotonic() - start) * 1000)
 
         ar = out.payload if out is not None and isinstance(out.payload, AnalysisResult) else None
+        usage = _usage_signal(out)
+        reasoning, reasoning_truncated = _reasoning(out)
 
         self._analyzer_log.append(
             AnalyzerCall(
@@ -295,16 +404,93 @@ class PipelineOrchestrator:
                 # string from the model is also informative ("intentionally
                 # said nothing") — keep it; only None when ar itself is None.
                 rationale=ar.rationale if ar is not None else None,
+                reasoning=reasoning,
+                reasoning_truncated=reasoning_truncated,
+                **_usage_fields(usage),
             )
         )
+        if usage is not None:
+            # Fire-and-forget: a slow insert (a busy SQLite file) must not
+            # delay the entry decision this result feeds.
+            self._spawn_background(
+                self._record_usage(usage, ts=ts, news_id=item.id, verdict=verdict)
+            )
 
         # Only forward to entry on ok + valid AR payload.
         if verdict != "ok" or ar is None:
             return None
         return ar
 
+    async def _record_usage(
+        self, usage: dict[str, Any], *, ts: float, news_id: str, verdict: str
+    ) -> None:
+        """Persist one analyzer call's usage (``llm_usage`` table) off the
+        event loop. Bookkeeping only: a failure is logged, never raised."""
+        try:
+            await asyncio.to_thread(
+                usage_store.record, usage, ts=ts, news_id=news_id, verdict=verdict
+            )
+        except Exception:  # noqa: BLE001 — usage logging must not break the pipeline
+            logger.exception("orchestrator: recording LLM usage for news_id=%s failed", news_id)
+
+    def _entry_tokens(self, market: Market) -> list[str]:
+        """The tokens whose books the entry decision reads: YES only under the
+        entry's ``side_lock``, else both sides (v1 picks the side by comparing
+        both books)."""
+        side_lock = getattr(getattr(self._entry, "config", None), "side_lock", False)
+        sides = candidate_sides(side_lock)
+        return [t for t in (market.token_for(s) for s in sides) if t is not None]
+
+    async def _ensure_fresh_books(self, market_id: str) -> _BookCheck | None:
+        """Refresh any book the entry will read that is older than the budget.
+
+        Returns the market plus the ages of the books that are within budget
+        after the refresh — a side whose refresh failed is simply absent.
+        None when freshness is not checked: no book source, or a market
+        missing from the catalog (left to the entry section, which reports it
+        in its own words).
+        """
+        source = self._book_source
+        if source is None:
+            return None
+        market = source.store.get(market_id)
+        if market is None:
+            return None
+        tokens = self._entry_tokens(market)
+        max_age = self._max_book_age_seconds
+        ages = await source.ensure_fresh(tokens, max_age)
+        fresh: dict[str, float] = {}
+        oldest: float | None = None
+        for token, age in ages.items():
+            if age is not None and (oldest is None or age > oldest):
+                oldest = age
+            if age is not None and age <= max_age:
+                fresh[token] = age
+            else:
+                logger.warning(
+                    "orchestrator: order book %s for %s is stale (%s, max %.1fs)",
+                    token,
+                    market_id,
+                    "missing" if age is None else f"{age:.1f}s",
+                    max_age,
+                )
+        return _BookCheck(market=market, fresh=fresh, oldest=oldest)
+
     async def _run_entry(self, item: NewsItem, ar: AnalysisResult) -> None:
         """Stage 3 — entry decision + execution.
+
+        Before the section runs, the market's order books are brought within
+        the freshness budget (``_ensure_fresh_books``; each book's age is
+        judged from its own fetch against the decision time, so one slow
+        refresh cannot age a sibling). The decision is skipped as
+        ``stale_book`` when no book it would read is fresh, or when the
+        section picks a side whose book could not be refreshed. One failed
+        refresh therefore does not block a trade on the other, fresh side —
+        but a stale side is never traded. A section declaring
+        ``ACCEPTS_FRESH_BOOKS`` (entry v1) is handed the fresh token set
+        (``FreshBooks``) and leaves a stale side out of its side choice, so a
+        stale side cannot win on a cached price and veto the decision; the
+        chosen-side check afterwards keeps the guarantee for any section.
 
         The entry section may do a blocking HTTP fetch (the late-buy veto) and
         the live executor blocks on network + sleeps, so both are offloaded to
@@ -316,20 +502,45 @@ class PipelineOrchestrator:
         reason: str | None
         error: str | None
         intent: OrderIntent | None = None
-        try:
-            out = await asyncio.to_thread(
-                self._entry.run,
-                SectionInput(tick_type="event", payload=ar),
-            )
-            verdict = str(out.verdict)
-            reason = out.reason
-            error = out.reason if verdict == "error" else None
-            if verdict == "ok" and isinstance(out.payload, OrderIntent):
-                intent = out.payload
-        except Exception as exc:  # noqa: BLE001 — section impl is user code
-            verdict = "error"
-            reason = None
-            error = repr(exc)[:200]
+        books = await self._ensure_fresh_books(ar.market_id)
+        book_age_s = books.oldest if books is not None else None
+        if books is not None and not books.fresh:
+            verdict, reason, error = "skip", "stale_book", None
+        else:
+            payload: AnalysisResult | FreshBooks = ar
+            if books is not None and getattr(self._entry, "ACCEPTS_FRESH_BOOKS", False):
+                payload = FreshBooks(analysis=ar, fresh_tokens=frozenset(books.fresh))
+            try:
+                out = await asyncio.to_thread(
+                    self._entry.run,
+                    SectionInput(tick_type="event", payload=payload),
+                )
+                verdict = str(out.verdict)
+                reason = out.reason
+                error = out.reason if verdict == "error" else None
+                if verdict == "ok" and isinstance(out.payload, OrderIntent):
+                    intent = out.payload
+            except Exception as exc:  # noqa: BLE001 — section impl is user code
+                verdict = "error"
+                reason = None
+                error = repr(exc)[:200]
+            if intent is not None and books is not None:
+                chosen = books.market.token_for(intent.side)
+                if chosen is None or chosen not in books.fresh:
+                    logger.warning(
+                        "orchestrator: entry chose %s on %s but its book is stale — skipping",
+                        intent.side,
+                        ar.market_id,
+                    )
+                    intent = None
+                    verdict, reason, error = "skip", "stale_book", None
+                else:
+                    book_age_s = books.fresh[chosen]
+                    logger.info(
+                        "orchestrator: entry decision for %s on a %.1fs-old book",
+                        ar.market_id,
+                        book_age_s,
+                    )
 
         # Execution stage — only when the section produced an OrderIntent.
         fill_status: str | None = None
@@ -387,8 +598,45 @@ class PipelineOrchestrator:
                 fill_price=fill_price,
                 fill_qty=fill_qty,
                 position_id=position_id,
+                book_age_s=book_age_s,
             )
         )
+
+
+def _reasoning(out: SectionOutput | None) -> tuple[str | None, bool]:
+    """The analyzer's written self-check, when its impl produces one — capped
+    so the polled /api/analyzer/log payload stays small — and whether the cap
+    cut it (surfaced so the UI can mark it rather than read as the model
+    stopping mid-thought)."""
+    reasoning = out.signals.get("reasoning") if out is not None else None
+    if not isinstance(reasoning, str) or not reasoning:
+        return None, False
+    return reasoning[:MAX_LOGGED_REASONING_CHARS], len(reasoning) > MAX_LOGGED_REASONING_CHARS
+
+
+def _usage_signal(out: SectionOutput | None) -> dict[str, Any] | None:
+    """The analyzer's ``llm_usage`` signal (analyzer v1), when present."""
+    if out is None:
+        return None
+    usage = out.signals.get("llm_usage")
+    return usage if isinstance(usage, dict) else None
+
+
+def _usage_fields(usage: dict[str, Any] | None) -> dict[str, Any]:
+    """``AnalyzerCall`` keyword fields for one call's usage."""
+    if usage is None:
+        return {}
+
+    model = usage.get("model")
+    return {
+        "llm_model": model if isinstance(model, str) else None,
+        "input_tokens": int_or(usage.get("input_tokens"), None),
+        "output_tokens": int_or(usage.get("output_tokens"), None),
+        "cache_read_input_tokens": int_or(usage.get("cache_read_input_tokens"), None),
+        "cache_creation_input_tokens": int_or(usage.get("cache_creation_input_tokens"), None),
+        "llm_attempts": int_or(usage.get("attempts"), None),
+        "cost_usd": cost_or_none(usage.get("cost_usd")),
+    }
 
 
 # Module-level singleton built lazily so tests can substitute. Real
@@ -418,47 +666,44 @@ def _canvas_config(config_cls: type[_C], section_type: str) -> _C:
         return config_cls()
 
 
+def _news_max_age_seconds() -> float:
+    """The news source's freshness window, re-used as the max age at decision
+    time: the canvas news_source node's ``freshness_seconds``. Resolved from
+    the canvas when the orchestrator is built (and again on a canvas edit,
+    ``reload_news_max_age``). The arrival filter matches it because both
+    autostart (``api.main._news_autostart_config``) and this read the same
+    canvas node; a source started by hand from the Live tab with a different
+    window is the operator's explicit choice."""
+    from openpoly.sections.news_source.tradingnews_ws import TradingNewsWSConfig
+
+    return float(_canvas_config(TradingNewsWSConfig, "news_source").freshness_seconds)
+
+
 def get_orchestrator() -> PipelineOrchestrator:
-    """Lazily build the pipeline orchestrator. Each section's params come from
-    the persisted canvas (``canvas_store``); restart the backend to apply a
-    canvas edit, same as picking up a new section impl."""
+    """Lazily build the pipeline orchestrator. Each section is the active impl
+    (``runtime.active_sections``) with params from the persisted canvas
+    (``canvas_store``); restart the backend to apply a canvas edit, same as
+    picking up a new section impl."""
     global _singleton
     if _singleton is None:
+        from openpoly.markets.manager import manager as market_source_manager
+        from openpoly.runtime.active_sections import build_section
         from openpoly.runtime.section_log import (
             analyzer_log,
             embedding_log,
             entry_log,
         )
-        from openpoly.sections.analyzer.llm_v0 import (
-            LLMAnalyzerConfig,
-            LLMAnalyzerV0,
-        )
-        from openpoly.sections.embedding.minilm_v0 import (
-            EmbeddingFilterConfig,
-            EmbeddingFilterV0,
-        )
-        from openpoly.sections.entry.edge_threshold_v0 import (
-            EdgeThresholdConfig,
-            EdgeThresholdEntryV0,
-        )
 
         _singleton = PipelineOrchestrator(
-            embedding_section=EmbeddingFilterV0(_canvas_config(EmbeddingFilterConfig, "embedding")),
-            analyzer_section=LLMAnalyzerV0(_canvas_config(LLMAnalyzerConfig, "analyzer")),
-            entry_section=EdgeThresholdEntryV0(
-                _canvas_config(EdgeThresholdConfig, "entry"),
-                # Lazy: executor's portfolio is configured *after* the
-                # orchestrator (and entry section) is built, so we hand
-                # entry a closure it calls per run() instead of the store
-                # itself. Returns None until executor.configure() lands.
-                portfolio_provider=lambda: getattr(
-                    getattr(executor, "_paper", executor), "_portfolio", None
-                ),
-            ),
+            embedding_section=build_section("embedding"),
+            analyzer_section=build_section("analyzer"),
+            entry_section=build_section("entry"),
             executor=executor,
             embedding_log_store=embedding_log,
             analyzer_log_store=analyzer_log,
             entry_log_store=entry_log,
+            book_source=market_source_manager,
+            news_max_age_seconds=_news_max_age_seconds(),
         )
     return _singleton
 
@@ -485,3 +730,12 @@ async def replace_section(section_type: str, new_inst: _SyncSection) -> None:
     if _singleton is None:
         return
     await _singleton.replace_section(section_type, new_inst)
+
+
+def reload_news_max_age() -> None:
+    """Re-read the news source's freshness window into the running
+    orchestrator (if any) — called by the canvas reload when the news_source
+    node changes, since the limit is otherwise resolved once at build time."""
+    if _singleton is None:
+        return
+    _singleton.set_news_max_age(_news_max_age_seconds())

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
 
 from openpoly.news.ring_buffer import NewsItem, NewsRingBuffer
-from openpoly.news.ws_client import OnItemHook
+from openpoly.news.ws_client import NewsWSClient, OnItemHook
 from openpoly.sections.news_source.tradingnews_ws import (
     TradingNewsWSConfig,
     TradingNewsWSSource,
@@ -224,6 +224,34 @@ class NewsSourceManager:
             self._first_msg_pending = False
             self._events.append(LogEvent(ts=time.time(), kind="stopped"))
             return self._snapshot()
+
+    def apply_freshness_seconds(self, seconds: int) -> bool:
+        """Apply a new freshness window to the current source without a
+        restart (canvas edit): the running WS client filters arrivals with it
+        from the next frame, the source's ``run`` reads its buffer with it,
+        and the recorded config follows so a later same-config start still
+        reuses the source. Returns False when there is no source yet (the
+        next start reads the canvas)."""
+        source = self._source
+        if source is None:
+            return False
+        config = getattr(source, "config", None)
+        if isinstance(config, TradingNewsWSConfig):
+            source.config = config.model_copy(  # type: ignore[attr-defined]
+                update={"freshness_seconds": seconds}
+            )
+        # The source owns its WS client and exposes no setter; reach it the
+        # same way the source does.
+        client = getattr(source, "_client", None)
+        if isinstance(client, NewsWSClient):
+            client.set_freshness_seconds(seconds)
+        for cfg in (self._running_config, self._source_config):
+            if cfg is not None:
+                cfg["freshness_seconds"] = seconds
+        self._events.append(
+            LogEvent(ts=time.time(), kind="config_applied", detail=f"freshness_seconds={seconds}")
+        )
+        return True
 
     async def shutdown(self) -> None:
         try:

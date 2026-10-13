@@ -295,3 +295,103 @@ async def test_canvas_reload_applies_the_database_retention_window(
         assert database_manager.status()["retention"]["retention_days"] == pytest.approx(30.0)
     finally:
         database_manager.apply_config(DatabaseConfig(order_book_retention_days=saved))
+
+
+async def test_canvas_reload_applies_the_news_freshness_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the orchestrator resolved the decision-time news age limit
+    once at build, so a canvas edit to ``freshness_seconds`` was ignored."""
+    from openpoly.api.canvas_routes import _apply_canvas_reload
+    from openpoly.runtime.canvas_store import save_template
+    from openpoly.runtime.orchestrator import get_orchestrator
+
+    def _news(freshness: int) -> dict:
+        return {
+            "version": 3,
+            "name": "t",
+            "nodes": [
+                {
+                    "id": "news",
+                    "sectionType": "news_source",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"freshness_seconds": freshness},
+                }
+            ],
+            "edges": [],
+        }
+
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    save_template(_news(1800))
+    orch = get_orchestrator()
+    assert orch._news_max_age_seconds == 1800.0  # noqa: SLF001
+    save_template(_news(300))
+    await _apply_canvas_reload(_news(1800), _news(300))
+    assert orch._news_max_age_seconds == 300.0  # noqa: SLF001
+
+
+async def test_canvas_reload_applies_news_freshness_to_the_running_ws_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a canvas edit to ``freshness_seconds`` reached only the
+    orchestrator; the running WS client kept filtering arrivals (and the
+    source's ``run`` its buffer reads) with the old window until restart."""
+    import asyncio
+
+    from openpoly.api.canvas_routes import _apply_canvas_reload
+    from openpoly.news import ws_client as wsc_mod
+    from openpoly.news.manager import manager as news_source_manager
+    from openpoly.runtime.canvas_store import save_template
+
+    class _IdleWS:
+        async def __aenter__(self) -> "_IdleWS":
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+        def __aiter__(self) -> "_IdleWS":
+            return self
+
+        async def __anext__(self) -> str:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+    def _news(freshness: int) -> dict:
+        return {
+            "version": 3,
+            "name": "t",
+            "nodes": [
+                {
+                    "id": "news",
+                    "sectionType": "news_source",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"freshness_seconds": freshness},
+                }
+            ],
+            "edges": [],
+        }
+
+    monkeypatch.setattr(wsc_mod.websockets, "connect", lambda *a, **k: _IdleWS())
+    monkeypatch.setenv("OPENPOLY_TEST_NEWS_KEY", "k")
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    save_template(_news(1800))
+    await news_source_manager.start(
+        {
+            "endpoint": "ws://fake",
+            "api_key_ref": "env:OPENPOLY_TEST_NEWS_KEY",
+            "freshness_seconds": 1800,
+        }
+    )
+    try:
+        source = news_source_manager._source  # noqa: SLF001
+        assert source is not None
+        save_template(_news(300))
+        await _apply_canvas_reload(_news(1800), _news(300))
+        assert source.config.freshness_seconds == 300
+        assert source._client._freshness_seconds == 300  # noqa: SLF001
+        assert news_source_manager.status().running_config["freshness_seconds"] == 300
+    finally:
+        await news_source_manager.stop()
+        news_source_manager._source = None  # noqa: SLF001
+        news_source_manager._source_config = None  # noqa: SLF001

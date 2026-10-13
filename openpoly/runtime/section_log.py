@@ -96,6 +96,11 @@ class AnalyzerCall:
     ``rationale`` field of the forced ``submit_analysis`` tool call). It is
     set on ok / fail_open outcomes when the model returned one, otherwise
     None. Surfaced in the PositionDetail UI by name-matching ``news_id``.
+
+    ``reasoning`` is the analyzer's written self-check (``llm_v1``'s
+    ``reasoning`` tool field), None for analyzers that do not produce one.
+    ``reason`` explains a runtime-level skip the analyzer never saw — e.g.
+    ``stale_news`` when the item aged out in the queue before its turn.
     """
 
     ts: float
@@ -109,6 +114,21 @@ class AnalyzerCall:
     latency_ms: int
     error: str | None = None
     rationale: str | None = None
+    reasoning: str | None = None
+    reason: str | None = None
+    # True when ``reasoning`` was cut at the orchestrator's cap.
+    reasoning_truncated: bool = False
+    # LLM token usage of the call, summed over every attempt (retries
+    # included); None for analyzers that do not report it (llm_v0) or calls
+    # that never reached the API. ``output_tokens`` include thinking tokens;
+    # ``cost_usd`` is an estimate, None for a model without a known price.
+    llm_model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    llm_attempts: int | None = None
+    cost_usd: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -140,6 +160,10 @@ class EntryDecision:
     fill_price: float | None = None
     fill_qty: float | None = None
     position_id: int | None = None
+    # Age in seconds of the traded side's order book (after the entry-time
+    # refresh); without an intent, the oldest book the decision could
+    # read. None when the runtime did not check freshness.
+    book_age_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

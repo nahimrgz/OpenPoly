@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -150,11 +150,11 @@ SUBMIT_ANALYSIS_TOOL: ToolDefinition = {
 }
 
 
-def _build_system(extra_guidance: str) -> str:
+def _build_system(extra_guidance: str, base: str = _SYSTEM_PROMPT) -> str:
     guidance = extra_guidance.strip()
     if guidance:
-        return f"{_SYSTEM_PROMPT}\n\nAdditional guidance:\n{guidance}"
-    return _SYSTEM_PROMPT
+        return f"{base}\n\nAdditional guidance:\n{guidance}"
+    return base
 
 
 def _build_user(candidates: MarketCandidates) -> str:
@@ -196,20 +196,24 @@ class LLMAnalyzerV0:
 
     def _client(self) -> LLMClient:
         if self._llm is None:
-            self._llm = LLMClient(
-                api_key_ref=self.config.api_key_ref,
-                model=self.config.llm_model,
-                temperature=self.config.temperature,
-                base_url=self.config.base_url,
-            )
+            self._llm = LLMClient(**self._client_kwargs())
         return self._llm
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        """Keyword arguments of the lazily built ``LLMClient``; subclasses
+        extend them."""
+        return {
+            "api_key_ref": self.config.api_key_ref,
+            "model": self.config.llm_model,
+            "temperature": self.config.temperature,
+            "base_url": self.config.base_url,
+        }
 
     def run(self, input: SectionInput) -> SectionOutput:
         candidates = input.payload
         if not isinstance(candidates, MarketCandidates) or not candidates.candidates:
             return SectionOutput(payload=None, verdict="skip", reason="no market candidates")
 
-        cands = candidates.candidates
         try:
             result = self._client().analyze(
                 system=_build_system(self.config.extra_guidance),
@@ -219,60 +223,7 @@ class LLMAnalyzerV0:
         except LLMError as exc:
             return SectionOutput(payload=None, verdict="error", reason=repr(exc)[:200])
 
-        idx = result.get("selected_index")
-        if not isinstance(idx, int) or isinstance(idx, bool) or not (1 <= idx <= len(cands)):
-            # 0 = explicit abstain; out-of-range / non-int = treat the same.
-            return SectionOutput(
-                payload=None,
-                verdict="skip",
-                reason="no actionable market",
-                signals={"selected_index": idx},
-            )
-
-        confidence = result.get("confidence")
-        if confidence not in _CONFIDENCE_RANK:
-            return SectionOutput(
-                payload=None,
-                verdict="error",
-                reason=f"malformed confidence: {confidence!r}",
-            )
-        if _CONFIDENCE_RANK[confidence] < _CONFIDENCE_RANK[self.config.min_confidence]:
-            return SectionOutput(
-                payload=None,
-                verdict="skip",
-                reason="below min_confidence",
-                signals={"confidence": confidence},
-            )
-
-        p_yes = result.get("p_yes")
-        if (
-            isinstance(p_yes, bool)
-            or not isinstance(p_yes, (int, float))
-            or not 0.0 <= p_yes <= 1.0
-        ):
-            return SectionOutput(
-                payload=None,
-                verdict="error",
-                reason=f"malformed p_yes: {p_yes!r}",
-            )
-
-        market = cands[idx - 1].market
-        ar = AnalysisResult(
-            market_id=market.market_id,
-            p_model=float(p_yes),
-            confidence=confidence,  # type: ignore[arg-type]
-            rationale=str(result.get("rationale", "")),
-        )
-        return SectionOutput(
-            payload=ar,
-            verdict="ok",
-            signals={
-                "news_id": candidates.news.id,
-                "selected_index": idx,
-                "confidence": confidence,
-                "candidate_count": len(cands),
-            },
-        )
+        return _interpret(result, candidates, self.config.min_confidence)
 
     @staticmethod
     def CONTRACT_TEST() -> None:
@@ -281,3 +232,71 @@ class LLMAnalyzerV0:
         inst = LLMAnalyzerV0(LLMAnalyzerConfig())
         out = inst.run(SectionInput(tick_type="event", payload=None))
         assert out.verdict == "skip"
+
+
+def _interpret(
+    result: dict[str, Any],
+    candidates: MarketCandidates,
+    min_confidence: Confidence,
+    extra_signals: dict[str, Any] | None = None,
+) -> SectionOutput:
+    """Validate a ``submit_analysis`` result and build the section output.
+
+    Shared by the analyzer versions; ``extra_signals`` (e.g. v1's reasoning)
+    is merged into every outcome's signals.
+    """
+    extra = extra_signals or {}
+    cands = candidates.candidates
+    idx = result.get("selected_index")
+    if not isinstance(idx, int) or isinstance(idx, bool) or not (1 <= idx <= len(cands)):
+        # 0 = explicit abstain; out-of-range / non-int = treat the same.
+        return SectionOutput(
+            payload=None,
+            verdict="skip",
+            reason="no actionable market",
+            signals={**extra, "selected_index": idx},
+        )
+
+    confidence = result.get("confidence")
+    if confidence not in _CONFIDENCE_RANK:
+        return SectionOutput(
+            payload=None,
+            verdict="error",
+            reason=f"malformed confidence: {confidence!r}",
+            signals=dict(extra),
+        )
+    if _CONFIDENCE_RANK[confidence] < _CONFIDENCE_RANK[min_confidence]:
+        return SectionOutput(
+            payload=None,
+            verdict="skip",
+            reason="below min_confidence",
+            signals={**extra, "confidence": confidence},
+        )
+
+    p_yes = result.get("p_yes")
+    if isinstance(p_yes, bool) or not isinstance(p_yes, (int, float)) or not 0.0 <= p_yes <= 1.0:
+        return SectionOutput(
+            payload=None,
+            verdict="error",
+            reason=f"malformed p_yes: {p_yes!r}",
+            signals=dict(extra),
+        )
+
+    market = cands[idx - 1].market
+    ar = AnalysisResult(
+        market_id=market.market_id,
+        p_model=float(p_yes),
+        confidence=confidence,  # type: ignore[arg-type]
+        rationale=str(result.get("rationale", "")),
+    )
+    return SectionOutput(
+        payload=ar,
+        verdict="ok",
+        signals={
+            **extra,
+            "news_id": candidates.news.id,
+            "selected_index": idx,
+            "confidence": confidence,
+            "candidate_count": len(cands),
+        },
+    )

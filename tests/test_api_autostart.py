@@ -71,3 +71,35 @@ async def test_lifespan_skips_autostart_when_disabled(
 
     assert market_calls == []
     assert news_calls == []
+
+
+def test_news_autostart_uses_the_canvas_freshness_window(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: autostart started the news source with the default window
+    while the orchestrator's decision-time check read the canvas — the two
+    freshness windows disagreed."""
+    from openpoly.api.main import _NEWS_AUTOSTART_KEY_REF, _news_autostart_config
+    from openpoly.runtime.canvas_store import save_template
+    from openpoly.runtime.orchestrator import _news_max_age_seconds
+
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    save_template(
+        {
+            "version": 4,
+            "name": "t",
+            "nodes": [
+                {
+                    "id": "n",
+                    "sectionType": "news_source",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"freshness_seconds": 300, "api_key_ref": "env:SOMETHING"},
+                }
+            ],
+            "edges": [],
+        }
+    )
+    cfg = _news_autostart_config()
+    assert cfg["freshness_seconds"] == 300
+    assert cfg["freshness_seconds"] == _news_max_age_seconds()
+    assert cfg["api_key_ref"] == _NEWS_AUTOSTART_KEY_REF

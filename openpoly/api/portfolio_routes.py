@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.api.security import require_api_token
-from openpoly.analytics.calibration import calibration_report
+from openpoly.analytics.calibration import calibration_summary
 from openpoly.db.engine import get_session_factory
 from openpoly.execution import executor
 from openpoly.portfolio import PortfolioStore
@@ -331,8 +331,9 @@ def get_calibration(
     store: PortfolioStore = Depends(get_portfolio_store),
 ) -> dict[str, Any]:
     """Is ``p_model`` calibrated? Closed positions bucketed by the model's
-    probability for the side they held, with each bucket's win rate and mean
-    realized return (see ``openpoly.analytics.calibration``).
+    probability for the side they held — over its full [0, 1] range, since
+    entry v1 can hold the side the model rates below 0.5 — with each bucket's
+    win rate and mean realized return (see ``openpoly.analytics.calibration``).
 
     Read-only and derived per request — nothing here is persisted. Read it as:
     a bucket whose ``win_rate`` sits near its own midpoint, with ``count`` of
@@ -340,13 +341,16 @@ def get_calibration(
     precondition for turning ``size_edge_multiplier_max`` above 1.0.
     """
     positions = store.list_positions(CALIBRATION_LIMIT)
-    buckets = calibration_report(
+    report = calibration_summary(
         positions,
         store.buy_cost_basis([p.id for p in positions]),
     )
     return {
-        "buckets": [asdict(b) for b in buckets],
-        "sample_size": sum(b.count for b in buckets),
+        "buckets": [asdict(b) for b in report.buckets],
+        "sample_size": sum(b.count for b in report.buckets),
+        # Closed, labelled positions left out as data defects (a held-side
+        # probability outside [0, 1]); 0 in a healthy ledger.
+        "excluded": report.excluded,
     }
 
 

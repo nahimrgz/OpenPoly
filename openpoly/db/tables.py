@@ -160,3 +160,29 @@ class PositionRow(Base):
     entry_p_model: Mapped[float | None] = mapped_column(default=None)
     entry_confidence: Mapped[str | None] = mapped_column(default=None)
     entry_edge: Mapped[float | None] = mapped_column(default=None)
+
+
+class LLMUsageRow(Base):
+    """Token usage of one analyzer LLM call (every attempt of one ``analyze``,
+    structural retries included) — the durable record behind
+    ``GET /api/analyzer/usage``. The analyzer log ring evicts within a few
+    hundred calls, so day / week / all-time totals need their own rows.
+
+    ``output_tokens`` include thinking tokens (they bill as output);
+    ``cost_usd`` is an estimate from ``openpoly.llm.client.MODEL_PRICING``,
+    NULL for a model not in that table.
+    """
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[float] = mapped_column(index=True)  # epoch seconds, UTC
+    news_id: Mapped[str | None]
+    model: Mapped[str]
+    verdict: Mapped[str | None]
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(default=0)
+    cache_creation_input_tokens: Mapped[int] = mapped_column(default=0)
+    attempts: Mapped[int] = mapped_column(default=1)
+    cost_usd: Mapped[float | None]

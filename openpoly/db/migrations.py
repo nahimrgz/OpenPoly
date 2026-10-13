@@ -154,6 +154,18 @@ def _m004_order_book_recorded_at_index(conn: Connection) -> None:
     )
 
 
+def _m005_llm_usage_table(conn: Connection) -> None:
+    """The ``llm_usage`` table (analyzer token usage + estimated cost).
+
+    ``create_all`` already adds a missing table to an existing database; this
+    makes the change explicit and versioned, and is a no-op when the table is
+    there (``checkfirst``). The table's ``ts`` index (``ix_llm_usage_ts``) is
+    part of the table definition, so creating the table creates it too."""
+    from openpoly.db.tables import LLMUsageRow
+
+    LLMUsageRow.__table__.create(conn, checkfirst=True)  # type: ignore[attr-defined]
+
+
 # Ordered, append-only. Never renumber or reuse a version: the number recorded
 # in a deployed database is the only thing that says what has run there.
 MIGRATIONS: list[tuple[int, Migration]] = [
@@ -161,6 +173,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (2, _m002_position_entry_columns),
     (3, _m003_order_book_token_time_index),
     (4, _m004_order_book_recorded_at_index),
+    (5, _m005_llm_usage_table),
 ]
 
 LATEST_VERSION: int = MIGRATIONS[-1][0]

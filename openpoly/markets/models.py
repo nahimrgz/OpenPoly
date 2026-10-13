@@ -14,7 +14,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,11 @@ class Market:
     # failure). Position settlement reads this + the held side to derive a
     # 0/1 final price.
     outcome_prices: tuple[float, float] | None = None
+
+    def token_for(self, side: Literal["yes", "no"]) -> str | None:
+        """The CLOB token id of one outcome side (None when the market has no
+        NO token)."""
+        return self.yes_token_id if side == "yes" else self.no_token_id
 
     @property
     def mid(self) -> float | None:
@@ -93,8 +98,9 @@ def _to_float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def _parse_iso(value: Any) -> datetime | None:
-    """Parse an ISO-8601 string (date or datetime, optional 'Z') to aware UTC."""
+def parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 string (date or datetime, optional 'Z') to aware UTC.
+    A naive value is read as UTC; anything unparseable yields None."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -148,7 +154,7 @@ def normalize_gamma_market(
         slug=str(raw.get("slug", "")),
         yes_token_id=token_ids[0],
         no_token_id=token_ids[1] if len(token_ids) > 1 else None,
-        end_date=_parse_iso(raw.get("endDate") or raw.get("endDateIso")),
+        end_date=parse_iso(raw.get("endDate") or raw.get("endDateIso")),
         best_bid=_to_float(raw.get("bestBid")),
         best_ask=_to_float(raw.get("bestAsk")),
         spread=_to_float(raw.get("spread")),
@@ -244,7 +250,14 @@ def _book_levels(raw: Any, *, descending: bool, depth: int) -> list[tuple[float,
     return levels[:depth]
 
 
-def parse_clob_book(raw: dict[str, Any], token_id: str, *, depth: int = 3) -> OrderBook:
+# Levels kept per side of a CLOB book. Deep enough that a top of book made of
+# dust / probe orders still leaves real size to find: a depth-guarded mark
+# (``openpoly.markets.pricing``) over only 3 levels turned "the first 3 levels
+# are dust" into "no executable bid" forever, and no stop could fire.
+BOOK_DEPTH = 20
+
+
+def parse_clob_book(raw: dict[str, Any], token_id: str, *, depth: int = BOOK_DEPTH) -> OrderBook:
     """Convert a raw CLOB ``/book`` payload into an ``OrderBook``.
 
     Keeps the top ``depth`` levels per side, best-first. The book's

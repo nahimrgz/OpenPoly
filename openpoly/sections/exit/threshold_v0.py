@@ -73,6 +73,15 @@ class MarkedPosition:
     peak_price: float
     spread: float | None = None  # best_ask - best_bid at mark time
     tick_size: float | None = None  # venue tick, when the book exposes one
+    ask: float | None = None  # level-1 ask at mark time (read by threshold_v1)
+    # True when no bid level is deep enough to mark against and
+    # ``current_price`` is the raw best bid instead. Only sent to sections that
+    # declare ``EVALUATES_THIN_MARKS`` (threshold_v1's hard stop); v0 never
+    # sees one.
+    thin: bool = False
+    # Consecutive prior ticks on which a thin-book hard stop was pending
+    # confirmation (read by threshold_v1 only; v0 ignores it).
+    thin_streak: int = 0
 
 
 @dataclass(frozen=True)
@@ -177,7 +186,18 @@ class ThresholdExitV0:
         tick = pos.tick_size if pos.tick_size and pos.tick_size > 0 else self.config.tick_size
         spread = pos.spread if pos.spread is not None and pos.spread > 0 else 0.0
         pct_trail = self.config.peak_drawdown_pct * (pos.peak_price - pos.avg_entry_price)
-        return max(self.config.min_trail_ticks * tick, spread, pct_trail)
+        spread_floor = self._spread_floor(spread, pct_trail, tick)
+        return max(self.config.min_trail_ticks * tick, spread_floor, pct_trail)
+
+    def _spread_floor(self, spread: float, pct_trail: float, tick: float) -> float:
+        """The spread's contribution to the trailing distance. v0 uses the
+        live spread as is; subclasses may bound it."""
+        return spread
+
+    def _stop_triggered(self, pos: MarkedPosition, return_pct: float) -> bool:
+        """Whether the stop-loss fires. v0 compares the mark (bid) return with
+        ``stop_loss_pct``; subclasses may measure it differently."""
+        return return_pct <= -self.config.stop_loss_pct
 
     def run(self, input: SectionInput) -> SectionOutput:
         pos = input.payload
@@ -203,7 +223,7 @@ class ThresholdExitV0:
             peak_dd = 0.0
 
         trigger: Trigger | None
-        if return_pct <= -self.config.stop_loss_pct:
+        if self._stop_triggered(pos, return_pct):
             trigger = "stop_loss"
         elif self.config.take_profit_enabled and return_pct >= self.config.take_profit_pct:
             trigger = "take_profit"

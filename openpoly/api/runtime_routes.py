@@ -11,6 +11,9 @@ loop state, and ``last_tick_at`` / ``open_positions`` / ``blocked`` carry its
 tick heartbeat (within-threshold + no-order-book holds write no entry, so the
 ring keeps only ok / error closes — these counts surface the rest).
 
+``GET /api/analyzer/log/{news_id}/reasoning`` returns one entry's analyzer
+self-check, which the polled list leaves out (``has_reasoning`` flags it).
+
 ``POST /api/analyzer/test`` is a connectivity probe — it builds an LLM client
 from supplied analyzer-config fields and makes one minimal call, so the user
 can verify the key / base URL / model before running the pipeline.
@@ -19,15 +22,20 @@ can verify the key / base URL / model before running the pipeline.
 from __future__ import annotations
 
 import time
-from typing import Any
+from dataclasses import fields
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.api.security import require_api_token
+from openpoly.db.engine import get_session_factory
 from openpoly.llm import LLMClient, LLMError
+from openpoly.llm.usage_store import usage_totals
 from openpoly.runtime.orchestrator import get_orchestrator
 from openpoly.runtime.section_log import (
+    AnalyzerCall,
     analyzer_log,
     embedding_log,
     embedding_warm_log,
@@ -72,16 +80,74 @@ def get_embedding_log(limit: int = 200) -> SectionLogResponse:
     )
 
 
+def _analyzer_list_entry(entry: AnalyzerCall) -> dict[str, Any]:
+    """An analyzer log entry for the polled list: the (up to 2000-char)
+    ``reasoning`` is replaced by a ``has_reasoning`` flag — the Calls tab polls
+    the whole ring every 3s and fetches one entry's reasoning on demand
+    (``GET /api/analyzer/log/{news_id}/reasoning?ts=<ts>``)."""
+    # Every field is a scalar, so a shallow read equals ``asdict`` without
+    # deep-copying the reasoning only to drop it.
+    d = {f.name: getattr(entry, f.name) for f in fields(entry) if f.name != "reasoning"}
+    d["has_reasoning"] = bool(entry.reasoning)
+    return d
+
+
 @router.get("/analyzer/log", response_model=SectionLogResponse)
 def get_analyzer_log(limit: int = 200) -> SectionLogResponse:
     orch = get_orchestrator()
     return SectionLogResponse(
-        entries=[e.to_dict() for e in analyzer_log.entries(limit=limit)],
+        entries=[_analyzer_list_entry(e) for e in analyzer_log.entries(limit=limit)],
         counters=analyzer_log.counters(),
         last_at=analyzer_log.last_at,
         queue_depth=orch.queue_depth,
         state=orch.state,
     )
+
+
+class AnalyzerReasoningResponse(BaseModel):
+    news_id: str
+    reasoning: str | None
+    # The reasoning was cut at the logging cap (2000 chars).
+    truncated: bool = False
+
+
+@router.get(
+    "/analyzer/log/{news_id}/reasoning",
+    response_model=AnalyzerReasoningResponse,
+    # ``truncated`` is only sent when true (older clients compare the body).
+    response_model_exclude_defaults=True,
+)
+def get_analyzer_reasoning(news_id: str, ts: float | None = None) -> AnalyzerReasoningResponse:
+    """The analyzer's written self-check for one call, identified by its
+    ``(ts, news_id)`` — unique per log entry. One news item can be analyzed
+    more than once (a re-delivery, a stale-news skip and a later call), so
+    ``news_id`` alone could return another call's reasoning. Without ``ts``
+    (older clients) the newest entry for ``news_id`` is returned, as before.
+    404 once the entry has left the ring."""
+    for entry in reversed(analyzer_log.entries()):
+        if entry.news_id == news_id and (ts is None or entry.ts == ts):
+            return AnalyzerReasoningResponse(
+                news_id=news_id,
+                reasoning=entry.reasoning,
+                truncated=entry.reasoning_truncated,
+            )
+    raise HTTPException(status_code=404, detail="no analyzer log entry for this call")
+
+
+# ---------- GET /api/analyzer/usage — LLM token usage totals ----------
+
+
+@router.get("/analyzer/usage")
+def get_analyzer_usage(
+    factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> dict[str, Any]:
+    """Analyzer LLM usage totals — calls, input / output tokens (output
+    includes thinking), cache tokens and estimated USD cost — for today
+    (UTC calendar day), the last 7 days and all time, from the ``llm_usage``
+    table (one row per analyzer call, retries summed in). ``unpriced_calls``
+    counts calls on a model without a known price, which ``cost_usd`` leaves
+    out. Read-only."""
+    return usage_totals(factory)
 
 
 # ---------- POST /api/analyzer/test — LLM connectivity probe ----------
@@ -95,6 +161,8 @@ class AnalyzerTestRequest(BaseModel):
     api_key_ref: str
     base_url: str = ""
     temperature: float = 0.2
+    # Analyzer v1's effort (sent only to models that accept it).
+    llm_effort: Literal["low", "medium", "high"] = "low"
 
 
 class AnalyzerTestResponse(BaseModel):
@@ -128,6 +196,7 @@ def test_analyzer(req: AnalyzerTestRequest) -> AnalyzerTestResponse:
         model=cfg.llm_model,
         temperature=cfg.temperature,
         base_url=cfg.base_url,
+        effort=req.llm_effort,
     )
     start = time.monotonic()
     try:

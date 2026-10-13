@@ -252,6 +252,16 @@ def test_analyzer_call_to_dict_shape() -> None:
         "latency_ms",
         "error",
         "rationale",
+        "reasoning",
+        "reason",
+        "reasoning_truncated",
+        "llm_model",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "llm_attempts",
+        "cost_usd",
     }
     assert d == asdict(e)
 
@@ -304,6 +314,7 @@ def test_entry_decision_to_dict_shape() -> None:
         "fill_price",
         "fill_qty",
         "position_id",
+        "book_age_s",
     }
     assert d == asdict(e)
 

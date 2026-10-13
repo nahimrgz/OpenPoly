@@ -16,11 +16,13 @@ import contextlib
 import json
 import logging
 import time
-from datetime import datetime
+import re
 from typing import Callable
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
+
+from openpoly.markets.models import parse_iso
 
 from .ring_buffer import NewsItem, NewsRingBuffer
 
@@ -34,22 +36,51 @@ OnItemHook = Callable[[NewsItem], object]
 
 logger = logging.getLogger(__name__)
 
+# How far in the future a ``published_at`` may sit before it is distrusted.
+# Allows ordinary clock skew between the provider and this host; anything
+# beyond it is a bad timestamp whose negative age would otherwise sail past
+# every freshness check, so the item is timed by its arrival instead.
+MAX_FUTURE_SKEW_SECONDS = 60.0
+
+# A numeric epoch above this is in milliseconds, not seconds: 1e12 seconds is
+# the year ~33,700, while 1e12 ms is September 2001.
+_EPOCH_MS_THRESHOLD = 1e12
+
+
+def _epoch_seconds(value: float) -> float:
+    """A numeric epoch in seconds, converting a millisecond epoch."""
+    return value / 1000.0 if value > _EPOCH_MS_THRESHOLD else value
+
+
+# An optionally signed decimal number: digits with an optional fraction.
+_NUMERIC_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+
 
 def _to_epoch(value: object, fallback: float) -> float:
-    """Accept ISO 8601 string or numeric epoch; fall back if neither parses."""
+    """Accept ISO 8601 string or numeric epoch; fall back if neither parses.
+
+    A naive ISO timestamp (no offset) is read as UTC — never as the host's
+    local time, which would shift every such item's age by the host's UTC
+    offset (clocks are UTC throughout this codebase).
+    """
     if value is None:
         return fallback
     if isinstance(value, (int, float)):
-        return float(value)
+        return _epoch_seconds(float(value))
     if isinstance(value, str):
+        # A purely numeric string is an epoch, never a date: Python 3.13's
+        # ``fromisoformat`` accepts ISO *basic* format, so it would read
+        # "1792013060023.0" (epoch ms) as the year 1792. Parse numbers first.
+        if _NUMERIC_RE.fullmatch(value.strip()):
+            return _epoch_seconds(float(value))
         # tradingnews emits ISO 8601 with offset (e.g. 2026-05-19T10:49:35+00:00).
+        parsed = parse_iso(value)
+        if parsed is not None:
+            return parsed.timestamp()
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            return _epoch_seconds(float(value))
         except ValueError:
-            try:
-                return float(value)
-            except ValueError:
-                return fallback
+            return fallback
     return fallback
 
 
@@ -61,22 +92,35 @@ def default_parse(raw: str) -> NewsItem | None:
     """
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # JSONDecodeError is a ValueError; so is an integer past the
+        # int-digit limit. A deeply nested frame overflows the recursion limit.
         return None
     if not isinstance(data, dict) or "id" not in data:
         return None
     now = time.time()
     try:
+        published_at = _to_epoch(data.get("published_at"), now)
+        if published_at - now > MAX_FUTURE_SKEW_SECONDS:
+            # Not trustworthy as a publish time, but the item itself may be
+            # real news: time it by its arrival rather than dropping it.
+            logger.warning(
+                "news %s: published_at %r is %.0fs in the future; using receive time",
+                data.get("id"),
+                data.get("published_at"),
+                published_at - now,
+            )
+            published_at = now
         return NewsItem(
             id=str(data["id"]),
             content=str(data.get("content", "")),
             urgency=str(data.get("urgency", "regular")),
             sentiment=data.get("sentiment"),
-            published_at=_to_epoch(data.get("published_at"), now),
+            published_at=published_at,
             received_at=now,
             raw=data,
         )
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return None
 
 
@@ -116,9 +160,17 @@ class NewsWSClient:
         # backlog (server replaying recent history on reconnect). ``None``
         # disables the filter entirely.
         self._freshness_seconds = freshness_seconds
+        # Exception types already logged for a dropped frame — a malformed
+        # stream logs once per kind instead of once per frame.
+        self._logged_frame_errors: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def set_freshness_seconds(self, freshness_seconds: float | None) -> None:
+        """Change the arrival freshness filter of a running client; applies
+        from the next frame (``None`` disables it)."""
+        self._freshness_seconds = freshness_seconds
 
     def _emit(self, kind: str, detail: str | None = None) -> None:
         """Forward a lifecycle event to the hook; exceptions are swallowed so
@@ -174,24 +226,60 @@ class NewsWSClient:
             except (ConnectionClosed, WebSocketException, OSError) as exc:
                 self._emit("disconnected", str(exc))
                 logger.warning("WS dropped: %s; reconnect in %.2fs", exc, backoff)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                await self._wait_backoff(backoff)
                 backoff = min(backoff * 2.0, self.max_backoff)
+            except Exception as exc:  # noqa: BLE001 — the task must outlive any bug
+                # Anything else (a bug in a consumer, an unexpected library
+                # error) would otherwise end the task silently while the
+                # manager still reports 'connected'. Report a disconnect and
+                # reconnect like any drop.
+                self._emit("disconnected", repr(exc)[:200])
+                logger.exception("WS loop error; reconnect in %.2fs", backoff)
+                await self._wait_backoff(backoff)
+                backoff = min(backoff * 2.0, self.max_backoff)
+
+    async def _wait_backoff(self, backoff: float) -> None:
+        """Sleep ``backoff`` seconds, or until ``stop()``."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+
+    def _decode_and_parse(self, raw: str | bytes) -> tuple[NewsItem | None, str | None]:
+        """``(item, text)`` for one frame; ``(None, text)`` when it does not
+        parse. Never raises: a frame that fails to decode or blows up the
+        parser (custom parsers included) is dropped and logged once per
+        exception type."""
+        text: str | None = None
+        try:
+            text = raw if isinstance(raw, str) else raw.decode()
+            return self.parse(text), text
+        except Exception as exc:  # noqa: BLE001 — one bad frame must not kill the stream
+            kind = type(exc).__name__
+            if kind not in self._logged_frame_errors:
+                self._logged_frame_errors.add(kind)
+                logger.warning(
+                    "dropping malformed news frame (%s: %s); further %s frames are "
+                    "dropped silently",
+                    kind,
+                    str(exc)[:120],
+                    kind,
+                )
+            return None, text
 
     async def _consume(self, ws) -> None:
         async for raw in ws:
             if self._stop.is_set():
                 break
-            text = raw if isinstance(raw, str) else raw.decode()
-            item = self.parse(text)
+            item, text = self._decode_and_parse(raw)
             if item is None:
                 snippet = text[:80] if isinstance(text, str) else None
                 self._emit("parse_error", snippet)
                 await asyncio.sleep(0)
                 continue
             if self._freshness_seconds is not None:
-                # Negative ages (clock drift / published in future) sail
-                # through; only positive ages past the threshold drop.
+                # Small negative ages (clock skew within
+                # MAX_FUTURE_SKEW_SECONDS) pass; anything further in the
+                # future was already re-timed to its arrival by the parser.
+                # Only positive ages past the threshold drop.
                 age = item.received_at - item.published_at
                 if age > self._freshness_seconds:
                     # Silent drop per plan §P2 — no buffer, no emit.
