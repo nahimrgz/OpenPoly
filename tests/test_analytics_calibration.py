@@ -250,3 +250,12 @@ def test_out_of_range_probability_is_counted_as_excluded() -> None:
     summary = calibration_summary(positions)
     assert summary.excluded == 2
     assert sum(b.count for b in summary.buckets) == 1
+
+
+@pytest.mark.parametrize(("p_model", "lower"), [(0.8, 0.2), (0.9, 0.1), (0.7, 0.3), (0.2, 0.8)])
+def test_no_side_held_probability_lands_in_its_exact_bucket(p_model: float, lower: float) -> None:
+    """1 - 0.8 is 0.19999999999999996 in floating point: without rounding a
+    NO position on p_model 0.8 (or 0.9) fell one bucket too low."""
+    positions = [_closed(p_model=p_model, side="no", realized_pnl=1.0)]
+    by_lower = {b.lower: b for b in calibration_summary(positions).buckets}
+    assert by_lower[lower].count == 1

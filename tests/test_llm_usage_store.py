@@ -118,7 +118,9 @@ async def test_orchestrator_records_usage_on_the_log_entry_and_the_table(
     orch = orch_mod.PipelineOrchestrator.__new__(orch_mod.PipelineOrchestrator)
     orch._analyzer = _Analyzer()  # type: ignore[attr-defined]
     orch._analyzer_log = log  # type: ignore[attr-defined]
+    orch._background = set()  # type: ignore[attr-defined]
     await orch._run_analyzer(_item(), None)  # type: ignore[arg-type]
+    await orch.flush_background()  # the insert is fire-and-forget
 
     entry = log.entries()[0]
     assert entry.input_tokens == 1234
@@ -128,3 +130,81 @@ async def test_orchestrator_records_usage_on_the_log_entry_and_the_table(
     totals = usage_totals(factory)
     assert totals["all_time"]["calls"] == 1
     assert totals["all_time"]["input_tokens"] == 1234
+
+
+def test_windowed_totals_use_the_ts_index(factory) -> None:
+    """The today / last-7-days aggregates must range-scan the ``ts`` index
+    rather than read the whole table (EXPLAIN QUERY PLAN on every statement
+    ``usage_totals`` runs that filters on ``ts``)."""
+    from sqlalchemy import event
+
+    store = UsageStore(factory)
+    store.record(_usage(1, 1, 0.0), ts=_NOW - 60, news_id="a", verdict="ok")
+    engine = factory.kw["bind"]
+    statements: list[tuple[str, object]] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        usage_totals(factory, now=_NOW)
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    windowed = [(s, p) for s, p in statements if "ts >=" in s]
+    assert windowed, statements
+    with engine.connect() as conn:
+        for statement, params in windowed:
+            plan = " | ".join(
+                str(r[-1]) for r in conn.exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", params)
+            )
+            assert "SEARCH llm_usage USING" in plan and "INDEX" in plan, plan
+
+
+async def test_usage_write_does_not_delay_the_entry_decision(monkeypatch) -> None:
+    """A slow ``llm_usage`` insert (a locked SQLite file) must not hold the
+    analyzer result back from the entry stage: the write runs in the
+    background and is flushed on stop."""
+    import asyncio
+    import threading
+
+    from openpoly.llm import usage_store as usage_mod
+    from openpoly.runtime import orchestrator as orch_mod
+    from openpoly.runtime.section_log import AnalyzerCall, SectionLogStore
+    from openpoly.sections._base import SectionOutput
+    from openpoly.sections.analyzer.llm_v0 import AnalysisResult
+    from tests.test_orchestrator import _item
+
+    release = threading.Event()
+    recorded: list[str] = []
+
+    def _slow_record(usage, *, ts, news_id, verdict):  # noqa: ANN001, ANN202
+        release.wait(timeout=5)
+        recorded.append(news_id)
+
+    monkeypatch.setattr(usage_mod.usage_store, "record", _slow_record)
+    ar = AnalysisResult(market_id="m1", p_model=0.7, confidence="high")
+
+    class _Analyzer:
+        def run(self, _input):  # noqa: ANN001, ANN201
+            return SectionOutput(payload=ar, verdict="ok", signals={"llm_usage": _usage(1, 1, 0.0)})
+
+    orch = orch_mod.PipelineOrchestrator(
+        embedding_section=None,  # type: ignore[arg-type]
+        analyzer_section=_Analyzer(),  # type: ignore[arg-type]
+        entry_section=None,  # type: ignore[arg-type]
+        executor=None,  # type: ignore[arg-type]
+        embedding_log_store=SectionLogStore("embedding"),
+        analyzer_log_store=SectionLogStore[AnalyzerCall]("analyzer"),
+        entry_log_store=SectionLogStore("entry"),
+    )
+    try:
+        got = await asyncio.wait_for(orch._run_analyzer(_item(), None), timeout=1.0)  # type: ignore[arg-type]
+        assert got is ar
+        assert recorded == []
+    finally:
+        release.set()
+        await orch.stop()
+    assert recorded == ["n1"]

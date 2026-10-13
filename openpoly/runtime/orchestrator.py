@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Coroutine
 from typing import Any, Literal, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -128,6 +129,9 @@ class PipelineOrchestrator:
         # the old instance alive until that call returns. Next call uses the
         # new instance.
         self._sections_lock = asyncio.Lock()
+        # Fire-and-forget bookkeeping (the ``llm_usage`` insert): referenced
+        # here so a task is not garbage-collected mid-flight, flushed on stop.
+        self._background: set[asyncio.Task[None]] = set()
 
     def __repr__(self) -> str:
         return f"PipelineOrchestrator(state={self._state}, queue_depth={self.queue_depth})"
@@ -151,17 +155,28 @@ class PipelineOrchestrator:
         self._worker_task = asyncio.create_task(self._worker())
 
     async def stop(self) -> None:
-        if self._worker_task is None:
-            self._state = "stopped"
-            return
-        self._worker_task.cancel()
         try:
-            await self._worker_task
-        except asyncio.CancelledError:
-            pass
+            if self._worker_task is None:
+                return
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
         finally:
             self._worker_task = None
             self._state = "stopped"
+            await self.flush_background()
+
+    async def flush_background(self) -> None:
+        """Wait for in-flight bookkeeping tasks (each logs its own failure)."""
+        if self._background:
+            await asyncio.gather(*self._background, return_exceptions=True)
+
+    def _spawn_background(self, coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     # ---------- canvas-sync v2: hot-reload section swap ----------
 
@@ -395,7 +410,11 @@ class PipelineOrchestrator:
             )
         )
         if usage is not None:
-            await self._record_usage(usage, ts=ts, news_id=item.id, verdict=verdict)
+            # Fire-and-forget: a slow insert (a busy SQLite file) must not
+            # delay the entry decision this result feeds.
+            self._spawn_background(
+                self._record_usage(usage, ts=ts, news_id=item.id, verdict=verdict)
+            )
 
         # Only forward to entry on ok + valid AR payload.
         if verdict != "ok" or ar is None:

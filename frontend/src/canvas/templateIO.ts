@@ -204,20 +204,22 @@ export async function pushTemplateToBackend(
     const detail = body.detail ?? {}
     const tplRaw = detail.template
     // The 409 body carries the current canvas; parse it the same way we
-    // would a fresh GET, so the caller can pop the diff dialog immediately
-    // without a second round trip.
+    // would a fresh GET — migration chain included, so a backend canvas still
+    // at an older version is a conflict, not a network error — and the caller
+    // can pop the diff dialog immediately without a second round trip.
     if (
       detail.current_rev &&
       tplRaw &&
       Array.isArray(tplRaw.nodes) &&
-      Array.isArray(tplRaw.edges) &&
-      tplRaw.version === TEMPLATE_VERSION &&
-      hasOnlyKnownSections(tplRaw as Template)
+      Array.isArray(tplRaw.edges)
     ) {
-      return {
-        status: 'conflict',
-        current_rev: detail.current_rev,
-        current_template: tplRaw as Template,
+      const { stored } = migrate(tplRaw)
+      if (stored.version === TEMPLATE_VERSION && hasOnlyKnownSections(stored as Template)) {
+        return {
+          status: 'conflict',
+          current_rev: detail.current_rev,
+          current_template: stored as Template,
+        }
       }
     }
     // Fallback if shape is off — caller should re-fetch.

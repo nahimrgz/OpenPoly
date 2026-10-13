@@ -4,9 +4,9 @@
 * Forced ``tool_choice`` only where it is accepted; elsewhere ``auto`` plus an
   instruction, with the structural retry as the safety net.
 * ``output_config.effort`` for models that support it (Haiku 5.5 & co).
-* Thinking blocks are skipped; a ``max_tokens`` cut-off or a missing required
+* Thinking blocks are skipped; a ``max_tokens`` cut-off missing a required
   field is a structural failure (retried with a higher cap), never a partial
-  result.
+  result. A complete call missing a required field is returned as-is.
 * Usage is summed across every attempt, with an estimated cost.
 """
 
@@ -121,9 +121,9 @@ def test_temperature_is_omitted_for_newer_and_unknown_models(model: str) -> None
         ("claude-opus-5-5", False),
         ("claude-sonnet-5-5", False),
         ("claude-fable-5-1", False),
-        ("claude-haiku-5-5", False),
-        ("claude-sonnet-5", False),
-        ("claude-opus-5", False),
+        ("claude-haiku-5-5", True),
+        ("claude-sonnet-5", True),
+        ("claude-opus-5", True),
         ("claude-opus-4-7", True),
         ("claude-opus-4-8", True),
         ("claude-haiku-4-5", True),
@@ -185,13 +185,14 @@ def test_no_temperature_for_models_that_reject_it(monkeypatch, model: str) -> No
     assert "temperature" not in messages.calls[0]
 
 
-def test_haiku_5_5_gets_effort_and_auto_tool_choice(monkeypatch) -> None:
+def test_haiku_5_5_gets_effort_and_forced_tool_choice(monkeypatch) -> None:
     messages = _Messages([_ok({"reasoning": "r", "p_yes": 0.6})])
     _patch(monkeypatch, messages)
     _client("claude-haiku-5-5", effort="low").analyze(system="s", user="u", tool=_REQUIRED_TOOL)
     kw = messages.calls[0]
     assert kw["output_config"] == {"effort": "low"}
-    assert kw["tool_choice"]["type"] == "auto"
+    # The docs state Haiku 5.5 accepts a forced tool_choice.
+    assert kw["tool_choice"] == {"type": "tool", "name": "submit_analysis"}
     assert "temperature" not in kw
 
 
@@ -253,12 +254,12 @@ def test_max_tokens_cap_never_exceeds_the_ceiling(monkeypatch) -> None:
     assert [c["max_tokens"] for c in messages.calls] == [_MAX_TOKENS_CEILING] * 2
 
 
-def test_missing_required_field_is_a_structural_failure(monkeypatch) -> None:
-    messages = _Messages([_ok({"reasoning": "r"}), _ok({"reasoning": "r"})])
+def test_complete_call_missing_a_required_field_is_returned_as_is(monkeypatch) -> None:
+    messages = _Messages([_ok({"reasoning": "r"})])
     _patch(monkeypatch, messages)
-    with pytest.raises(LLMError, match="missing required field") as info:
-        _client("claude-haiku-4-5").analyze(system="s", user="u", tool=_REQUIRED_TOOL)
-    assert info.value.usage is not None and info.value.usage.attempts == 2
+    result = _client("claude-haiku-4-5").analyze_detailed(system="s", user="u", tool=_REQUIRED_TOOL)
+    assert result.data == {"reasoning": "r"}
+    assert result.usage.attempts == 1
 
 
 # ---------- usage ----------

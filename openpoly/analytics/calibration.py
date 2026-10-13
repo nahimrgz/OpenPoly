@@ -37,6 +37,9 @@ from openpoly.sections.entry._types import held_side_probability
 # Bucket boundaries over the *held side's* probability, full range (see the
 # module docstring for why it is not ≥ 0.5 any more).
 BUCKET_EDGES: tuple[float, ...] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+# Digits a probability is rounded to before bucketing — far below any
+# meaningful model precision, far above float noise.
+_BUCKET_ROUND_DIGITS = 9
 
 # Close reasons whose ``realized_pnl`` is not a measured outcome. A
 # ``reconciled`` close books 0 by construction — the position was exited
@@ -91,7 +94,12 @@ def _held_side_probability(record: PositionRecord) -> float | None:
 
 def _bucket_index(probability: float) -> int:
     """Index of the bucket owning ``probability``; boundaries belong to the
-    upper bucket and 1.0 belongs to the last one."""
+    upper bucket and 1.0 belongs to the last one.
+
+    The probability is rounded first: a NO holding's ``1 - p_model`` carries
+    float noise (``1 - 0.8`` is ``0.19999999999999996``) that would otherwise
+    drop it one bucket below its edge."""
+    probability = round(probability, _BUCKET_ROUND_DIGITS)
     for index in range(len(BUCKET_EDGES) - 2, -1, -1):
         if probability >= BUCKET_EDGES[index]:
             return index

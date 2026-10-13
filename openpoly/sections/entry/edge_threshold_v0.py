@@ -607,18 +607,24 @@ def _kill_switch_check(
     matching kill_* config field; the first one tripped wins (consecutive
     → daily → drawdown), no full scan after a hit."""
     positions = portfolio.list_positions(limit=500)
-    closed = [
-        _ClosedOutcome(p.closed_at, p.realized_pnl, p.close_reason)
-        for p in positions
-        if p.closed_at is not None and p.realized_pnl is not None
-    ]
+    # list_positions is newest *id* (open order) first; the brakes need close
+    # order — a position opened early can close after later ones. Sort by
+    # closed_at, newest close first (stable: ties keep the id order).
+    closed = sorted(
+        (
+            _ClosedOutcome(p.closed_at, p.realized_pnl, p.close_reason)
+            for p in positions
+            if p.closed_at is not None and p.realized_pnl is not None
+        ),
+        key=lambda p: p.closed_at,
+        reverse=True,
+    )
     if not closed:
         return None
     now_ts = now if now is not None else time.time()
 
-    # 1. Consecutive losses: walk newest → first non-loss. closed is
-    #    newest-first per list_positions contract, so the streak from index 0
-    #    is the live tail.
+    # 1. Consecutive losses: walk newest close → first non-loss, so the
+    #    streak from index 0 is the live tail.
     if config.kill_max_consecutive_losses > 0:
         streak = 0
         for p in closed:
@@ -651,8 +657,8 @@ def _kill_switch_check(
                 },
             )
 
-    # 3. Peak-to-trough drawdown across all closed history. Walk chronological
-    #    (reverse the newest-first slice), keep running cum + peak.
+    # 3. Peak-to-trough drawdown across all closed history. Walk in close
+    #    order (reverse the newest-close-first list), keep running cum + peak.
     if config.kill_max_drawdown_usd > 0:
         cum = 0.0
         peak = 0.0

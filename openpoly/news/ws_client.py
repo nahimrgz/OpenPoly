@@ -92,7 +92,9 @@ def default_parse(raw: str) -> NewsItem | None:
     """
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # JSONDecodeError is a ValueError; so is an integer past the
+        # int-digit limit. A deeply nested frame overflows the recursion limit.
         return None
     if not isinstance(data, dict) or "id" not in data:
         return None
@@ -158,9 +160,17 @@ class NewsWSClient:
         # backlog (server replaying recent history on reconnect). ``None``
         # disables the filter entirely.
         self._freshness_seconds = freshness_seconds
+        # Exception types already logged for a dropped frame — a malformed
+        # stream logs once per kind instead of once per frame.
+        self._logged_frame_errors: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def set_freshness_seconds(self, freshness_seconds: float | None) -> None:
+        """Change the arrival freshness filter of a running client; applies
+        from the next frame (``None`` disables it)."""
+        self._freshness_seconds = freshness_seconds
 
     def _emit(self, kind: str, detail: str | None = None) -> None:
         """Forward a lifecycle event to the hook; exceptions are swallowed so
@@ -216,16 +226,50 @@ class NewsWSClient:
             except (ConnectionClosed, WebSocketException, OSError) as exc:
                 self._emit("disconnected", str(exc))
                 logger.warning("WS dropped: %s; reconnect in %.2fs", exc, backoff)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                await self._wait_backoff(backoff)
                 backoff = min(backoff * 2.0, self.max_backoff)
+            except Exception as exc:  # noqa: BLE001 — the task must outlive any bug
+                # Anything else (a bug in a consumer, an unexpected library
+                # error) would otherwise end the task silently while the
+                # manager still reports 'connected'. Report a disconnect and
+                # reconnect like any drop.
+                self._emit("disconnected", repr(exc)[:200])
+                logger.exception("WS loop error; reconnect in %.2fs", backoff)
+                await self._wait_backoff(backoff)
+                backoff = min(backoff * 2.0, self.max_backoff)
+
+    async def _wait_backoff(self, backoff: float) -> None:
+        """Sleep ``backoff`` seconds, or until ``stop()``."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+
+    def _decode_and_parse(self, raw: str | bytes) -> tuple[NewsItem | None, str | None]:
+        """``(item, text)`` for one frame; ``(None, text)`` when it does not
+        parse. Never raises: a frame that fails to decode or blows up the
+        parser (custom parsers included) is dropped and logged once per
+        exception type."""
+        text: str | None = None
+        try:
+            text = raw if isinstance(raw, str) else raw.decode()
+            return self.parse(text), text
+        except Exception as exc:  # noqa: BLE001 — one bad frame must not kill the stream
+            kind = type(exc).__name__
+            if kind not in self._logged_frame_errors:
+                self._logged_frame_errors.add(kind)
+                logger.warning(
+                    "dropping malformed news frame (%s: %s); further %s frames are "
+                    "dropped silently",
+                    kind,
+                    str(exc)[:120],
+                    kind,
+                )
+            return None, text
 
     async def _consume(self, ws) -> None:
         async for raw in ws:
             if self._stop.is_set():
                 break
-            text = raw if isinstance(raw, str) else raw.decode()
-            item = self.parse(text)
+            item, text = self._decode_and_parse(raw)
             if item is None:
                 snippet = text[:80] if isinstance(text, str) else None
                 self._emit("parse_error", snippet)

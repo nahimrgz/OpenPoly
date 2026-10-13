@@ -12,7 +12,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, func, select, true
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.db.tables import LLMUsageRow
@@ -75,27 +75,40 @@ def usage_totals(
         .replace(hour=0, minute=0, second=0, microsecond=0)
         .timestamp()
     )
-    windows = {"today": day_start, "last_7_days": now - _WEEK_SECONDS, "all_time": None}
+    week_start = now - _WEEK_SECONDS
+    windows = {"today": day_start, "last_7_days": week_start, "all_time": None}
     token_columns = (
         LLMUsageRow.input_tokens,
         LLMUsageRow.output_tokens,
         LLMUsageRow.cache_read_input_tokens,
         LLMUsageRow.cache_creation_input_tokens,
     )
-    # One scan for every window: each aggregate is FILTERed to its window
-    # (all-time: an always-true filter), seven columns per window in
-    # ``windows`` order.
-    columns: list[Any] = []
-    for since in windows.values():
-        cond = LLMUsageRow.ts >= since if since is not None else true()
-        columns += [
-            func.count(LLMUsageRow.id).filter(cond),
-            *(func.coalesce(func.sum(col).filter(cond), 0) for col in token_columns),
-            func.coalesce(func.sum(LLMUsageRow.cost_usd).filter(cond), 0.0),
-            func.count(LLMUsageRow.id).filter(and_(cond, LLMUsageRow.cost_usd.is_(None))),
+
+    def _aggregates(cond: Any) -> list[Any]:
+        """The seven per-window columns, each FILTERed by ``cond`` (None: no
+        filter)."""
+
+        def _f(agg: Any, extra: Any = None) -> Any:
+            conds = [c for c in (cond, extra) if c is not None]
+            return agg.filter(and_(*conds)) if conds else agg
+
+        return [
+            _f(func.count(LLMUsageRow.id)),
+            *(func.coalesce(_f(func.sum(col)), 0) for col in token_columns),
+            func.coalesce(_f(func.sum(LLMUsageRow.cost_usd)), 0.0),
+            _f(func.count(LLMUsageRow.id), LLMUsageRow.cost_usd.is_(None)),
         ]
+
+    # Today and the last 7 days in one query bounded by the week start, so
+    # SQLite range-scans the ``ts`` index instead of the whole table (today
+    # always starts inside the week). All time is a separate plain aggregate
+    # with no per-row FILTER work.
+    windowed = select(*_aggregates(LLMUsageRow.ts >= day_start), *_aggregates(None)).where(
+        LLMUsageRow.ts >= week_start
+    )
+    all_time = select(*_aggregates(None))
     with session_factory() as session:
-        row = session.execute(select(*columns)).one()
+        row = (*session.execute(windowed).one(), *session.execute(all_time).one())
     out: dict[str, dict[str, Any]] = {}
     for n, name in enumerate(windows):
         calls, tin, tout, cread, ccreate, cost, unpriced_calls = row[n * 7 : (n + 1) * 7]

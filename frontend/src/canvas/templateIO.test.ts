@@ -448,6 +448,24 @@ describe('v3 → v4: entry cooldown', () => {
     expect(absent.template.nodes[0].config.same_market_cooldown_minutes).toBeUndefined()
   })
 
+  it('treats a 409 carrying a v3 backend canvas as a conflict, migrated', async () => {
+    // Regression: the 409 handler required the current version, so a save
+    // racing a backend canvas still at v3 reported a network error and the
+    // canvas went offline instead of showing the conflict.
+    fetchMock().mockResolvedValue(
+      res(409, { detail: { current_rev: 'sha-theirs', template: v3(0) } }),
+    )
+    const result = await pushTemplateToBackend(
+      { ...v3(15), version: TEMPLATE_VERSION } as Template,
+      'sha-mine',
+    )
+    expect(result.status).toBe('conflict')
+    if (result.status !== 'conflict') return
+    expect(result.current_rev).toBe('sha-theirs')
+    expect(result.current_template.version).toBe(TEMPLATE_VERSION)
+    expect(result.current_template.nodes[0].config.same_market_cooldown_minutes).toBe(60)
+  })
+
   it('never touches a deliberate 0 on a current-version canvas', () => {
     localStorage.setItem(
       STORAGE_KEY,

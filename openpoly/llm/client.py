@@ -6,9 +6,11 @@ that tool's input dict. An optional ``base_url`` routes the call through an
 Anthropic-compatible third-party gateway (e.g. yunwu) instead of the
 official endpoint. The Anthropic SDK retries transient HTTP errors (429 / 5xx /
 connection) itself; this wrapper additionally retries a *structurally* bad
-response — one with no ``tool_use`` block (e.g. a refusal), a tool call
-missing a required field, or one cut off at ``max_tokens`` — up to
-``_STRUCTURAL_RETRIES`` attempts in all before raising ``LLMError``.
+response — one with no ``tool_use`` block (e.g. a refusal), or one cut off
+at ``max_tokens`` before every required field was written — up to
+``_STRUCTURAL_RETRIES`` attempts in all before raising ``LLMError``. A
+complete (non-truncated) tool call missing a schema-required field is returned
+as-is: the section interprets it (an abstain carries no probability).
 
 Request parameters depend on the model (``model_capabilities``): newer models
 reject a non-default ``temperature`` and a forced ``tool_choice`` with a 400,
@@ -79,8 +81,9 @@ class ModelCapabilities:
     * ``temperature`` — a non-default sampling temperature. Rejected (400)
       from Opus 4.7 / Sonnet 5 / Haiku 5.5 on.
     * ``forced_tool_choice`` — ``tool_choice: {type: "tool"}``. Rejected (400)
-      by Opus 5.5 / Sonnet 5.5 / Fable 5.1, and incompatible with thinking,
-      which the 5-generation models run by default; the wrapper then sends
+      by Opus 5.5 / Sonnet 5.5 / Fable 5.1 / Mythos 5.1; accepted by Opus 5,
+      Sonnet 5, Fable 5, Haiku 5.5 and older models (per the Claude API
+      docs). Where it is rejected or undocumented the wrapper sends
       ``{type: "auto"}`` plus an instruction to call the tool.
     * ``effort`` — ``output_config.effort``.
     """
@@ -91,22 +94,37 @@ class ModelCapabilities:
 
 
 # Families: claude-<family>-<major>[-<minor>] (4.x and later) and the legacy
-# claude-<major>[-<minor>]-<family> (3.x). A trailing date suffix
-# (claude-sonnet-4-5-20250929) or a provider prefix (us.anthropic.claude-…)
-# does not change the family; a minor is at most two digits so a date is never
-# read as one.
-_NEW_ID = re.compile(r"claude-(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:-(\d{1,2}))?(?![\d])")
-_LEGACY_ID = re.compile(r"claude-(\d)(?:-(\d))?-(opus|sonnet|haiku)")
+# claude-<major>[-<minor>]-<family> (3.x). Ids are normalized first: a vendor
+# prefix up to the last ``/`` (``anthropic/claude-…``, a gateway's naming) is
+# dropped and dots become dashes (``claude-opus-4.7`` → ``claude-opus-4-7``).
+# A trailing date suffix (claude-sonnet-4-5-20250929) or a provider prefix
+# (us.anthropic.claude-…) does not change the family; a minor is at most two
+# digits so a date is never read as one.
+_FAMILIES = "opus|sonnet|haiku|fable|mythos"
+_NEW_ID = re.compile(rf"claude-({_FAMILIES})-(\d{{1,2}})(?:-(\d{{1,2}}))?(?!\d)")
+_LEGACY_ID = re.compile(rf"claude-(\d{{1,2}})(?:-(\d{{1,2}}))?-({_FAMILIES})")
 
 # Unknown ids (a gateway's own naming) get the conservative set: no
 # temperature (sending one is a 400 on every new model), auto tool choice
 # (valid on every model) and no effort.
 _UNKNOWN = ModelCapabilities(temperature=False, forced_tool_choice=False, effort=False)
 
+# 5-generation models the Claude API docs state accept a forced tool_choice
+# (Opus 5.5 / Sonnet 5.5 / Fable 5.1 / Mythos 5.1 reject it with a 400; the
+# rest of the generation is undocumented and stays on auto + instruction).
+_FORCED_TOOL_CHOICE_5X: frozenset[tuple[str, int, int]] = frozenset(
+    {("opus", 5, 0), ("sonnet", 5, 0), ("fable", 5, 0), ("haiku", 5, 5)}
+)
+
+
+def _normalize_model_id(model: str) -> str:
+    """Lower-cased id without a vendor prefix, with dotted versions dashed."""
+    return model.strip().lower().rsplit("/", 1)[-1].replace(".", "-")
+
 
 def _parse_model(model: str) -> tuple[str, int, int] | None:
     """``(family, major, minor)`` of a Claude model id, or None."""
-    m = model.strip().lower()
+    m = _normalize_model_id(model)
     new = _NEW_ID.search(m)
     if new is not None:
         return new.group(1), int(new.group(2)), int(new.group(3) or 0)
@@ -123,9 +141,10 @@ def model_capabilities(model: str) -> ModelCapabilities:
     * temperature: an allowlist of legacy models known to accept it —
       3.x, ``claude-haiku-4-5``, ``claude-sonnet-4-*`` up to 4.6 and
       ``claude-opus-4-*`` up to 4.6.
-    * forced tool choice: those plus Opus 4.7 / 4.8 (no thinking unless
-      asked for). Everything else — the 5 generation, Fable, Mythos, unknown
-      ids — gets ``auto`` plus an instruction.
+    * forced tool choice: those plus Opus 4.7 / 4.8 and the 5-generation
+      models documented to accept it (``_FORCED_TOOL_CHOICE_5X``).
+      Everything else — Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos, later
+      generations, unknown ids — gets ``auto`` plus an instruction.
     * effort: Opus 4.5+, Sonnet 4.6+, Haiku 5+, Fable, Mythos.
     """
     parsed = _parse_model(model)
@@ -135,7 +154,11 @@ def model_capabilities(model: str) -> ModelCapabilities:
     if major <= 3:
         return ModelCapabilities(temperature=True, forced_tool_choice=True, effort=False)
     if family in ("fable", "mythos") or major >= 5:
-        return ModelCapabilities(temperature=False, forced_tool_choice=False, effort=True)
+        return ModelCapabilities(
+            temperature=False,
+            forced_tool_choice=parsed in _FORCED_TOOL_CHOICE_5X,
+            effort=True,
+        )
     # major == 4
     if family == "haiku":
         return ModelCapabilities(temperature=True, forced_tool_choice=True, effort=False)
@@ -388,9 +411,11 @@ class LLMClient:
 
         A response is structurally unusable — and retried, up to
         ``_STRUCTURAL_RETRIES`` attempts in all — when it carries no
-        ``tool_use`` block for ``tool``, when it stopped at ``max_tokens``
-        (a truncated tool input is partial, not an answer; the retry doubles
-        the cap), or when a ``required`` field of the tool schema is missing.
+        ``tool_use`` block for ``tool``, or when it stopped at ``max_tokens``
+        before writing every ``required`` field of the tool schema (a
+        truncated tool input is partial, not an answer; the retry doubles the
+        cap). A complete call missing a required field is returned as-is —
+        the section decides what it means (an abstain needs no ``p_yes``).
         Raises ``LLMError`` (with the usage spent) on key / API failure or
         when no attempt is usable.
         """
@@ -421,15 +446,14 @@ class LLMClient:
                     data = dict(block.input)
                     break
 
-            if stop_reason == "max_tokens":
+            truncated = stop_reason == "max_tokens"
+            if data is not None and not (truncated and _missing_required(tool, data)):
+                return LLMResult(data=data, usage=usage)
+            if truncated:
                 last_error = f"response truncated at max_tokens={cap}"
                 cap = min(cap * 2, _MAX_TOKENS_CEILING)
-            elif data is None:
-                last_error = f"no '{tool_name}' tool call (stop_reason={stop_reason})"
-            elif missing := _missing_required(tool, data):
-                last_error = f"'{tool_name}' call missing required field(s): {', '.join(missing)}"
             else:
-                return LLMResult(data=data, usage=usage)
+                last_error = f"no '{tool_name}' tool call (stop_reason={stop_reason})"
             logger.warning("LLM attempt %d/%d: %s", attempt, _STRUCTURAL_RETRIES, last_error)
 
         raise LLMError(f"LLM returned no usable tool call: {last_error}", usage=usage)

@@ -212,9 +212,16 @@ async def _apply_canvas_reload(
 
     # News source: the orchestrator re-checks news age against its freshness
     # window at decision time; it resolves that once at build, so re-read it.
+    # The running WS client filters arrivals with the same window: apply it
+    # there too, live (other news_source fields still need a restart).
     if _section_config(old_template, "news_source") != _section_config(new_template, "news_source"):
         try:
             orch_mod.reload_news_max_age()
+            from openpoly.news.manager import manager as news_source_manager
+            from openpoly.sections.news_source.tradingnews_ws import TradingNewsWSConfig
+
+            news_cfg = orch_mod._canvas_config(TradingNewsWSConfig, "news_source")
+            news_source_manager.apply_freshness_seconds(news_cfg.freshness_seconds)
             logger.info("canvas reload: applied news freshness window")
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to apply news freshness window")
