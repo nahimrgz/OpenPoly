@@ -108,3 +108,51 @@ def test_save_is_atomic_no_tmp_leftover(_isolate_canvas: Path) -> None:
     save_template(_tpl())
     siblings = list(_isolate_canvas.parent.iterdir())
     assert [p.name for p in siblings] == [_isolate_canvas.name]
+
+
+# ---------- v3 -> v4 upgrade: entry cooldown ----------
+
+
+def _entry_tpl(version: int, cooldown: int | None) -> dict:
+    cfg = {} if cooldown is None else {"same_market_cooldown_minutes": cooldown}
+    return {
+        "version": version,
+        "name": "t",
+        "nodes": [{"id": "e", "sectionType": "entry", "position": {"x": 0, "y": 0}, "config": cfg}],
+        "edges": [],
+    }
+
+
+def test_v3_canvas_lifts_v0_cooldown_zero_to_sixty() -> None:
+    """Regression: the v0-era persisted 0 overrode entry v1's default of 60."""
+    from openpoly.runtime.canvas_store import section_config
+
+    save_template(_entry_tpl(3, 0))
+    assert section_config("entry")["same_market_cooldown_minutes"] == 60
+    # The stored file and the API view are untouched.
+    loaded = load_template()
+    assert loaded is not None and loaded["version"] == 3
+
+
+def test_v4_canvas_keeps_a_deliberate_zero() -> None:
+    from openpoly.runtime.canvas_store import section_config
+
+    save_template(_entry_tpl(4, 0))
+    assert section_config("entry")["same_market_cooldown_minutes"] == 0
+
+
+def test_upgrade_leaves_other_values_alone() -> None:
+    from openpoly.runtime.canvas_store import upgrade_template
+
+    t = _entry_tpl(3, 15)
+    assert upgrade_template(t)["nodes"][0]["config"]["same_market_cooldown_minutes"] == 15
+    assert t["version"] == 3  # input not mutated
+    assert upgrade_template(_entry_tpl(3, None))["nodes"][0]["config"] == {}
+
+
+def test_build_section_gets_the_upgraded_cooldown() -> None:
+    from openpoly.runtime.active_sections import build_section
+
+    save_template(_entry_tpl(3, 0))
+    entry = build_section("entry")
+    assert entry.config.same_market_cooldown_minutes == 60

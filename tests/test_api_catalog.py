@@ -56,3 +56,32 @@ def test_catalog_cache_resets() -> None:
     api_main.reset_catalog()
     r2 = client.get("/api/sections/catalog").json()
     assert r1 == r2  # deterministic; just ensure reset hook does not crash
+
+
+def test_catalog_marks_exactly_the_runtime_impl_active() -> None:
+    """Several versions of one type can be registered side by side; the canvas
+    reads ``active`` to know which one the backend runs."""
+    api_main.reset_catalog()
+    sections = client.get("/api/sections/catalog").json()["sections"]
+    active = {s["type"]: s["name"] for s in sections if s["active"]}
+    assert active["analyzer"] == "LLMAnalyzerV1"
+    assert active["entry"] == "EdgeThresholdEntryV1"
+    assert active["exit"] == "ThresholdExitV1"
+    # One active impl per type.
+    assert len(active) == len([s for s in sections if s["active"]])
+    # The v0 impls stay registered.
+    names = {s["name"] for s in sections}
+    assert {"LLMAnalyzerV0", "EdgeThresholdEntryV0", "ThresholdExitV0"} <= names
+
+
+def test_build_section_builds_the_active_classes() -> None:
+    from openpoly.runtime.active_sections import ACTIVE_SECTION_IMPLS, build_section
+    from openpoly.runtime.exit_monitor import exit_monitor
+
+    for section_type in ("embedding", "analyzer", "entry", "exit"):
+        inst = build_section(section_type)
+        cls = type(inst)
+        assert ACTIVE_SECTION_IMPLS[section_type] == (cls.__module__, cls.__name__)
+        assert isinstance(inst.config, cls.Config)
+    exit_cls = type(exit_monitor._exit)  # noqa: SLF001
+    assert ACTIVE_SECTION_IMPLS["exit"] == (exit_cls.__module__, exit_cls.__name__)

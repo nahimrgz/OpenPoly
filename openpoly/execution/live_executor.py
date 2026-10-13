@@ -283,6 +283,41 @@ def _bookable_price(
     return worst
 
 
+def _sell_price_estimate(
+    bids: list[tuple[float, float]], *, limit: float, qty: float, token_id: str
+) -> float:
+    """Best estimate of what a crossing SELL limit at ``limit`` realized for
+    ``qty`` shares, when the venue's own account of the fill is lost.
+
+    The volume-weighted price of the pre-sell book's bid levels at or above
+    the limit, taken best-first for ``qty``; whatever those levels cannot
+    cover is priced at the limit (a SELL never fills below it). With no
+    qualifying level it falls back to the best bid at sell time — the cached
+    book now — and to the limit when that is gone too. Never below the limit.
+
+    Booking every inferred fill at the limit understated proceeds by the
+    whole sweep: the limit is the *floor* of the sweep, so a stop marked deep
+    into the book booked a loss the sell never took, and the fabricated loss
+    fed the entry kill switch.
+    """
+    levels = [(p, s) for p, s in bids if p >= limit and s > 0]
+    if not levels:
+        current = market_source_manager.store.get_order_book(token_id)
+        best = current.bids[0][0] if current is not None and current.bids else None
+        return max(limit, best) if best is not None and in_price_band(best) else limit
+    remaining = qty
+    notional = 0.0
+    for price, size in levels:
+        take = min(remaining, size)
+        notional += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        notional += remaining * limit
+    return max(limit, notional / qty) if qty > 0 else limit
+
+
 @dataclass(frozen=True)
 class _Fill:
     """What the venue actually did with one order: final matched size, the
@@ -844,12 +879,17 @@ class LiveExecutor:
         size: float,
         limit_price: float,
         confirm: Callable[[], float],
+        estimate_price: Callable[[float], float] | None = None,
     ) -> _Fill | ExecResult:
         """Turn a successful POST /order response into what actually filled, or
         into the ``ExecResult.skip`` to return. This is where the venue's own
         account of the order is either believed or thrown away; the settle step
         below is handed only numbers that survived that, and runs whenever what
-        did survive is short of ``size``."""
+        did survive is short of ``size``.
+
+        ``estimate_price(qty)`` replaces the limit as the stand-in price when
+        the response carried no usable amounts (see ``_sell_price_estimate``);
+        without it the limit is used, as before."""
         if side not in ("buy", "sell"):
             raise ValueError(f"invalid side: {side!r}")
         # ``makingAmount`` is what our order gives, ``takingAmount`` what it
@@ -912,12 +952,13 @@ class LiveExecutor:
             # BUY cost can only be ≤ it, SELL proceeds ≥ it.
             logger.warning(
                 "%s: %.4f filled but the response carried no usable amounts — "
-                "falling back to the limit price (order=%s)",
+                "falling back to %s (order=%s)",
                 side,
                 qty,
+                "the pre-order book estimate" if estimate_price else "the limit price",
                 order_id,
             )
-            price = None
+            price = estimate_price(qty) if estimate_price is not None else None
         return _Fill(
             qty=qty,
             price=_bookable_price(price, fallback=limit_price, side=side, order_id=order_id),
@@ -927,7 +968,13 @@ class LiveExecutor:
         )
 
     def _fill_from_balance(
-        self, confirm: Callable[[], float], *, side: str, size: float, limit_price: float
+        self,
+        confirm: Callable[[], float],
+        *,
+        side: str,
+        size: float,
+        limit_price: float,
+        estimate_price: Callable[[float], float] | None = None,
     ) -> _Fill | ExecResult | None:
         """The fill as the CTF balance tells it, for when the venue's own account
         of the order is unavailable (lost response): the balance delta booked at
@@ -940,6 +987,9 @@ class LiveExecutor:
         venue's own account of the order is already gone, so a delta that
         establishes nothing leaves this order's fate unknown rather than merely
         unmeasured.
+
+        ``estimate_price(qty)``, when given, is booked instead of the limit
+        (see ``_sell_price_estimate``).
         """
         if side not in ("buy", "sell"):
             raise ValueError(f"invalid side: {side!r}")
@@ -960,7 +1010,8 @@ class LiveExecutor:
                 qty,
                 size,
             )
-        price = _bookable_price(None, fallback=limit_price, side=side, order_id=None)
+        estimate = estimate_price(qty) if estimate_price is not None else None
+        price = _bookable_price(estimate, fallback=limit_price, side=side, order_id=None)
         return _Fill(qty=qty, price=price, tx_hash=None, order_id=None, resting=resting)
 
     def _persist_irreversible(self, write: Callable[[], _T], *, what: str) -> _T:
@@ -1105,7 +1156,7 @@ class LiveExecutor:
         market = catalog.get(intent.market_id)
         if market is None:
             return ExecResult.skip("market_not_found")
-        token_id = market.yes_token_id if intent.side == "yes" else market.no_token_id
+        token_id = market.token_for(intent.side)
         if token_id is None:
             return ExecResult.skip("no_token")
 
@@ -1244,7 +1295,18 @@ class LiveExecutor:
         close_reason: CloseReason,
         ts: float,
         trigger: str | None = None,
+        floor_price: float | None = None,
     ) -> ExecResult:
+        """Sell a held position with a crossing GTC limit order.
+
+        The limit is the book's best bid, or ``floor_price`` — the mark the
+        exit decision was made on — when that is lower: a crossing SELL limit
+        at the mark fills against every bid level down to it, the live
+        counterpart of the paper executor's sweep, instead of only the level-1
+        sliver. A mark above the best bid (the book fell since the decision)
+        keeps the best bid, as paper does. Only the limit price changes; the
+        order type, size and the settle / confirm flow are the same either way.
+        """
         catalog = market_source_manager.store
         market = catalog.get(position.market_id)
         if market is None:
@@ -1254,6 +1316,8 @@ class LiveExecutor:
         if book is None or not book.bids:
             return ExecResult.skip("no_bid_liquidity")
         bid_price = book.bids[0][0]
+        if floor_price is not None and floor_price < bid_price:
+            bid_price = floor_price
         # The order is SIGNED at this price. Refusing afterwards only declines to
         # RECORD a price we already traded at, so a book the venue could not have
         # produced stops the trade here — nothing upstream validates its levels.
@@ -1298,6 +1362,17 @@ class LiveExecutor:
         def confirm() -> float:
             return self._confirm_lost_order_qty(position.token_id, pre_raw, "drop")
 
+        # The book as it stood before the order went out: when the venue's own
+        # account of the fill is lost, its levels at or above the limit are
+        # the best estimate of what the crossing sell actually took.
+        pre_sell_bids = list(book.bids)
+        limit = bid_price
+
+        def estimate(qty: float) -> float:
+            return _sell_price_estimate(
+                pre_sell_bids, limit=limit, qty=qty, token_id=position.token_id
+            )
+
         fill: _Fill | ExecResult | None
         try:
             resp = self._post_order(
@@ -1324,7 +1399,9 @@ class LiveExecutor:
                 return ExecResult.skip(f"live_rejected:{exc.error_msg}")
             # The order may have filled despite the lost response — confirm via
             # the balance before declaring failure (R5 at-least-once).
-            fill = self._fill_from_balance(confirm, side="sell", size=size, limit_price=bid_price)
+            fill = self._fill_from_balance(
+                confirm, side="sell", size=size, limit_price=bid_price, estimate_price=estimate
+            )
             if isinstance(fill, ExecResult):
                 return fill
             if fill is None:
@@ -1332,7 +1409,7 @@ class LiveExecutor:
                 return ExecResult.skip(f"live_error:{type(exc).__name__}")
             logger.warning(
                 "sell response lost (%s) but CTF balance dropped %.4f — "
-                "recording fill at limit price %.4f",
+                "recording fill at the pre-sell book estimate %.4f",
                 type(exc).__name__,
                 fill.qty,
                 fill.price,
@@ -1341,7 +1418,12 @@ class LiveExecutor:
             if _order_was_rejected(resp):
                 return ExecResult.skip(f"live_rejected:{_rejection_reason(resp)}")
             fill = self._resolve_fill(
-                resp, side="sell", size=size, limit_price=bid_price, confirm=confirm
+                resp,
+                side="sell",
+                size=size,
+                limit_price=bid_price,
+                confirm=confirm,
+                estimate_price=estimate,
             )
             if isinstance(fill, ExecResult):
                 return fill

@@ -52,7 +52,7 @@ class _FakeExecutor:
             self._calls.live_buys += 1
         return ExecResult.ok(price=0.5, qty=10.0, position_id=1)
 
-    def execute_sell(self, position, *, close_reason, ts, trigger=None):
+    def execute_sell(self, position, *, close_reason, ts, trigger=None, floor_price=None):
         if self._kind == "paper":
             self._calls.paper_sells += 1
         else:

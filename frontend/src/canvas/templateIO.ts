@@ -6,7 +6,7 @@ import {
 } from '../sections/catalog'
 import type { ConfigValues, SectionType } from '../sections/types'
 
-export const TEMPLATE_VERSION = 3
+export const TEMPLATE_VERSION = 4
 export const STORAGE_KEY = 'openpoly.template.draft'
 
 export type TemplateNode = {
@@ -60,17 +60,8 @@ export function loadFromStorage(): LoadResult | null {
   try {
     const parsed = JSON.parse(raw) as StoredTemplate
     if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) return null
-    // Run the migration chain step by step so a v1 draft climbs v1→v2→v3.
-    let stored: StoredTemplate = parsed
-    let migrated = false
-    if (stored.version === 1) {
-      stored = migrateV1toV2(stored)
-      migrated = true
-    }
-    if (stored.version === 2) {
-      stored = migrateV2toV3(stored)
-      migrated = true
-    }
+    // Run the migration chain step by step so a v1 draft climbs v1→…→v4.
+    const { stored, migrated } = migrate(parsed)
     if (stored.version !== TEMPLATE_VERSION) return null
     const template = stored as Template
     if (!hasOnlyKnownSections(template)) return { status: 'incompatible' }
@@ -141,16 +132,7 @@ async function _parseTemplate(raw: unknown): Promise<FetchResult> {
   }
   // Migration chain — same as loadFromStorage, so an old backend canvas
   // self-upgrades on the way in.
-  let stored: StoredTemplate = r
-  let migrated = false
-  if (stored.version === 1) {
-    stored = migrateV1toV2(stored)
-    migrated = true
-  }
-  if (stored.version === 2) {
-    stored = migrateV2toV3(stored)
-    migrated = true
-  }
+  const { stored, migrated } = migrate(r)
   if (stored.version !== TEMPLATE_VERSION) {
     return { status: 'incompatible' }
   }
@@ -314,4 +296,45 @@ function migrateV2toV3(v2: StoredTemplate): StoredTemplate {
     }
   }
   return { version: 3, name: v2.name, nodes: v2.nodes, edges }
+}
+
+// v3 → v4: entry v1 defaults ``same_market_cooldown_minutes`` to 60, but a
+// canvas saved while entry v0 was active persisted v0's default of 0 — which,
+// being explicit, overrode v1's default and silently disabled the cooldown.
+// Lift an explicit 0 to 60 once. A v4 canvas is never migrated again, so a
+// user who deliberately sets 0 after the upgrade keeps it. The backend applies
+// the same step when it reads a v3 canvas (``canvas_store.upgrade_template``),
+// so the runtime agrees before the frontend has saved the upgraded canvas.
+export const ENTRY_V1_COOLDOWN_MINUTES = 60
+
+function migrateV3toV4(v3: StoredTemplate): StoredTemplate {
+  const nodes = v3.nodes.map((n) =>
+    n.sectionType === 'entry' && n.config?.same_market_cooldown_minutes === 0
+      ? {
+          ...n,
+          config: { ...n.config, same_market_cooldown_minutes: ENTRY_V1_COOLDOWN_MINUTES },
+        }
+      : n,
+  )
+  return { version: 4, name: v3.name, nodes, edges: v3.edges }
+}
+
+// The whole chain, one step per version, so any older template climbs to the
+// current one.
+function migrate(input: StoredTemplate): { stored: StoredTemplate; migrated: boolean } {
+  let stored = input
+  let migrated = false
+  if (stored.version === 1) {
+    stored = migrateV1toV2(stored)
+    migrated = true
+  }
+  if (stored.version === 2) {
+    stored = migrateV2toV3(stored)
+    migrated = true
+  }
+  if (stored.version === 3) {
+    stored = migrateV3toV4(stored)
+    migrated = true
+  }
+  return { stored, migrated }
 }

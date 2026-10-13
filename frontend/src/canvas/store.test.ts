@@ -116,11 +116,11 @@ describe('startup state', () => {
     )
     const useStore = await freshStore()
     expect(useStore.getState().startupFlash).toBe(
-      'Migrated draft to v3: linked Embedding → Database',
+      'Migrated draft to the current canvas version',
     )
     // consumeStartupFlash hands it over exactly once.
     expect(useStore.getState().consumeStartupFlash()).toBe(
-      'Migrated draft to v3: linked Embedding → Database',
+      'Migrated draft to the current canvas version',
     )
     expect(useStore.getState().consumeStartupFlash()).toBeNull()
   })

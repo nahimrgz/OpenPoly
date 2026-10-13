@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 import websockets
 from websockets.exceptions import InvalidStatus
 
@@ -339,3 +341,54 @@ def test_default_parse_happy() -> None:
     assert item.urgency == "medium"
     assert item.sentiment == 0.2
     assert item.published_at == 100.0
+
+
+def test_default_parse_naive_iso_timestamp_is_utc() -> None:
+    """A timestamp with no offset is UTC, not the host's local time."""
+    from datetime import datetime, timezone
+
+    item = default_parse(json.dumps({"id": "n", "published_at": "2026-05-19T10:49:35"}))
+    assert item is not None
+    expected = datetime(2026, 5, 19, 10, 49, 35, tzinfo=timezone.utc).timestamp()
+    assert item.published_at == expected
+
+
+def test_default_parse_offset_iso_timestamp_unchanged() -> None:
+    from datetime import datetime, timezone
+
+    item = default_parse(json.dumps({"id": "n", "published_at": "2026-05-19T12:49:35+02:00"}))
+    assert item is not None
+    expected = datetime(2026, 5, 19, 10, 49, 35, tzinfo=timezone.utc).timestamp()
+    assert item.published_at == expected
+
+
+def test_default_parse_reads_an_epoch_in_milliseconds() -> None:
+    """Regression: an epoch-ms value was read as seconds (~50,000 years out)
+    and the item dropped; it is now converted."""
+    import time as _time
+
+    sec = _time.time() - 30
+    item = default_parse(json.dumps({"id": "n", "published_at": sec * 1000}))
+    assert item is not None
+    assert item.published_at == pytest.approx(sec)
+    item = default_parse(json.dumps({"id": "n", "published_at": str(sec * 1000)}))
+    assert item is not None
+    assert item.published_at == pytest.approx(sec)
+
+
+def test_default_parse_far_future_timestamp_falls_back_to_receive_time() -> None:
+    """A publish time well in the future is not trusted — its negative age
+    would pass every freshness check — but the item is kept, timed by its
+    arrival."""
+    item = default_parse(json.dumps({"id": "n", "published_at": "2999-01-01T00:00:00+00:00"}))
+    assert item is not None
+    assert item.published_at == item.received_at
+
+
+def test_default_parse_tolerates_small_clock_skew() -> None:
+    import time as _time
+
+    ahead = _time.time() + 30
+    item = default_parse(json.dumps({"id": "n", "published_at": ahead}))
+    assert item is not None
+    assert item.published_at == ahead

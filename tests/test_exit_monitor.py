@@ -113,6 +113,7 @@ class _FakeExecutor:
         self._result = result
         self._exc = exc
         self.calls: list[dict[str, object]] = []
+        self.floors: list[float | None] = []
 
     def execute_sell(
         self,
@@ -121,6 +122,7 @@ class _FakeExecutor:
         close_reason: str,
         ts: float,
         trigger: str | None,
+        floor_price: float | None = None,
     ) -> ExecResult:
         self.calls.append(
             {
@@ -129,6 +131,7 @@ class _FakeExecutor:
                 "trigger": trigger,
             }
         )
+        self.floors.append(floor_price)
         if self._exc is not None:
             raise self._exc
         return self._result or ExecResult.ok(
@@ -585,6 +588,24 @@ async def test_marked_position_carries_spread_from_the_book() -> None:
     assert marked.tick_size is None
 
 
+async def test_marked_position_carries_the_level_one_ask() -> None:
+    """threshold_v1's stop-loss compares the ask with the entry ask."""
+    captured: list[object] = []
+
+    class _Recorder:
+        def run(self, input):  # noqa: ANN001, ANN201
+            captured.append(input.payload)
+            return ThresholdExitV0(ThresholdExitConfig()).run(input)
+
+    market_source_manager.store.set_order_books(
+        [OrderBook(token_id="t1", ts=1.0, bids=[(0.50, 100.0)], asks=[(0.53, 100.0)])]
+    )
+    m = ExitMonitor(exit_section=_Recorder(), executor=_FakeExecutor(), tick_interval_seconds=3600)
+    m.configure(_FakePortfolio([_held(1, "t1", avg=0.48)]))  # type: ignore[arg-type]
+    await m._tick_once()
+    assert captured[0].ask == 0.53
+
+
 async def test_bootstrap_peaks_ignores_thin_snapshot_bids(tmp_path) -> None:
     db_path = tmp_path / "openpoly_peak_thin.db"
     engine = make_engine(f"sqlite:///{db_path}")
@@ -740,7 +761,7 @@ async def test_execute_sell_runs_off_the_event_loop() -> None:
     import time as _time
 
     class _SlowExecutor(_FakeExecutor):
-        def execute_sell(self, position, *, close_reason, ts, trigger):  # noqa: ANN001, ANN201
+        def execute_sell(self, position, *, close_reason, ts, trigger, floor_price=None):  # noqa: ANN001, ANN201
             _time.sleep(0.3)
             return super().execute_sell(position, close_reason=close_reason, ts=ts, trigger=trigger)
 
@@ -798,7 +819,7 @@ class _SleepingExecutor(_FakeExecutor):
         super().__init__(**kwargs)
         self._seconds = seconds
 
-    def execute_sell(self, position, *, close_reason, ts, trigger):  # noqa: ANN001, ANN201
+    def execute_sell(self, position, *, close_reason, ts, trigger, floor_price=None):  # noqa: ANN001, ANN201
         import time as _time
 
         _time.sleep(self._seconds)
@@ -966,7 +987,7 @@ async def test_position_closed_mid_sweep_is_not_sold_from_the_stale_snapshot(tmp
         """Blocks the worker thread on the first position's sell and tells the
         event loop it is in flight, so the race is deterministic."""
 
-        def execute_sell(self, position, *, close_reason, ts, trigger):  # noqa: ANN001, ANN201
+        def execute_sell(self, position, *, close_reason, ts, trigger, floor_price=None):  # noqa: ANN001, ANN201
             if position.position_id == first.position_id:
                 selling.set()
                 _time.sleep(0.3)
@@ -1102,7 +1123,7 @@ class _PartialExecutor(_FakeExecutor):
         self._portfolio = portfolio
         self._sold = sold_qty
 
-    def execute_sell(self, position, *, close_reason, ts, trigger):  # type: ignore[override]
+    def execute_sell(self, position, *, close_reason, ts, trigger, floor_price=None):  # type: ignore[override]
         result = super().execute_sell(position, close_reason=close_reason, ts=ts, trigger=trigger)
         self._portfolio.apply_sell(position.position_id)
         return result

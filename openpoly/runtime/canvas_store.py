@@ -81,8 +81,59 @@ def load_template_with_rev() -> tuple[dict[str, Any], str] | None:
     return t, compute_rev(t)
 
 
+# The canvas template version this backend understands — mirrors the
+# frontend's ``TEMPLATE_VERSION`` (``frontend/src/canvas/templateIO.ts``).
+CANVAS_TEMPLATE_VERSION = 4
+
+# Entry v1's cooldown default; v3 canvases persisted entry v0's 0 instead.
+_ENTRY_V1_COOLDOWN_MINUTES = 60
+
+
+def upgrade_template(template: dict[str, Any]) -> dict[str, Any]:
+    """Apply the canvas migrations the backend's section configs depend on —
+    the same steps the frontend runs on load — and return the upgraded copy
+    (the input is not mutated).
+
+    v3 → v4: a canvas saved while entry v0 was active persisted v0's
+    ``same_market_cooldown_minutes: 0``, and that explicit 0 overrode entry
+    v1's default of 60, silently disabling the cooldown. An explicit 0 on an
+    entry node of a pre-v4 canvas is lifted to 60. The template's ``version``
+    is the marker that makes this a one-time step: once the frontend saves
+    the upgraded (v4) canvas, a 0 the user sets afterwards is kept.
+
+    Only the runtime's view is upgraded (``section_config``); the stored file
+    and ``GET /api/canvas/template`` stay as written, and the frontend
+    migrates — and on its next save persists — the same change itself.
+    """
+    version = template.get("version")
+    if not isinstance(version, int) or version >= CANVAS_TEMPLATE_VERSION:
+        return template
+    nodes = template.get("nodes")
+    upgraded_nodes: list[Any] = []
+    for node in nodes if isinstance(nodes, list) else []:
+        if (
+            isinstance(node, dict)
+            and node.get("sectionType") == "entry"
+            and isinstance(node.get("config"), dict)
+            and node["config"].get("same_market_cooldown_minutes") == 0
+        ):
+            node = {
+                **node,
+                "config": {
+                    **node["config"],
+                    "same_market_cooldown_minutes": _ENTRY_V1_COOLDOWN_MINUTES,
+                },
+            }
+        upgraded_nodes.append(node)
+    upgraded = {**template, "version": CANVAS_TEMPLATE_VERSION}
+    if isinstance(nodes, list):
+        upgraded["nodes"] = upgraded_nodes
+    return upgraded
+
+
 def section_config(section_type: str) -> dict[str, Any]:
-    """The config dict of the first canvas node of ``section_type``.
+    """The config dict of the first canvas node of ``section_type``, read
+    from the upgraded template (``upgrade_template``).
 
     Returns ``{}`` when no template is persisted or no such node exists — the
     caller then builds the section from its own defaults.
@@ -90,6 +141,7 @@ def section_config(section_type: str) -> dict[str, Any]:
     template = load_template()
     if not template:
         return {}
+    template = upgrade_template(template)
     nodes = template.get("nodes")
     if not isinstance(nodes, list):
         return {}

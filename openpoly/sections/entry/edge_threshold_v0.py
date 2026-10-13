@@ -36,21 +36,58 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal, NamedTuple, TYPE_CHECKING
+from typing import Callable, Literal, NamedTuple, Protocol, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from openpoly.markets.manager import manager as market_source_manager
+from openpoly.markets.models import OrderBook
 from openpoly.markets.polymarket_api import recent_move
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.analyzer.llm_v0 import AnalysisResult
 
 if TYPE_CHECKING:
-    from openpoly.portfolio import PortfolioStore
+    from openpoly.portfolio import HeldPosition, PortfolioStore, PositionRecord
 
 
 Side = Literal["yes", "no"]
 PortfolioProvider = Callable[[], "PortfolioStore | None"]
+
+
+# A side's level-1 quote: (token_id, best_ask, best_bid).
+Quote = tuple[str, float, float]
+# A side decision: (side, signals every later skip carries, the quote the side
+# was chosen from — None when it was chosen without reading one).
+SideChoice = tuple[Side, dict[str, object], Quote | None]
+
+
+class PortfolioReader(Protocol):
+    """The two portfolio reads the entry gates make."""
+
+    def list_positions(self, limit: int = 100) -> list["PositionRecord"]: ...
+
+    def get_open_positions(self) -> list["HeldPosition"]: ...
+
+
+class _PortfolioSnapshot:
+    """Per-decision memo over a ``PortfolioReader``: the heat cap, kill switch
+    and per-market gates all read the same slices, so one decision reads each
+    at most once."""
+
+    def __init__(self, inner: PortfolioReader) -> None:
+        self._inner = inner
+        self._listed: dict[int, list["PositionRecord"]] = {}
+        self._open: list["HeldPosition"] | None = None
+
+    def list_positions(self, limit: int = 100) -> list["PositionRecord"]:
+        if limit not in self._listed:
+            self._listed[limit] = self._inner.list_positions(limit=limit)
+        return self._listed[limit]
+
+    def get_open_positions(self) -> list["HeldPosition"]:
+        if self._open is None:
+            self._open = self._inner.get_open_positions()
+        return self._open
 
 
 @dataclass(frozen=True)
@@ -222,124 +259,39 @@ class EdgeThresholdEntryV0:
         if not isinstance(res, AnalysisResult):
             return SectionOutput(payload=None, verdict="skip", reason="no analysis upstream")
 
-        side: Side = "yes" if res.p_model >= 0.5 else "no"
-        if self.config.side_lock and side != "yes":
-            return SectionOutput(payload=None, verdict="skip", reason="side_lock active")
+        # The decision is a fixed sequence of steps; each returns a skip
+        # SectionOutput or its result. Versions override individual steps
+        # (v1: side selection and two extra gates), not this sequence.
+        choice = self._choose_side(res)
+        if isinstance(choice, SectionOutput):
+            return choice
+        side, side_signals, chosen_quote = choice
 
-        # Portfolio-aware gates — cheapest first. Only fetch the portfolio
-        # when at least one gate is enabled (keeps the default config from
-        # touching the DB at all, which contract tests rely on).
-        needs_portfolio = (
-            self.config.heat_cap_usd > 0
-            or self.config.same_market_lifetime_lockout
-            or self.config.same_market_cooldown_minutes > 0
-            or self.config.kill_max_consecutive_losses > 0
-            or self.config.kill_daily_loss_usd > 0
-            or self.config.kill_max_drawdown_usd > 0
-        )
-        portfolio = (
-            self._portfolio_provider() if needs_portfolio and self._portfolio_provider else None
-        )
-        # Kept for the sizing step below: the heat cap has to bound what is
-        # actually bought, so a scaled order is capped by the headroom left
-        # over this same open exposure. None when the gate is off.
-        open_cost: float | None = None
-        if portfolio is not None:
-            # heat_cap: portfolio-wide ceiling. One get_open_positions call,
-            # only sums the currently-open set, returns fast.
-            cap_usd = self.config.heat_cap_usd
-            if cap_usd > 0:
-                opens = portfolio.get_open_positions()
-                open_cost = sum(h.qty * h.avg_entry_price for h in opens)
-                if open_cost >= cap_usd:
-                    return SectionOutput(
-                        payload=None,
-                        verdict="skip",
-                        reason="heat_cap",
-                        signals={
-                            "side": side,
-                            "open_cost": round(open_cost, 2),
-                            "heat_cap_usd": cap_usd,
-                            "open_position_count": len(opens),
-                        },
-                    )
+        portfolio_skip, open_cost = self._portfolio_gates(res, side, side_signals)
+        if portfolio_skip is not None:
+            return portfolio_skip
 
-            # A4 kill switch: portfolio-wide circuit breakers from realized
-            # PnL history. Fires before per-market lockout because a tripped
-            # brake is a system-level stop — no need to scan further.
-            kill_skip = _kill_switch_check(portfolio, self.config, now=None)
-            if kill_skip is not None:
-                reason, signals = kill_skip
-                return SectionOutput(
-                    payload=None,
-                    verdict="skip",
-                    reason=reason,
-                    signals={"side": side, **signals},
-                )
+        # A side chosen from a quote is priced from that same quote, so the
+        # book cannot change between choosing the side and pricing it.
+        quote = chosen_quote if chosen_quote is not None else self._read_quote(res, side)
+        if isinstance(quote, SectionOutput):
+            return quote
+        token_id, held_price, best_bid = quote
 
-            # Lockout / cooldown: per-(market, side) gate. Lifetime lockout
-            # supersedes the time-window cooldown when enabled.
-            if self.config.same_market_lifetime_lockout:
-                if _market_side_has_history(portfolio, res.market_id, side):
-                    return SectionOutput(
-                        payload=None,
-                        verdict="skip",
-                        reason="same_market_lockout",
-                        signals={"side": side},
-                    )
-            elif self.config.same_market_cooldown_minutes > 0:
-                cooldown_min = self.config.same_market_cooldown_minutes
-                if _in_cooldown(portfolio, res.market_id, side, cooldown_min):
-                    return SectionOutput(
-                        payload=None,
-                        verdict="skip",
-                        reason="same_market_cooldown",
-                        signals={
-                            "side": side,
-                            "cooldown_minutes": cooldown_min,
-                        },
-                    )
-
-        catalog = market_source_manager.store
-        market = catalog.get(res.market_id)
-        if market is None:
-            return SectionOutput(payload=None, verdict="skip", reason="market not found")
-        token_id = market.yes_token_id if side == "yes" else market.no_token_id
-        if token_id is None:
-            return SectionOutput(payload=None, verdict="skip", reason="no token for side")
-
-        book = catalog.get_order_book(token_id)
-        if book is None or not book.asks or not book.bids:
-            return SectionOutput(payload=None, verdict="skip", reason="no order book")
-        held_price = book.asks[0][0]
-        if held_price <= 0.0:
-            return SectionOutput(payload=None, verdict="skip", reason="invalid ask price")
-
-        spread = held_price - book.bids[0][0]
+        spread = held_price - best_bid
         fair = res.p_model if side == "yes" else 1.0 - res.p_model
         edge = fair - held_price
-        signals = {
-            "side": side,
+        signals: dict[str, object] = {
+            **side_signals,
             "edge": round(edge, 4),
             "spread": round(spread, 4),
             "p_model": res.p_model,
             "held_price": held_price,
         }
 
-        if edge < self.config.min_edge:
-            return SectionOutput(
-                payload=None,
-                verdict="skip",
-                reason="edge below min_edge",
-                signals=signals,
-            )
-        if spread > self.config.max_spread:
-            return SectionOutput(
-                payload=None,
-                verdict="skip",
-                reason="spread above max_spread",
-                signals=signals,
-            )
+        price_skip = self._price_gates(edge, spread, held_price, signals)
+        if price_skip is not None:
+            return price_skip
 
         # Late-buy veto: if the held side's token has already run up over the
         # recent window, the fast-news alpha is gone. recent_move fails open
@@ -375,6 +327,169 @@ class EdgeThresholdEntryV0:
             edge=edge,
         )
         return SectionOutput(payload=intent, verdict="ok", signals=signals)
+
+    # ---------- decision steps (overridable) ----------
+
+    def _choose_side(self, res: AnalysisResult) -> SideChoice | SectionOutput:
+        """YES when ``p_model >= 0.5``, else NO; ``side_lock`` refuses NO.
+        Returns ``(side, signals, quote)`` — the signals every later skip
+        carries, and the quote the side was chosen from (None here: v0 picks
+        the side from the probability alone and reads the quote afterwards)."""
+        side: Side = "yes" if res.p_model >= 0.5 else "no"
+        if self.config.side_lock and side != "yes":
+            return SectionOutput(payload=None, verdict="skip", reason="side_lock active")
+        return side, {"side": side}, None
+
+    def _needs_portfolio(self) -> bool:
+        """Whether any portfolio-aware gate is enabled. Only then is the
+        portfolio fetched (keeps the default config from touching the DB at
+        all, which contract tests rely on)."""
+        return (
+            self.config.heat_cap_usd > 0
+            or self.config.same_market_lifetime_lockout
+            or self.config.same_market_cooldown_minutes > 0
+            or self._kill_switch_enabled()
+        )
+
+    def _kill_switch_enabled(self) -> bool:
+        return (
+            self.config.kill_max_consecutive_losses > 0
+            or self.config.kill_daily_loss_usd > 0
+            or self.config.kill_max_drawdown_usd > 0
+        )
+
+    def _portfolio_gates(
+        self, res: AnalysisResult, side: Side, signals: dict[str, object]
+    ) -> tuple[SectionOutput | None, float | None]:
+        """Portfolio-aware gates, cheapest first. Returns ``(skip, open_cost)``;
+        ``open_cost`` is kept for sizing — the heat cap has to bound what is
+        actually bought, so a scaled order is capped by the headroom left over
+        this same open exposure. None when the heat cap is off."""
+        raw = (
+            self._portfolio_provider()
+            if self._needs_portfolio() and self._portfolio_provider
+            else None
+        )
+        if raw is None:
+            return None, None
+        # Every gate below reads the same two position slices; memoize them so
+        # one decision costs at most one read of each.
+        portfolio = _PortfolioSnapshot(raw)
+        open_cost: float | None = None
+        # heat_cap: portfolio-wide ceiling. One get_open_positions call,
+        # only sums the currently-open set, returns fast.
+        cap_usd = self.config.heat_cap_usd
+        if cap_usd > 0:
+            opens = portfolio.get_open_positions()
+            open_cost = sum(h.qty * h.avg_entry_price for h in opens)
+            if open_cost >= cap_usd:
+                return SectionOutput(
+                    payload=None,
+                    verdict="skip",
+                    reason="heat_cap",
+                    signals={
+                        **signals,
+                        "open_cost": round(open_cost, 2),
+                        "heat_cap_usd": cap_usd,
+                        "open_position_count": len(opens),
+                    },
+                ), open_cost
+
+        # A4 kill switch: portfolio-wide circuit breakers from realized
+        # PnL history. Fires before per-market lockout because a tripped
+        # brake is a system-level stop — no need to scan further.
+        if self._kill_switch_enabled():
+            kill_skip = _kill_switch_check(portfolio, self.config, now=None)
+            if kill_skip is not None:
+                reason, kill_signals = kill_skip
+                return SectionOutput(
+                    payload=None,
+                    verdict="skip",
+                    reason=reason,
+                    signals={**signals, **kill_signals},
+                ), open_cost
+
+        extra_skip = self._extra_portfolio_gates(portfolio, res, side, signals)
+        if extra_skip is not None:
+            return extra_skip, open_cost
+
+        # Lockout / cooldown: per-(market, side) gate. Lifetime lockout
+        # supersedes the time-window cooldown when enabled.
+        if self.config.same_market_lifetime_lockout:
+            if _market_side_has_history(portfolio, res.market_id, side):
+                return SectionOutput(
+                    payload=None,
+                    verdict="skip",
+                    reason="same_market_lockout",
+                    signals=dict(signals),
+                ), open_cost
+        elif self.config.same_market_cooldown_minutes > 0:
+            cooldown_min = self.config.same_market_cooldown_minutes
+            if _in_cooldown(portfolio, res.market_id, side, cooldown_min):
+                return SectionOutput(
+                    payload=None,
+                    verdict="skip",
+                    reason="same_market_cooldown",
+                    signals={**signals, "cooldown_minutes": cooldown_min},
+                ), open_cost
+        return None, open_cost
+
+    def _extra_portfolio_gates(
+        self,
+        portfolio: PortfolioReader,
+        res: AnalysisResult,
+        side: Side,
+        signals: dict[str, object],
+    ) -> SectionOutput | None:
+        """Hook for version-specific portfolio gates, run after the kill switch
+        and before the lockout / cooldown. None in v0."""
+        return None
+
+    def _read_quote(self, res: AnalysisResult, side: Side) -> Quote | SectionOutput:
+        """The held side's level-1 quote: ``(token_id, best_ask, best_bid)``."""
+        catalog = market_source_manager.store
+        market = catalog.get(res.market_id)
+        if market is None:
+            return SectionOutput(payload=None, verdict="skip", reason="market not found")
+        token_id = market.token_for(side)
+        if token_id is None:
+            return SectionOutput(payload=None, verdict="skip", reason="no token for side")
+
+        book = catalog.get_order_book(token_id)
+        if book is None or not book.asks or not book.bids:
+            return SectionOutput(payload=None, verdict="skip", reason="no order book")
+        held_price = book.asks[0][0]
+        if held_price <= 0.0:
+            return SectionOutput(payload=None, verdict="skip", reason="invalid ask price")
+        bid = self._quote_bid(book)
+        if bid is None:
+            return SectionOutput(payload=None, verdict="skip", reason="no executable bid")
+        return token_id, held_price, bid
+
+    def _quote_bid(self, book: OrderBook) -> float | None:
+        """The bid the spread gate measures against: level 1 in v0. None
+        means the side has no usable bid (never in v0)."""
+        return book.bids[0][0]
+
+    def _price_gates(
+        self, edge: float, spread: float, held_price: float, signals: dict[str, object]
+    ) -> SectionOutput | None:
+        """Gates on the held side's price: edge, then spread."""
+        if edge < self.config.min_edge:
+            return SectionOutput(
+                payload=None,
+                verdict="skip",
+                reason="edge below min_edge",
+                signals=signals,
+            )
+        if spread > self.config.max_spread:
+            return SectionOutput(
+                payload=None,
+                verdict="skip",
+                reason="spread above max_spread",
+                signals=signals,
+            )
+        return None
 
     def _scaled_notional(self, edge: float, open_cost: float | None) -> tuple[float, str | None]:
         """Order notional in USD — ``order_size_usd``, optionally scaled by edge.
@@ -432,7 +547,7 @@ class EdgeThresholdEntryV0:
 
 
 def _in_cooldown(
-    portfolio: "PortfolioStore",
+    portfolio: PortfolioReader,
     market_id: str,
     side: Side,
     cooldown_minutes: int,
@@ -458,7 +573,7 @@ def _in_cooldown(
 
 
 def _market_side_has_history(
-    portfolio: "PortfolioStore",
+    portfolio: PortfolioReader,
     market_id: str,
     side: Side,
 ) -> bool:
@@ -481,7 +596,7 @@ class _ClosedOutcome(NamedTuple):
 
 
 def _kill_switch_check(
-    portfolio: "PortfolioStore",
+    portfolio: PortfolioReader,
     config: "EdgeThresholdConfig",
     *,
     now: float | None = None,

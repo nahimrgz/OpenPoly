@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from openpoly.analytics.calibration import BUCKET_EDGES, calibration_report
+from openpoly.analytics.calibration import BUCKET_EDGES, calibration_report, calibration_summary
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.portfolio import PortfolioStore, PositionRecord
 
@@ -216,3 +216,31 @@ def test_a_null_close_reason_is_still_counted() -> None:
     positions = [_closed(p_model=0.85, realized_pnl=5.0, close_reason=None)]
     top = [b for b in calibration_report(positions) if b.lower == 0.8][0]
     assert top.count == 1
+
+
+# ---------- full held-side range (entry v1 picks the side by edge) ----------
+
+
+def test_held_side_below_half_is_bucketed_not_dropped() -> None:
+    """Regression: entry v1 can buy NO on p_model 0.55 (held-side 0.45); the
+    report silently dropped every such position."""
+    positions = [
+        _closed(p_model=0.55, realized_pnl=1.0, position_id=1, side="no"),
+        _closed(p_model=0.30, realized_pnl=-1.0, position_id=2),
+    ]
+    summary = calibration_summary(positions)
+    by_lower = {b.lower: b for b in summary.buckets}
+    assert by_lower[0.4].count == 1 and by_lower[0.4].win_rate == 1.0
+    assert by_lower[0.3].count == 1 and by_lower[0.3].win_rate == 0.0
+    assert summary.excluded == 0
+
+
+def test_out_of_range_probability_is_counted_as_excluded() -> None:
+    positions = [
+        _closed(p_model=1.4, realized_pnl=1.0, position_id=1),
+        _closed(p_model=float("nan"), realized_pnl=1.0, position_id=2),
+        _closed(p_model=0.7, realized_pnl=1.0, position_id=3),
+    ]
+    summary = calibration_summary(positions)
+    assert summary.excluded == 2
+    assert sum(b.count for b in summary.buckets) == 1

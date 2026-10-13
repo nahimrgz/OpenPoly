@@ -16,7 +16,8 @@ import contextlib
 import json
 import logging
 import time
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import Callable
 
 import websockets
@@ -34,20 +35,52 @@ OnItemHook = Callable[[NewsItem], object]
 
 logger = logging.getLogger(__name__)
 
+# How far in the future a ``published_at`` may sit before it is distrusted.
+# Allows ordinary clock skew between the provider and this host; anything
+# beyond it is a bad timestamp whose negative age would otherwise sail past
+# every freshness check, so the item is timed by its arrival instead.
+MAX_FUTURE_SKEW_SECONDS = 60.0
+
+# A numeric epoch above this is in milliseconds, not seconds: 1e12 seconds is
+# the year ~33,700, while 1e12 ms is September 2001.
+_EPOCH_MS_THRESHOLD = 1e12
+
+
+def _epoch_seconds(value: float) -> float:
+    """A numeric epoch in seconds, converting a millisecond epoch."""
+    return value / 1000.0 if value > _EPOCH_MS_THRESHOLD else value
+
+
+# An optionally signed decimal number: digits with an optional fraction.
+_NUMERIC_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+
 
 def _to_epoch(value: object, fallback: float) -> float:
-    """Accept ISO 8601 string or numeric epoch; fall back if neither parses."""
+    """Accept ISO 8601 string or numeric epoch; fall back if neither parses.
+
+    A naive ISO timestamp (no offset) is read as UTC — never as the host's
+    local time, which would shift every such item's age by the host's UTC
+    offset (clocks are UTC throughout this codebase).
+    """
     if value is None:
         return fallback
     if isinstance(value, (int, float)):
-        return float(value)
+        return _epoch_seconds(float(value))
     if isinstance(value, str):
+        # A purely numeric string is an epoch, never a date: Python 3.13's
+        # ``fromisoformat`` accepts ISO *basic* format, so it would read
+        # "1792013060023.0" (epoch ms) as the year 1792. Parse numbers first.
+        if _NUMERIC_RE.fullmatch(value.strip()):
+            return _epoch_seconds(float(value))
         # tradingnews emits ISO 8601 with offset (e.g. 2026-05-19T10:49:35+00:00).
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
         except ValueError:
             try:
-                return float(value)
+                return _epoch_seconds(float(value))
             except ValueError:
                 return fallback
     return fallback
@@ -67,16 +100,27 @@ def default_parse(raw: str) -> NewsItem | None:
         return None
     now = time.time()
     try:
+        published_at = _to_epoch(data.get("published_at"), now)
+        if published_at - now > MAX_FUTURE_SKEW_SECONDS:
+            # Not trustworthy as a publish time, but the item itself may be
+            # real news: time it by its arrival rather than dropping it.
+            logger.warning(
+                "news %s: published_at %r is %.0fs in the future; using receive time",
+                data.get("id"),
+                data.get("published_at"),
+                published_at - now,
+            )
+            published_at = now
         return NewsItem(
             id=str(data["id"]),
             content=str(data.get("content", "")),
             urgency=str(data.get("urgency", "regular")),
             sentiment=data.get("sentiment"),
-            published_at=_to_epoch(data.get("published_at"), now),
+            published_at=published_at,
             received_at=now,
             raw=data,
         )
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return None
 
 
@@ -190,8 +234,10 @@ class NewsWSClient:
                 await asyncio.sleep(0)
                 continue
             if self._freshness_seconds is not None:
-                # Negative ages (clock drift / published in future) sail
-                # through; only positive ages past the threshold drop.
+                # Small negative ages (clock skew within
+                # MAX_FUTURE_SKEW_SECONDS) pass; anything further in the
+                # future was already re-timed to its arrival by the parser.
+                # Only positive ages past the threshold drop.
                 age = item.received_at - item.published_at
                 if age > self._freshness_seconds:
                     # Silent drop per plan §P2 — no buffer, no emit.

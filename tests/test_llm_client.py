@@ -112,6 +112,16 @@ def test_forces_tool_and_marks_system_cacheable(monkeypatch) -> None:
     assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
+def test_max_tokens_defaults_and_can_be_raised(monkeypatch) -> None:
+    messages = _Messages([_tool_response({"ok": True}), _tool_response({"ok": True})])
+    _patch(monkeypatch, messages)
+    client = _client()
+    client.analyze(system="s", user="u", tool=_TOOL)
+    client.analyze(system="s", user="u", tool=_TOOL, max_tokens=2048)
+    assert messages.calls[0]["max_tokens"] == 1024
+    assert messages.calls[1]["max_tokens"] == 2048
+
+
 # ---------- structural retry ----------
 
 

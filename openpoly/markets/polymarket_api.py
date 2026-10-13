@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from openpoly.markets.models import (
+    BOOK_DEPTH,
     Market,
     OrderBook,
     normalize_gamma_market,
@@ -169,7 +170,7 @@ async def fetch_market_by_id(
 async def fetch_book(
     token_id: str,
     *,
-    depth: int = 3,
+    depth: int = BOOK_DEPTH,
     base_url: str = CLOB_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
     client: httpx.AsyncClient | None = None,

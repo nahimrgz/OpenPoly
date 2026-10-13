@@ -295,3 +295,36 @@ async def test_canvas_reload_applies_the_database_retention_window(
         assert database_manager.status()["retention"]["retention_days"] == pytest.approx(30.0)
     finally:
         database_manager.apply_config(DatabaseConfig(order_book_retention_days=saved))
+
+
+async def test_canvas_reload_applies_the_news_freshness_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the orchestrator resolved the decision-time news age limit
+    once at build, so a canvas edit to ``freshness_seconds`` was ignored."""
+    from openpoly.api.canvas_routes import _apply_canvas_reload
+    from openpoly.runtime.canvas_store import save_template
+    from openpoly.runtime.orchestrator import get_orchestrator
+
+    def _news(freshness: int) -> dict:
+        return {
+            "version": 3,
+            "name": "t",
+            "nodes": [
+                {
+                    "id": "news",
+                    "sectionType": "news_source",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"freshness_seconds": freshness},
+                }
+            ],
+            "edges": [],
+        }
+
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    save_template(_news(1800))
+    orch = get_orchestrator()
+    assert orch._news_max_age_seconds == 1800.0  # noqa: SLF001
+    save_template(_news(300))
+    await _apply_canvas_reload(_news(1800), _news(300))
+    assert orch._news_max_age_seconds == 300.0  # noqa: SLF001

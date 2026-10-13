@@ -37,6 +37,7 @@ from openpoly.api.wallet_routes import router as wallet_router
 from openpoly.db.engine import get_session_factory
 from openpoly.db.manager import DatabaseConfig
 from openpoly.db.manager import manager as database_manager
+from openpoly.llm.usage_store import usage_store
 from openpoly.embedding.manager import manager as embedding_manager
 from openpoly.execution import executor
 from openpoly.markets.manager import MarketSourceConfig
@@ -47,6 +48,7 @@ from openpoly.runtime.exit_monitor import exit_monitor
 from openpoly.runtime.settlement_monitor import settlement_monitor
 from openpoly.runtime import reconciliation_monitor as _recon_mod
 from openpoly.runtime.reconciliation_monitor import ReconciliationMonitor
+from openpoly.runtime.active_sections import is_active
 from openpoly.runtime.orchestrator import _canvas_config, get_orchestrator
 from openpoly.sections._registry import CatalogEntry, scan
 from openpoly.sections.news_source.tradingnews_ws import TradingNewsWSConfig
@@ -99,6 +101,20 @@ def _autostart_enabled() -> bool:
     )
 
 
+def _news_autostart_config() -> dict[str, Any]:
+    """The news source config autostart starts with: the persisted canvas
+    news_source node (endpoint, ``freshness_seconds``, urgency filter, buffer
+    size — defaults when absent) with the autostart key ref.
+
+    It must come from the canvas: the orchestrator re-checks news age at
+    decision time against the canvas node's ``freshness_seconds``
+    (``orchestrator._news_max_age_seconds``), and autostart used to start the
+    source with the *default* window instead — so the arrival filter and the
+    decision-time filter disagreed whenever the operator had changed it."""
+    news_cfg = _canvas_config(TradingNewsWSConfig, "news_source")
+    return news_cfg.model_copy(update={"api_key_ref": _NEWS_AUTOSTART_KEY_REF}).model_dump()
+
+
 async def _autostart_sources() -> None:
     """Best-effort start of both sources. A failure is logged and surfaced via
     the source's own status snapshot; it never aborts app startup."""
@@ -107,8 +123,7 @@ async def _autostart_sources() -> None:
     except Exception:  # noqa: BLE001 — startup must survive a bad source
         logger.exception("market_source autostart failed")
     try:
-        news_cfg = TradingNewsWSConfig(api_key_ref=_NEWS_AUTOSTART_KEY_REF)
-        await news_source_manager.start(news_cfg.model_dump())
+        await news_source_manager.start(_news_autostart_config())
     except Exception:  # noqa: BLE001 — startup must survive a bad source
         logger.exception("news_source autostart failed")
 
@@ -172,6 +187,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # entry fills and exit sells write fill / position through it.
     portfolio = PortfolioStore(get_session_factory())
     executor.configure_paper(portfolio)
+    # Analyzer token usage — one llm_usage row per LLM call.
+    usage_store.configure(get_session_factory())
     # Try-build the live executor whether or not we're currently in live
     # mode — pre-construct so a UI flip is cheap. Failure leaves live=None
     # and the dispatcher falls back to live_not_ready.
@@ -247,6 +264,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await embedding_manager.stop()
     await database_manager.stop()
     await orch.stop()
+    usage_store.configure(None)
     news_source_manager.set_pipeline_hook(None)
     await news_source_manager.shutdown()
     await market_source_manager.shutdown()
@@ -290,4 +308,11 @@ def health() -> dict[str, str]:
 
 @app.get("/api/sections/catalog")
 def get_catalog() -> dict[str, list[dict[str, Any]]]:
-    return {"sections": [asdict(e) for e in _catalog()]}
+    # ``active`` marks the impl the runtime builds for each type (several
+    # versions of one type can be registered side by side — see
+    # ``runtime.active_sections``).
+    return {
+        "sections": [
+            {**asdict(e), "active": is_active(e.type, e.module, e.name)} for e in _catalog()
+        ]
+    }

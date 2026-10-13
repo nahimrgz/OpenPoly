@@ -14,7 +14,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,11 @@ class Market:
     # failure). Position settlement reads this + the held side to derive a
     # 0/1 final price.
     outcome_prices: tuple[float, float] | None = None
+
+    def token_for(self, side: Literal["yes", "no"]) -> str | None:
+        """The CLOB token id of one outcome side (None when the market has no
+        NO token)."""
+        return self.yes_token_id if side == "yes" else self.no_token_id
 
     @property
     def mid(self) -> float | None:
@@ -244,7 +249,14 @@ def _book_levels(raw: Any, *, descending: bool, depth: int) -> list[tuple[float,
     return levels[:depth]
 
 
-def parse_clob_book(raw: dict[str, Any], token_id: str, *, depth: int = 3) -> OrderBook:
+# Levels kept per side of a CLOB book. Deep enough that a top of book made of
+# dust / probe orders still leaves real size to find: a depth-guarded mark
+# (``openpoly.markets.pricing``) over only 3 levels turned "the first 3 levels
+# are dust" into "no executable bid" forever, and no stop could fire.
+BOOK_DEPTH = 20
+
+
+def parse_clob_book(raw: dict[str, Any], token_id: str, *, depth: int = BOOK_DEPTH) -> OrderBook:
     """Convert a raw CLOB ``/book`` payload into an ``OrderBook``.
 
     Keeps the top ``depth`` levels per side, best-first. The book's

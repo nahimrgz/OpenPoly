@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import time
 from typing import Any
 
 from openpoly.embedding.models import MarketCandidate, MarketCandidates
 from openpoly.execution import ExecResult
-from openpoly.markets.models import Market
+from openpoly.markets.manager import MarketSourceManager
+from openpoly.markets.models import Market, OrderBook
+from openpoly.markets.store import MarketStore, PollSummary, book_clock
 from openpoly.news.ring_buffer import NewsItem
 from openpoly.runtime.orchestrator import PipelineOrchestrator
 from openpoly.runtime.section_log import (
@@ -623,3 +627,346 @@ async def test_execute_buy_runs_off_the_event_loop() -> None:
     assert ex.call_count == 1
     assert e_log.entries()[0].fill_status == "filled"
     assert beats >= 10, f"event loop stalled: only {beats} heartbeats"
+
+
+async def test_embedding_runs_off_the_event_loop() -> None:
+    """The embedding section runs torch inference (and, on the first call after
+    a cache-warm start, the model load) — it must not block the loop."""
+    import time as _time
+
+    class _SlowEmbedding(FakeEmbedding):
+        def run(self, input: SectionInput) -> SectionOutput:
+            _time.sleep(0.3)
+            return super().run(input)
+
+    orch, emb_log, _, _ = make_orchestrator(embedding=_SlowEmbedding())
+    beats = 0
+
+    async def _heartbeat() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.01)
+            beats += 1
+
+    hb = asyncio.create_task(_heartbeat())
+    await orch.start()
+    try:
+        orch.enqueue(_item())
+
+        async def _wait() -> None:
+            while not emb_log.entries():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait(), timeout=5.0)
+    finally:
+        await orch.stop()
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+
+    assert emb_log.entries()[0].verdict == "ok"
+    assert beats >= 10, f"event loop stalled: only {beats} heartbeats"
+
+
+# ---------- news age at decision time ----------
+
+
+def _aged_item(age_seconds: float, news_id: str = "n1") -> NewsItem:
+    import time as _time
+
+    now = _time.time()
+    return NewsItem(
+        id=news_id,
+        content=f"content of {news_id}",
+        urgency="high",
+        sentiment=None,
+        published_at=now - age_seconds,
+        received_at=now,
+    )
+
+
+async def _run_one(orch: PipelineOrchestrator, item: NewsItem) -> None:
+    await orch.start()
+    try:
+        orch.enqueue(item)
+        await _drain(orch)
+    finally:
+        await orch.stop()
+
+
+async def test_news_stale_at_decision_time_skips_before_the_encode_and_llm() -> None:
+    embedding = FakeEmbedding()
+    analyzer = FakeAnalyzer()
+    entry = FakeEntry()
+    orch, emb_log, a_log, e_log = make_orchestrator(
+        embedding=embedding, analyzer=analyzer, entry=entry
+    )
+    orch._news_max_age_seconds = 60.0  # noqa: SLF001
+    await _run_one(orch, _aged_item(120.0))
+    assert embedding.call_count == 0
+    assert not emb_log.entries()
+    assert analyzer.call_count == 0
+    assert entry.call_count == 0
+    assert not e_log.entries()
+    (call,) = a_log.entries()
+    assert call.verdict == "skip"
+    assert call.reason is not None and call.reason.startswith("stale_news")
+
+
+async def test_news_within_max_age_reaches_the_analyzer() -> None:
+    analyzer = FakeAnalyzer()
+    orch, _, a_log, _ = make_orchestrator(analyzer=analyzer)
+    orch._news_max_age_seconds = 60.0  # noqa: SLF001
+    await _run_one(orch, _aged_item(5.0))
+    assert analyzer.call_count == 1
+    assert a_log.entries()[0].verdict == "ok"
+
+
+async def test_news_max_age_none_disables_the_check() -> None:
+    analyzer = FakeAnalyzer()
+    orch, _, _, _ = make_orchestrator(analyzer=analyzer)
+    orch._news_max_age_seconds = None  # noqa: SLF001
+    await _run_one(orch, _aged_item(10_000.0))
+    assert analyzer.call_count == 1
+
+
+async def test_analyzer_reasoning_signal_is_logged() -> None:
+    class _ReasoningAnalyzer(FakeAnalyzer):
+        def run(self, input: SectionInput) -> SectionOutput:
+            out = super().run(input)
+            out.signals["reasoning"] = "Q1: new."
+            return out
+
+    orch, _, a_log, _ = make_orchestrator(analyzer=_ReasoningAnalyzer())
+    await _run_one(orch, _item())
+    assert a_log.entries()[0].reasoning == "Q1: new."
+
+
+async def test_logged_reasoning_is_capped() -> None:
+    from openpoly.runtime.orchestrator import MAX_LOGGED_REASONING_CHARS
+
+    class _VerboseAnalyzer(FakeAnalyzer):
+        def run(self, input: SectionInput) -> SectionOutput:
+            out = super().run(input)
+            out.signals["reasoning"] = "x" * (MAX_LOGGED_REASONING_CHARS + 500)
+            return out
+
+    orch, _, a_log, _ = make_orchestrator(analyzer=_VerboseAnalyzer())
+    await _run_one(orch, _item())
+    reasoning = a_log.entries()[0].reasoning
+    assert reasoning is not None and len(reasoning) == MAX_LOGGED_REASONING_CHARS
+
+
+# ---------- book freshness at entry time ----------
+
+
+class FakeBookSource(MarketSourceManager):
+    """The real market-source manager (so ``ensure_fresh`` is the production
+    code) over an injected book fetcher that records and can fail."""
+
+    def __init__(self, *, fail: bool = False, fail_tokens: tuple[str, ...] = ()) -> None:
+        self.refreshed: list[str] = []
+
+        async def fetch(token_id: str) -> OrderBook:
+            self.refreshed.append(token_id)
+            if fail or token_id in fail_tokens:
+                raise RuntimeError("venue down")
+            return OrderBook(token_id=token_id, ts=time.time(), bids=[(0.4, 50)], asks=[(0.42, 50)])
+
+        super().__init__(book_fetcher=fetch)
+        self.store.replace([_market()], PollSummary(ts=0.0, fetched=1, kept=1))
+
+    def seed(self, age_seconds: float) -> None:
+        """Replace the cached YES book with one fetched ``age_seconds`` ago
+        (a fresh store, since newest-wins would refuse the older book)."""
+        store = MarketStore()
+        store.replace(self.store.snapshot(), PollSummary(ts=0.0, fetched=1, kept=1))
+        book = OrderBook(token_id="y-m1", ts=0.0, bids=[(0.4, 50)], asks=[(0.42, 50)])
+        store.put_order_book(book, fetched_at=book_clock() - age_seconds)
+        self.store = store
+
+
+async def test_fresh_book_is_not_refreshed() -> None:
+    source = FakeBookSource()
+    source.seed(age_seconds=1.0)
+    entry = FakeEntry()
+    orch, _, _, e_log = make_orchestrator(entry=entry)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert source.refreshed == []
+    assert entry.call_count == 1
+    (decision,) = e_log.entries()
+    assert decision.book_age_s is not None and decision.book_age_s < 5.0
+
+
+async def test_stale_book_is_refreshed_before_the_decision() -> None:
+    source = FakeBookSource()
+    source.seed(age_seconds=60.0)
+    entry = FakeEntry()
+    orch, _, _, e_log = make_orchestrator(entry=entry)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert source.refreshed == ["y-m1"]
+    assert entry.call_count == 1
+    (decision,) = e_log.entries()
+    assert decision.verdict == "ok"
+    assert decision.book_age_s is not None and decision.book_age_s < 5.0
+
+
+async def test_failed_refresh_of_a_stale_book_skips_as_stale_book() -> None:
+    source = FakeBookSource(fail=True)
+    source.seed(age_seconds=60.0)
+    entry = FakeEntry()
+    ex = FakeExecutor()
+    orch, _, _, e_log = make_orchestrator(entry=entry, executor=ex)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert source.refreshed == ["y-m1"]
+    assert entry.call_count == 0
+    assert ex.call_count == 0
+    (decision,) = e_log.entries()
+    assert decision.verdict == "skip"
+    assert decision.reason == "stale_book"
+    assert decision.book_age_s is not None and decision.book_age_s >= 60.0
+
+
+async def test_failed_refresh_with_no_cached_book_skips_as_stale_book() -> None:
+    source = FakeBookSource(fail=True)
+    entry = FakeEntry()
+    orch, _, _, e_log = make_orchestrator(entry=entry)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert entry.call_count == 0
+    assert e_log.entries()[0].reason == "stale_book"
+
+
+async def test_book_budget_is_the_orchestrator_setting() -> None:
+    entry = FakeEntry()
+    source = FakeBookSource()
+    source.seed(age_seconds=60.0)
+    orch, _, _, _ = make_orchestrator(entry=entry)
+    orch._book_source = source  # noqa: SLF001
+    orch._max_book_age_seconds = 600.0  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert source.refreshed == []
+    assert entry.call_count == 1
+
+
+async def test_side_lock_only_refreshes_the_yes_book() -> None:
+    from openpoly.markets.store import PollSummary
+
+    class _Cfg:
+        side_lock = True
+
+    entry = FakeEntry()
+    entry.config = _Cfg()  # type: ignore[attr-defined]
+    source = FakeBookSource()
+    two_sided = dataclasses.replace(_market(), no_token_id="n-m1")
+    source.store.replace([two_sided], PollSummary(ts=0.0, fetched=1, kept=1))
+    orch, _, _, _ = make_orchestrator(entry=entry)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert source.refreshed == ["y-m1"]
+
+    entry.config.side_lock = False  # type: ignore[attr-defined]
+    source.refreshed.clear()
+    source.store.replace([two_sided], PollSummary(ts=0.0, fetched=1, kept=1))
+    source.seed(age_seconds=60.0)
+    await _run_one(orch, _item("n2"))
+    assert sorted(source.refreshed) == ["n-m1", "y-m1"]
+
+
+async def test_market_missing_from_catalog_is_left_to_the_entry_section() -> None:
+    from openpoly.markets.store import MarketStore
+
+    source = FakeBookSource()
+    source.store = MarketStore()  # empty catalog
+    entry = FakeEntry()
+    orch, _, _, _ = make_orchestrator(entry=entry)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert source.refreshed == []
+    assert entry.call_count == 1
+
+
+def _two_sided_source(**kw: Any) -> FakeBookSource:
+    from openpoly.markets.store import PollSummary
+
+    source = FakeBookSource(**kw)
+    two_sided = dataclasses.replace(_market(), no_token_id="n-m1")
+    source.store.replace([two_sided], PollSummary(ts=0.0, fetched=1, kept=1))
+    return source
+
+
+async def test_one_failed_side_does_not_block_a_trade_on_the_fresh_side() -> None:
+    """Regression: a failed NO refresh skipped the whole decision as
+    stale_book even though the entry traded the fresh YES side."""
+    source = _two_sided_source(fail_tokens=("n-m1",))
+    entry = FakeEntry()  # buys YES
+    ex = FakeExecutor()
+    orch, _, _, e_log = make_orchestrator(entry=entry, executor=ex)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert sorted(source.refreshed) == ["n-m1", "y-m1"]
+    assert entry.call_count == 1
+    assert ex.call_count == 1
+    (decision,) = e_log.entries()
+    assert decision.verdict == "ok"
+    assert decision.book_age_s is not None and decision.book_age_s < 5.0
+
+
+async def test_entry_choosing_the_stale_side_is_skipped_as_stale_book() -> None:
+    class _NoEntry(FakeEntry):
+        def run(self, input: SectionInput) -> SectionOutput:
+            self.call_count += 1
+            intent = OrderIntent(market_id="m1", side="no", price=0.5, qty=20.0)
+            return SectionOutput(payload=intent, verdict="ok")
+
+    source = _two_sided_source(fail_tokens=("n-m1",))
+    ex = FakeExecutor()
+    orch, _, _, e_log = make_orchestrator(entry=_NoEntry(), executor=ex)
+    orch._book_source = source  # noqa: SLF001
+    await _run_one(orch, _item())
+    assert ex.call_count == 0
+    (decision,) = e_log.entries()
+    assert decision.verdict == "skip"
+    assert decision.reason == "stale_book"
+    assert decision.side is None
+
+
+def test_default_orchestrator_wires_the_v1_sections_and_both_guards(tmp_path, monkeypatch) -> None:
+    """With no saved canvas, every section is built from its own defaults —
+    entry v1's included (60-minute cooldown, opposite-side block on)."""
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "absent" / "canvas.json"))
+    from openpoly.markets.manager import manager as market_source_manager
+    from openpoly.runtime import orchestrator as orch_mod
+    from openpoly.sections.analyzer.llm_v1 import LLMAnalyzerV1
+    from openpoly.sections.entry.edge_threshold_v1 import EdgeThresholdEntryV1
+
+    orch_mod._reset_singleton_for_tests()
+    try:
+        orch = orch_mod.get_orchestrator()
+        assert isinstance(orch._analyzer, LLMAnalyzerV1)  # noqa: SLF001
+        assert isinstance(orch._entry, EdgeThresholdEntryV1)  # noqa: SLF001
+        assert orch._entry.config.same_market_cooldown_minutes == 60  # noqa: SLF001
+        assert orch._entry.config.block_opposite_side is True  # noqa: SLF001
+        assert orch._book_source is market_source_manager  # noqa: SLF001
+        # The news source's default freshness window.
+        assert orch._news_max_age_seconds == 1800.0  # noqa: SLF001
+    finally:
+        orch_mod._reset_singleton_for_tests()
+
+
+def test_reasoning_truncation_is_flagged() -> None:
+    from openpoly.runtime.orchestrator import (
+        MAX_LOGGED_REASONING_CHARS,
+        _reasoning_signal,
+        _reasoning_truncated,
+    )
+
+    long = SectionOutput(signals={"reasoning": "x" * (MAX_LOGGED_REASONING_CHARS + 1)})
+    short = SectionOutput(signals={"reasoning": "x" * MAX_LOGGED_REASONING_CHARS})
+    assert _reasoning_truncated(long) is True
+    assert _reasoning_truncated(short) is False
+    assert _reasoning_truncated(None) is False
+    assert len(_reasoning_signal(long) or "") == MAX_LOGGED_REASONING_CHARS

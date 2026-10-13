@@ -56,16 +56,26 @@ export function defaultConfigForType(
   type: SectionType,
   catalog: RuntimeCatalogEntry[],
 ): ConfigValues {
-  const entry = catalog.find((e) => e.type === type)
+  const entry = findEntry(type, catalog)
   if (!entry) return {}
   return defaultsFromSchema(entry.param_schema)
 }
 
+/**
+ * The catalog entry the canvas renders for a section type. Several versions of
+ * one type can be registered side by side (e.g. `LLMAnalyzerV0` and
+ * `LLMAnalyzerV1`); the backend marks the one it actually runs `active`, so
+ * that one wins. A catalog without the flag (older backend) falls back to the
+ * first entry of the type.
+ */
 export function findEntry(
   type: SectionType,
   catalog: RuntimeCatalogEntry[],
 ): RuntimeCatalogEntry | undefined {
-  return catalog.find((e) => e.type === type)
+  return (
+    catalog.find((e) => e.type === type && e.active) ??
+    catalog.find((e) => e.type === type)
+  )
 }
 
 /**
@@ -85,6 +95,379 @@ export function findEntry(
  * loses, or re-defaults a field, update the matching entry here and bump its
  * `version` to the section's new `SECTION_VERSION`.
  */
+const ANALYZER_V0: RuntimeCatalogEntry = {
+  type: 'analyzer',
+  name: 'LLMAnalyzerV0',
+  version: '0.1.0',
+  module: 'openpoly.sections.analyzer.llm_v0',
+  requires: ['llm', 'market_data'],
+  source: 'builtin',
+  param_schema: {
+    type: 'object',
+    title: 'LLMAnalyzerConfig',
+    properties: {
+      llm_model: {
+        type: 'string',
+        title: 'Llm Model',
+        default: 'claude-haiku-4-5',
+        description:
+          'Model id sent to the API. On the official Anthropic endpoint use a Claude id; on a third-party gateway use whatever id that gateway publishes.',
+      },
+      temperature: {
+        type: 'number',
+        title: 'Temperature',
+        default: 0.2,
+        minimum: 0,
+        maximum: 1,
+        description: 'Sampling temperature; ignored for claude-opus-4-7.',
+      },
+      api_key_ref: {
+        type: 'string',
+        title: 'Api Key Ref',
+        default: 'env:ANTHROPIC_API_KEY',
+        description: 'Reference to the LLM API key (env: / local: scheme).',
+      },
+      base_url: {
+        type: 'string',
+        title: 'Base Url',
+        default: '',
+        description: 'Third-party API base URL; empty = official Anthropic endpoint.',
+      },
+      extra_guidance: {
+        type: 'string',
+        title: 'Extra Guidance',
+        default: '',
+        description:
+          "Optional extra guidance appended to the analyzer's system prompt. Cannot alter the structured-output contract.",
+      },
+      min_confidence: {
+        type: 'string',
+        title: 'Min Confidence',
+        default: 'medium',
+        enum: ['low', 'medium', 'high'],
+      },
+    },
+  },
+}
+
+const ENTRY_V0: RuntimeCatalogEntry = {
+  type: 'entry',
+  name: 'EdgeThresholdEntryV0',
+  version: '0.4.0',
+  module: 'openpoly.sections.entry.edge_threshold_v0',
+  requires: ['order_book', 'market_data'],
+  source: 'builtin',
+  param_schema: {
+    type: 'object',
+    title: 'EdgeThresholdConfig',
+    properties: {
+      min_edge: {
+        type: 'number',
+        title: 'Min Edge',
+        default: 0.05,
+        minimum: 0,
+        maximum: 1,
+      },
+      order_size_usd: {
+        type: 'number',
+        title: 'Order Size Usd',
+        default: 10,
+        minimum: 1,
+        maximum: 100,
+      },
+      max_spread: {
+        type: 'number',
+        title: 'Max Spread',
+        default: 0.05,
+        minimum: 0,
+        maximum: 0.5,
+      },
+      slippage_tolerance: {
+        type: 'number',
+        title: 'Slippage Tolerance',
+        description: 'Reserved — dormant under the level-1 fill model (v1).',
+        default: 0.02,
+        minimum: 0,
+        maximum: 0.2,
+      },
+      side_lock: {
+        type: 'boolean',
+        title: 'Side Lock',
+        description: 'Lock to YES only; never buy NO.',
+        default: false,
+      },
+      veto_enabled: {
+        type: 'boolean',
+        title: 'Veto Enabled',
+        description:
+          'Enable the late-buy veto. Off by default — run warn-only first and observe recent_move before enforcing.',
+        default: false,
+      },
+      veto_window_min: {
+        type: 'integer',
+        title: 'Veto Window Min',
+        description: 'Late-buy veto: price-move lookback window, in minutes.',
+        default: 60,
+        minimum: 1,
+        maximum: 1440,
+      },
+      veto_move_threshold: {
+        type: 'number',
+        title: 'Veto Move Threshold',
+        description:
+          "Late-buy veto: skip the entry if the held side's token has already moved up by at least this much over the window.",
+        default: 0.1,
+        minimum: 0,
+        maximum: 1,
+      },
+      same_market_cooldown_minutes: {
+        type: 'integer',
+        title: 'Same Market Cooldown Minutes',
+        description:
+          'Skip the entry if a position on the same (market, side) was opened or closed within this many minutes. 0 disables the check. Targets the repeated-loss-on-same-market pattern. Superseded by ``same_market_lifetime_lockout`` when that is True.',
+        default: 0,
+        minimum: 0,
+        maximum: 1440,
+      },
+      same_market_lifetime_lockout: {
+        type: 'boolean',
+        title: 'Same Market Lifetime Lockout',
+        description:
+          'Strict mode: skip if ANY prior position exists on (market, side), regardless of when. One-shot-per-(market, side) across the lifetime of the strategy. When True, ``same_market_cooldown_minutes`` is ignored.',
+        default: false,
+      },
+      size_edge_multiplier_max: {
+        type: 'number',
+        title: 'Size Edge Multiplier Max',
+        description:
+          "Scale the order with the edge: notional = order_size_usd × clamp(edge / min_edge, 1.0, this). 1.0 (the default) disables scaling entirely — sizing stays exactly order_size_usd / held_price, as it always was. Raise it ONLY after GET /api/analytics/calibration shows p_model is actually calibrated: each bucket's win rate close to its own midpoint, with n ≥ 100 behind the buckets being relied on. Betting more on a larger 'edge' computed from an uncalibrated probability only loses faster. heat_cap_usd, when set, still bounds the scaled notional.",
+        default: 1,
+        minimum: 1,
+        maximum: 5,
+      },
+      heat_cap_usd: {
+        type: 'number',
+        title: 'Heat Cap Usd',
+        description:
+          "Skip the entry if the sum of (qty × avg_entry_price) across all currently-open positions is at or above this dollar amount. 0 disables the check. Caps total exposure during regimes where the analyzer's signal goes one-sided (cross-market correlated losses).",
+        default: 0,
+        minimum: 0,
+        maximum: 10000,
+      },
+      kill_max_consecutive_losses: {
+        type: 'integer',
+        title: 'Kill Max Consecutive Losses',
+        description:
+          'Skip the entry if the most recent N closed positions are ALL losses (realized_pnl < 0). Catches regime change / strategy drift. 0 disables. Example: 5 stops new entries after 5 consecutive losers.',
+        default: 0,
+        minimum: 0,
+        maximum: 100,
+      },
+      kill_daily_loss_usd: {
+        type: 'number',
+        title: 'Kill Daily Loss Usd',
+        description:
+          'Skip the entry if the sum of realized_pnl across positions closed in the last 24h is ≤ -kill_daily_loss_usd. 0 disables. Bounds single-day damage.',
+        default: 0,
+        minimum: 0,
+        maximum: 10000,
+      },
+      kill_max_drawdown_usd: {
+        type: 'number',
+        title: 'Kill Max Drawdown Usd',
+        description:
+          'Skip the entry if the cumulative realized_pnl curve (all closed positions, chronological) has dropped this many dollars from its peak. 0 disables. Catches slow bleed across many small losses. Tighter than kill_daily_loss because it tracks ALL history, not just one day.',
+        default: 0,
+        minimum: 0,
+        maximum: 10000,
+      },
+    },
+  },
+}
+
+const EXIT_V0: RuntimeCatalogEntry = {
+  type: 'exit',
+  name: 'ThresholdExitV0',
+  version: '0.3.0',
+  module: 'openpoly.sections.exit.threshold_v0',
+  requires: ['market_data', 'portfolio'],
+  source: 'builtin',
+  param_schema: {
+    type: 'object',
+    title: 'ThresholdExitConfig',
+    properties: {
+      take_profit_pct: {
+        type: 'number',
+        title: 'Take Profit Pct',
+        description:
+          'Take-profit ceiling, as a fraction of entry (0.20 = +20%). It caps every winner at this return, so it is OFF by default (see take_profit_enabled) and only applies once you switch it on: at +20% the trailing lock has not armed yet, so leaving it on means no position ever reaches the lock.',
+        default: 0.2,
+        minimum: 0,
+        maximum: 10,
+      },
+      take_profit_enabled: {
+        type: 'boolean',
+        title: 'Take Profit Enabled',
+        description:
+          'Whether the take-profit ceiling is active. Off by default: the trailing peak-drawdown lock is the primary exit for winners, with the stop-loss underneath. Turn it on to cap every winner at take_profit_pct instead.',
+        default: false,
+      },
+      stop_loss_pct: {
+        type: 'number',
+        title: 'Stop Loss Pct',
+        description:
+          'Close the position when its loss reaches this fraction (0.15 = -15%).',
+        default: 0.15,
+        minimum: 0,
+        maximum: 1,
+      },
+      peak_drawdown_pct: {
+        type: 'number',
+        title: 'Peak Drawdown Pct',
+        description:
+          'Trailing lock: close when the price has retraced this fraction of the banked gain (peak - entry) from the peak. Only ever widens the trailing distance — the min_trail_ticks and spread floors below set its minimum.',
+        default: 0.12,
+        minimum: 0,
+        maximum: 1,
+      },
+      min_trail_ticks: {
+        type: 'integer',
+        title: 'Min Trail Ticks',
+        description:
+          'Floor on the trailing distance, in price ticks. A percentage-only trail is tightest right after the position arms, where it can fall below a single tick and close on ordinary quote noise; two ticks is the smallest distance a real move can be distinguished from that noise.',
+        default: 2,
+        minimum: 0,
+        maximum: 100,
+      },
+      tick_size: {
+        type: 'number',
+        title: 'Tick Size',
+        description:
+          'Price tick used for the min_trail_ticks floor (Polymarket CLOB is 0.01). A tick size carried on the marked position overrides this.',
+        default: 0.01,
+        maximum: 1,
+        exclusiveMinimum: 0,
+      },
+      peak_meaningful_floor_usd: {
+        type: 'number',
+        title: 'Peak Meaningful Floor Usd',
+        description: 'Skip peak_drawdown unless the peak gain in USD exceeds this floor.',
+        default: 1,
+        minimum: 0,
+      },
+      peak_meaningful_floor_pct: {
+        type: 'number',
+        title: 'Peak Meaningful Floor Pct',
+        description:
+          'Skip peak_drawdown unless the peak gain exceeds this fraction of cost basis. Defaults to 30%: at grain-scale stakes the USD floor alone arms the trailing lock after a ~+10% move, where a retrace is noise rather than given-back profit. Arming at +30% means the lock only ever protects a real gain.',
+        default: 0.3,
+        minimum: 0,
+        maximum: 1,
+      },
+    },
+  },
+}
+
+// v1 impls the backend runs by default (`runtime/active_sections.py`): v0's
+// entry with only the new / re-defaulted properties. Spreading the v0
+// properties keeps a re-defaulted field in place and appends new ones — the
+// same order pydantic emits for a subclassed Config.
+const ANALYZER_V0_PROPS = ANALYZER_V0.param_schema.properties as Record<string, object>
+
+const ANALYZER_V1: RuntimeCatalogEntry = {
+  ...ANALYZER_V0,
+  name: 'LLMAnalyzerV1',
+  version: '1.1.0',
+  module: 'openpoly.sections.analyzer.llm_v1',
+  active: true,
+  param_schema: {
+    ...ANALYZER_V0.param_schema,
+    title: 'LLMAnalyzerConfigV1',
+    properties: {
+      ...ANALYZER_V0_PROPS,
+      llm_model: {
+        ...ANALYZER_V0_PROPS.llm_model,
+        description:
+          'Model id sent to the API. On the official Anthropic endpoint use a Claude id — claude-haiku-4-5 (default), claude-haiku-5-5 (cheaper; thinks by default, tuned by llm_effort), claude-sonnet-4-6, claude-opus-4-7, …; on a third-party gateway use whatever id that gateway publishes.',
+      },
+      temperature: {
+        ...ANALYZER_V0_PROPS.temperature,
+        description:
+          'Sampling temperature; sent only to models that accept one (claude-haiku-4-5, Sonnet / Opus up to 4.6, 3.x) and omitted for the rest, which reject a non-default value.',
+      },
+      llm_effort: {
+        type: 'string',
+        title: 'Llm Effort',
+        default: 'low',
+        enum: ['low', 'medium', 'high'],
+        description:
+          'Effort sent as output_config.effort to models that support it (e.g. claude-haiku-5-5, Opus 4.5+, Sonnet 4.6+); ignored for the others. claude-haiku-5-5 thinks by default and thinking tokens bill as output — low keeps the analyzer cheap and fast.',
+      },
+    },
+  },
+}
+
+const ENTRY_V0_PROPS = ENTRY_V0.param_schema.properties as Record<string, object>
+
+const ENTRY_V1: RuntimeCatalogEntry = {
+  ...ENTRY_V0,
+  name: 'EdgeThresholdEntryV1',
+  version: '1.0.0',
+  module: 'openpoly.sections.entry.edge_threshold_v1',
+  active: true,
+  param_schema: {
+    ...ENTRY_V0.param_schema,
+    title: 'EdgeThresholdConfigV1',
+    properties: {
+      ...ENTRY_V0_PROPS,
+      same_market_cooldown_minutes: {
+        ...ENTRY_V0_PROPS.same_market_cooldown_minutes,
+        default: 60,
+      },
+      max_spread_pct: {
+        type: 'number',
+        title: 'Max Spread Pct',
+        description:
+          "Skip the entry if the held side's spread is more than this fraction of its ask (0.10 = the spread may be at most 10% of the price).",
+        default: 0.1,
+        minimum: 0,
+        maximum: 1,
+      },
+      block_opposite_side: {
+        type: 'boolean',
+        title: 'Block Opposite Side',
+        description:
+          'Skip the entry if a position on the OTHER side of the same market is currently open.',
+        default: true,
+      },
+    },
+  },
+}
+
+const EXIT_V1: RuntimeCatalogEntry = {
+  ...EXIT_V0,
+  name: 'ThresholdExitV1',
+  version: '1.0.0',
+  module: 'openpoly.sections.exit.threshold_v1',
+  active: true,
+  param_schema: {
+    ...EXIT_V0.param_schema,
+    title: 'ThresholdExitConfigV1',
+    properties: {
+      ...(EXIT_V0.param_schema.properties as Record<string, object>),
+      hard_stop_loss_pct: {
+        type: 'number',
+        title: 'Hard Stop Loss Pct',
+        description:
+          "Catastrophic backstop: close when the executable bid's loss reaches this fraction (0.30 = -30%), whatever the mid says.",
+        default: 0.3,
+        minimum: 0,
+        maximum: 1,
+      },
+    },
+  },
+}
+
 export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
   {
     type: 'news_source',
@@ -93,6 +476,7 @@ export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
     module: 'openpoly.sections.news_source.tradingnews_ws',
     requires: [],
     source: 'builtin',
+    active: true,
     param_schema: {
       type: 'object',
       title: 'TradingNewsWSConfig',
@@ -142,6 +526,7 @@ export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
     module: 'openpoly.sections.market_source.polymarket',
     requires: [],
     source: 'builtin',
+    active: true,
     param_schema: {
       type: 'object',
       title: 'MarketSourceConfig',
@@ -231,6 +616,7 @@ export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
     module: 'openpoly.sections.embedding.minilm_v0',
     requires: ['market_data'],
     source: 'builtin',
+    active: true,
     param_schema: {
       type: 'object',
       title: 'EmbeddingFilterConfig',
@@ -276,277 +662,9 @@ export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
       },
     },
   },
-  {
-    type: 'analyzer',
-    name: 'LLMAnalyzerV0',
-    version: '0.1.0',
-    module: 'openpoly.sections.analyzer.llm_v0',
-    requires: ['llm', 'market_data'],
-    source: 'builtin',
-    param_schema: {
-      type: 'object',
-      title: 'LLMAnalyzerConfig',
-      properties: {
-        llm_model: {
-          type: 'string',
-          title: 'Llm Model',
-          default: 'claude-haiku-4-5',
-          description:
-            'Model id sent to the API. On the official Anthropic endpoint use a Claude id; on a third-party gateway use whatever id that gateway publishes.',
-        },
-        temperature: {
-          type: 'number',
-          title: 'Temperature',
-          default: 0.2,
-          minimum: 0,
-          maximum: 1,
-          description: 'Sampling temperature; ignored for claude-opus-4-7.',
-        },
-        api_key_ref: {
-          type: 'string',
-          title: 'Api Key Ref',
-          default: 'env:ANTHROPIC_API_KEY',
-          description: 'Reference to the LLM API key (env: / local: scheme).',
-        },
-        base_url: {
-          type: 'string',
-          title: 'Base Url',
-          default: '',
-          description: 'Third-party API base URL; empty = official Anthropic endpoint.',
-        },
-        extra_guidance: {
-          type: 'string',
-          title: 'Extra Guidance',
-          default: '',
-          description:
-            "Optional extra guidance appended to the analyzer's system prompt. Cannot alter the structured-output contract.",
-        },
-        min_confidence: {
-          type: 'string',
-          title: 'Min Confidence',
-          default: 'medium',
-          enum: ['low', 'medium', 'high'],
-        },
-      },
-    },
-  },
-  {
-    type: 'entry',
-    name: 'EdgeThresholdEntryV0',
-    version: '0.4.0',
-    module: 'openpoly.sections.entry.edge_threshold_v0',
-    requires: ['order_book', 'market_data'],
-    source: 'builtin',
-    param_schema: {
-      type: 'object',
-      title: 'EdgeThresholdConfig',
-      properties: {
-        min_edge: {
-          type: 'number',
-          title: 'Min Edge',
-          default: 0.05,
-          minimum: 0,
-          maximum: 1,
-        },
-        order_size_usd: {
-          type: 'number',
-          title: 'Order Size Usd',
-          default: 10,
-          minimum: 1,
-          maximum: 100,
-        },
-        max_spread: {
-          type: 'number',
-          title: 'Max Spread',
-          default: 0.05,
-          minimum: 0,
-          maximum: 0.5,
-        },
-        slippage_tolerance: {
-          type: 'number',
-          title: 'Slippage Tolerance',
-          description: 'Reserved — dormant under the level-1 fill model (v1).',
-          default: 0.02,
-          minimum: 0,
-          maximum: 0.2,
-        },
-        side_lock: {
-          type: 'boolean',
-          title: 'Side Lock',
-          description: 'Lock to YES only; never buy NO.',
-          default: false,
-        },
-        veto_enabled: {
-          type: 'boolean',
-          title: 'Veto Enabled',
-          description:
-            'Enable the late-buy veto. Off by default — run warn-only first and observe recent_move before enforcing.',
-          default: false,
-        },
-        veto_window_min: {
-          type: 'integer',
-          title: 'Veto Window Min',
-          description: 'Late-buy veto: price-move lookback window, in minutes.',
-          default: 60,
-          minimum: 1,
-          maximum: 1440,
-        },
-        veto_move_threshold: {
-          type: 'number',
-          title: 'Veto Move Threshold',
-          description:
-            "Late-buy veto: skip the entry if the held side's token has already moved up by at least this much over the window.",
-          default: 0.1,
-          minimum: 0,
-          maximum: 1,
-        },
-        same_market_cooldown_minutes: {
-          type: 'integer',
-          title: 'Same Market Cooldown Minutes',
-          description:
-            'Skip the entry if a position on the same (market, side) was opened or closed within this many minutes. 0 disables the check. Targets the repeated-loss-on-same-market pattern. Superseded by ``same_market_lifetime_lockout`` when that is True.',
-          default: 0,
-          minimum: 0,
-          maximum: 1440,
-        },
-        same_market_lifetime_lockout: {
-          type: 'boolean',
-          title: 'Same Market Lifetime Lockout',
-          description:
-            'Strict mode: skip if ANY prior position exists on (market, side), regardless of when. One-shot-per-(market, side) across the lifetime of the strategy. When True, ``same_market_cooldown_minutes`` is ignored.',
-          default: false,
-        },
-        size_edge_multiplier_max: {
-          type: 'number',
-          title: 'Size Edge Multiplier Max',
-          description:
-            "Scale the order with the edge: notional = order_size_usd × clamp(edge / min_edge, 1.0, this). 1.0 (the default) disables scaling entirely — sizing stays exactly order_size_usd / held_price, as it always was. Raise it ONLY after GET /api/analytics/calibration shows p_model is actually calibrated: each bucket's win rate close to its own midpoint, with n ≥ 100 behind the buckets being relied on. Betting more on a larger 'edge' computed from an uncalibrated probability only loses faster. heat_cap_usd, when set, still bounds the scaled notional.",
-          default: 1,
-          minimum: 1,
-          maximum: 5,
-        },
-        heat_cap_usd: {
-          type: 'number',
-          title: 'Heat Cap Usd',
-          description:
-            "Skip the entry if the sum of (qty × avg_entry_price) across all currently-open positions is at or above this dollar amount. 0 disables the check. Caps total exposure during regimes where the analyzer's signal goes one-sided (cross-market correlated losses).",
-          default: 0,
-          minimum: 0,
-          maximum: 10000,
-        },
-        kill_max_consecutive_losses: {
-          type: 'integer',
-          title: 'Kill Max Consecutive Losses',
-          description:
-            'Skip the entry if the most recent N closed positions are ALL losses (realized_pnl < 0). Catches regime change / strategy drift. 0 disables. Example: 5 stops new entries after 5 consecutive losers.',
-          default: 0,
-          minimum: 0,
-          maximum: 100,
-        },
-        kill_daily_loss_usd: {
-          type: 'number',
-          title: 'Kill Daily Loss Usd',
-          description:
-            'Skip the entry if the sum of realized_pnl across positions closed in the last 24h is ≤ -kill_daily_loss_usd. 0 disables. Bounds single-day damage.',
-          default: 0,
-          minimum: 0,
-          maximum: 10000,
-        },
-        kill_max_drawdown_usd: {
-          type: 'number',
-          title: 'Kill Max Drawdown Usd',
-          description:
-            'Skip the entry if the cumulative realized_pnl curve (all closed positions, chronological) has dropped this many dollars from its peak. 0 disables. Catches slow bleed across many small losses. Tighter than kill_daily_loss because it tracks ALL history, not just one day.',
-          default: 0,
-          minimum: 0,
-          maximum: 10000,
-        },
-      },
-    },
-  },
-  {
-    type: 'exit',
-    name: 'ThresholdExitV0',
-    version: '0.3.0',
-    module: 'openpoly.sections.exit.threshold_v0',
-    requires: ['market_data', 'portfolio'],
-    source: 'builtin',
-    param_schema: {
-      type: 'object',
-      title: 'ThresholdExitConfig',
-      properties: {
-        take_profit_pct: {
-          type: 'number',
-          title: 'Take Profit Pct',
-          description:
-            'Take-profit ceiling, as a fraction of entry (0.20 = +20%). It caps every winner at this return, so it is OFF by default (see take_profit_enabled) and only applies once you switch it on: at +20% the trailing lock has not armed yet, so leaving it on means no position ever reaches the lock.',
-          default: 0.2,
-          minimum: 0,
-          maximum: 10,
-        },
-        take_profit_enabled: {
-          type: 'boolean',
-          title: 'Take Profit Enabled',
-          description:
-            'Whether the take-profit ceiling is active. Off by default: the trailing peak-drawdown lock is the primary exit for winners, with the stop-loss underneath. Turn it on to cap every winner at take_profit_pct instead.',
-          default: false,
-        },
-        stop_loss_pct: {
-          type: 'number',
-          title: 'Stop Loss Pct',
-          description:
-            'Close the position when its loss reaches this fraction (0.15 = -15%).',
-          default: 0.15,
-          minimum: 0,
-          maximum: 1,
-        },
-        peak_drawdown_pct: {
-          type: 'number',
-          title: 'Peak Drawdown Pct',
-          description:
-            'Trailing lock: close when the price has retraced this fraction of the banked gain (peak - entry) from the peak. Only ever widens the trailing distance — the min_trail_ticks and spread floors below set its minimum.',
-          default: 0.12,
-          minimum: 0,
-          maximum: 1,
-        },
-        min_trail_ticks: {
-          type: 'integer',
-          title: 'Min Trail Ticks',
-          description:
-            'Floor on the trailing distance, in price ticks. A percentage-only trail is tightest right after the position arms, where it can fall below a single tick and close on ordinary quote noise; two ticks is the smallest distance a real move can be distinguished from that noise.',
-          default: 2,
-          minimum: 0,
-          maximum: 100,
-        },
-        tick_size: {
-          type: 'number',
-          title: 'Tick Size',
-          description:
-            'Price tick used for the min_trail_ticks floor (Polymarket CLOB is 0.01). A tick size carried on the marked position overrides this.',
-          default: 0.01,
-          maximum: 1,
-          exclusiveMinimum: 0,
-        },
-        peak_meaningful_floor_usd: {
-          type: 'number',
-          title: 'Peak Meaningful Floor Usd',
-          description:
-            'Skip peak_drawdown unless the peak gain in USD exceeds this floor.',
-          default: 1,
-          minimum: 0,
-        },
-        peak_meaningful_floor_pct: {
-          type: 'number',
-          title: 'Peak Meaningful Floor Pct',
-          description:
-            'Skip peak_drawdown unless the peak gain exceeds this fraction of cost basis. Defaults to 30%: at grain-scale stakes the USD floor alone arms the trailing lock after a ~+10% move, where a retrace is noise rather than given-back profit. Arming at +30% means the lock only ever protects a real gain.',
-          default: 0.3,
-          minimum: 0,
-          maximum: 1,
-        },
-      },
-    },
-  },
+  { ...ANALYZER_V0, active: false },
+  { ...ENTRY_V0, active: false },
+  { ...EXIT_V0, active: false },
   {
     type: 'database',
     name: 'SqliteDatabase',
@@ -554,6 +672,7 @@ export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
     module: 'openpoly.sections.database.sqlite',
     requires: [],
     source: 'builtin',
+    active: true,
     param_schema: {
       type: 'object',
       title: 'DatabaseConfig',
@@ -569,4 +688,7 @@ export const MOCK_RUNTIME_CATALOG: RuntimeCatalogEntry[] = [
       },
     },
   },
+  ANALYZER_V1,
+  ENTRY_V1,
+  EXIT_V1,
 ]

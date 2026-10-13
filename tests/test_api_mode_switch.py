@@ -281,7 +281,7 @@ class _RecordingLiveExecutor:
         self.buys.append(intent.market_id)
         return ExecResult.ok(price=intent.price, qty=intent.qty, position_id=1)
 
-    def execute_sell(self, position, *, close_reason, ts, trigger=None):  # noqa: ANN001, ANN201
+    def execute_sell(self, position, *, close_reason, ts, trigger=None, floor_price=None):  # noqa: ANN001, ANN201
         raise AssertionError("not exercised by this test")
 
     def get_collateral_balance_raw(self) -> int | None:

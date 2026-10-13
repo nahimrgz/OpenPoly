@@ -19,18 +19,44 @@ separate concern, out of scope.
 Marking is depth-guarded (v0.3.0). A resting level-1 bid can be a single
 minimum-size probe order sitting far from fair value; marking there produced
 false stop-outs. The mark is the first bid level carrying at least
-``min_mark_bid_size`` shares — and nothing else. There is deliberately no mid
-fallback: the executors sell into the book's raw level-1 bid, so a mid mark
-would evaluate take-profit and peak-drawdown against a price the position can
-never realize, closing a "winner" into a dust bid at a loss. When no bid level
-qualifies the position is reported *blocked*, held, and logged once as
-``no_executable_bid`` so the gap is visible rather than silent.
+``min_mark_bid_size`` shares (``openpoly.markets.pricing`` — the same rule
+entry v1 gates its spread on); the ask passed along is the raw level-1 ask
+(see ``_decide``). There is deliberately no mid mark: take-profit and peak-drawdown must be
+evaluated against a price the position can realize. The sell sweeps bid
+levels down to the mark the decision used (``floor_price``), so the fill
+matches the decision rather than a level-1 sliver.
+
+When no bid level qualifies, a v0 exit section never sees the position: it is
+reported *blocked*, held, and logged once as ``no_executable_bid`` so the gap
+is visible rather than silent. A section declaring ``EVALUATES_THIN_MARKS``
+(threshold_v1) is still run on the raw best bid, where it evaluates only its
+hard stop — closing into a thin book beats riding a collapse to zero. It fires
+only once the ask confirms the collapse, or — with no ask — once it has
+persisted for several ticks; the monitor keeps that streak per position
+(``MarkedPosition.thin_streak``).
+
+Held, not traded: a position whose token's CLOB book is gone (404 — the
+market resolved) or has stopped refreshing is never closed off its last
+quote. It is reported blocked and logged once as
+``market_closed_await_settlement`` / ``stale_order_book``; the settlement
+monitor closes it at 0/1.
+
+A close that is decided but does not fill backs off per position —
+exponentially from one tick to ``CLOSE_BACKOFF_MAX_SECONDS`` — and counts as
+blocked meanwhile; the backoff resets on a fill or when the decision changes.
+Every skip / error row is written once per (position, reason) while that
+reason persists, so a failing close cannot flood the exit-log ring.
 
 The tick's own work is sub-millisecond (DB read/write, in-memory book lookup,
 the pure exit section) so it runs inline, but ``execute_sell`` is a live
 network call that sleeps for seconds (CTF cache polling, close-persist
 retries), so it is offloaded with ``asyncio.to_thread`` — same pattern the
 orchestrator uses for its blocking section calls (docs/architecture/05).
+
+Freshness: the market source re-fetches held tokens' books every ~10s
+(``HELD_BOOK_INTERVAL_SECONDS``), and a close decided on a book older than
+``MAX_BOOK_AGE_SECONDS`` is confirmed on a re-fetched book before it is acted
+on (``_confirm_close``) — the one place a tick awaits network I/O.
 """
 
 from __future__ import annotations
@@ -39,7 +65,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -48,33 +74,41 @@ from openpoly.db.tables import OrderBookSnapshot
 from openpoly.execution import ExecResult
 from openpoly.execution import executor as _executor_singleton
 from openpoly.execution.sizing import is_dust_qty
+from openpoly.markets.manager import (
+    HELD_BOOK_INTERVAL_SECONDS,
+    MAX_BOOK_AGE_SECONDS,
+    FreshBookSource,
+)
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook
-from openpoly.markets.store import MarketStore
+from openpoly.markets.pricing import MIN_LEVEL_SIZE, first_level_with_size
+from openpoly.markets.store import KEPT_BOOK_MAX_AGE_SECONDS, MarketStore
 from openpoly.portfolio import HeldPosition, PortfolioStore
 from openpoly.runtime.closing_registry import clear_closing, is_closing, mark_closing
 from openpoly.runtime.section_log import ExitDecision, exit_log
 from openpoly.runtime.tick_loop import State, TickLoopMonitor
 from openpoly.sections._base import SectionInput, SectionOutput
-from openpoly.sections.exit.threshold_v0 import (
-    CloseIntent,
-    MarkedPosition,
-    ThresholdExitConfig,
-    ThresholdExitV0,
-)
+from openpoly.runtime.active_sections import build_section
+from openpoly.sections.exit.threshold_v0 import CloseIntent, MarkedPosition
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TICK_INTERVAL_SECONDS = 120  # v8 §10.1 "hard" tick
+# The exit tick runs at the cadence the held tokens' books are refreshed
+# (``HELD_BOOK_INTERVAL_SECONDS``): evaluating less often than the data changes
+# only delays every stop. A tick is cheap — one DB read, in-memory book
+# lookups and the pure exit section; the only network I/O is the rare
+# confirm-before-close refetch.
+DEFAULT_TICK_INTERVAL_SECONDS = int(HELD_BOOK_INTERVAL_SECONDS)
 
-# Minimum resting size (in shares) for a bid level to be accepted as the mark.
-# Polymarket's minimum order notional is $1, which at the 0.20–0.80 prices this
-# system trades is 1.25–5 shares — so any level below ~5 shares can be a single
-# minimum-size probe or dust order rather than a price anyone is committed to.
-# Requiring 5 shares means the mark is always backed by at least one order
-# larger than the venue minimum, which is what makes a stop-loss fired off it
-# an executable price rather than an artifact.
-DEFAULT_MIN_MARK_BID_SIZE = 5.0
+# Minimum resting size (in shares) for a level to be accepted as the mark — the
+# shared rule (see ``openpoly.markets.pricing``).
+DEFAULT_MIN_MARK_BID_SIZE = MIN_LEVEL_SIZE
+
+# Per-position backoff after a close that was decided but did not fill: the
+# first retry waits one tick, each further failure doubles the wait, capped
+# here. Without it a failing live sell (CTF cache polling sleeps ~4s per
+# attempt) was retried — and logged — every 10s tick.
+CLOSE_BACKOFF_MAX_SECONDS = 120.0
 
 # How long ``stop()`` waits for an in-flight sell to finish recording itself.
 # The live sell runs in a worker thread and cannot be cancelled, so the choice
@@ -89,18 +123,10 @@ def _mark_from_levels(
     bids: list[tuple[float, float]],
     min_bid_size: float,
 ) -> float | None:
-    """Depth-guarded mark for one book — an *executable* price or nothing.
-
-    The first bid level carrying ``min_bid_size`` or more is where the position
-    could actually be sold, so that is the mark. Returns ``None`` when no bid
-    level qualifies: the book has no real bid side, and every alternative (the
-    mid, the dust bid) is a price the position cannot be sold at, which is
-    exactly what makes a trigger fired off it a fabricated exit.
-    """
-    for price, size in bids:
-        if size >= min_bid_size:
-            return price
-    return None
+    """Depth-guarded mark for one book — an *executable* price or nothing
+    (``first_level_with_size``). The first bid level carrying
+    ``min_bid_size`` or more is where the position could actually be sold."""
+    return first_level_with_size(bids, min_bid_size)
 
 
 class _ExitSection(Protocol):
@@ -119,6 +145,7 @@ class _Executor(Protocol):
         close_reason: str,
         ts: float,
         trigger: str | None,
+        floor_price: float | None = None,
     ) -> ExecResult: ...
 
 
@@ -140,17 +167,20 @@ class ExitMonitor(TickLoopMonitor):
         executor: _Executor,
         tick_interval_seconds: int = DEFAULT_TICK_INTERVAL_SECONDS,
         min_mark_bid_size: float = DEFAULT_MIN_MARK_BID_SIZE,
+        book_source: FreshBookSource | None = None,
     ) -> None:
         super().__init__(tick_interval_seconds=tick_interval_seconds)
         self._exit = exit_section
         self._executor = executor
         self._min_mark_bid_size = min_mark_bid_size
+        # Confirm-before-close (see ``_confirm_close``); None disables it.
+        self._book_source = book_source
         self._portfolio: PortfolioStore | None = None
         # The sell currently in flight, if any. ``execute_sell`` runs in a
         # worker thread and cannot be cancelled, so the sell + its bookkeeping
         # live in their own task: cancelling the tick loop must not strand a
         # close that already happened on-chain (see ``stop``).
-        self._inflight: asyncio.Task[None] | None = None
+        self._inflight: asyncio.Task[bool] | None = None
         # canvas-sync v2: atomic swap lock — same model as orchestrator's
         # _sections_lock. _tick_once reads self._exit; replace happens between
         # ticks (or between in-flight section.run calls within a tick — Python
@@ -176,16 +206,27 @@ class ExitMonitor(TickLoopMonitor):
         self._last_tick_at: float | None = None
         self._last_tick_open: int = 0
         self._last_tick_blocked: int = 0
-        # Positions already logged as ``no_executable_bid``. A position whose
-        # book has no depth-qualified bid cannot be evaluated at all — its
-        # stop-loss can't fire — so that has to be visible in exit_log, but a
-        # row per position per tick would evict the ok / error closes from the
-        # ring. One row per occurrence: the id is dropped again as soon as the
-        # position becomes markable (or closes), so a book that goes thin twice
-        # is logged twice.
-        self._unmarkable: set[int] = set()
+        # (position, reason) pairs already logged — ``no_executable_bid``,
+        # ``market_closed_await_settlement``, ``stale_order_book`` and failed
+        # sells. A position that cannot be evaluated or closed has to be
+        # visible in exit_log, but a row per position per tick would evict the
+        # ok / error closes from the ring. One row per occurrence and reason:
+        # a pair is dropped again as soon as that reason stops holding (the
+        # position becomes markable, closes, or is held for another reason),
+        # so a book that goes thin twice is logged twice.
+        self._logged: set[tuple[int, str]] = set()
+        # (position, error) pairs of failed closes already logged — kept apart
+        # from the holds: a retried close of the same decision must not log
+        # again just because the position was evaluable in between. Cleared
+        # on a fill, or when the decision stops being a close.
+        self._logged_errors: set[tuple[int, str]] = set()
+        # Per-position close backoff (see ``CLOSE_BACKOFF_MAX_SECONDS``).
+        self._backoff: dict[int, _Backoff] = {}
+        # Per-position count of consecutive ticks on which a thin-book hard
+        # stop was pending confirmation (``MarkedPosition.thin_streak``).
+        self._thin_streak: dict[int, int] = {}
         # Positions already logged as ``dust_remainder`` — same dedup contract
-        # as ``_unmarkable``. A sub-one-share remainder is not a placeable
+        # as ``_logged``. A sub-one-share remainder is not a placeable
         # order, so evaluating it produced a CloseIntent → a sell the executor
         # can only skip → an ``error`` row, every tick, for as long as the
         # market stayed unresolved (~720 rows/day into a 200-entry ring). One
@@ -279,10 +320,11 @@ class ExitMonitor(TickLoopMonitor):
     def observe_price(self, token_id: str, bid: float) -> None:
         """Push hook — record a fresh mark for ``token_id`` into the peaks.
 
-        The exit tick runs every ``DEFAULT_TICK_INTERVAL_SECONDS`` (120s) but
-        the order-book sampler refreshes far more often; without this hook a
-        run-up that happens and reverses between two ticks is invisible and the
-        trailing lock trails a peak that never existed. Only tokens held by a
+        The exit tick runs every ``DEFAULT_TICK_INTERVAL_SECONDS``; books
+        arriving between two ticks (the samplers, entry-time refreshes) still
+        carry prices, and without this hook a run-up that happens and
+        reverses between two ticks is invisible and the trailing lock trails
+        a peak that never existed. Only tokens held by a
         position seen on the last sweep are tracked, so this stays a dict
         lookup — a position opened between sweeps starts being observed after
         the next tick, which is harmless (its peak seeds at that tick's mark).
@@ -338,7 +380,10 @@ class ExitMonitor(TickLoopMonitor):
         # and reconciliation monitors close positions behind its back — every
         # one of those left an entry here forever.
         open_ids = {held.position_id for held in opens}
-        self._unmarkable &= open_ids
+        self._logged = {key for key in self._logged if key[0] in open_ids}
+        self._logged_errors = {key for key in self._logged_errors if key[0] in open_ids}
+        self._backoff = {pid: b for pid, b in self._backoff.items() if pid in open_ids}
+        self._thin_streak = {pid: n for pid, n in self._thin_streak.items() if pid in open_ids}
         self._dust &= open_ids
         self._peak = {pid: peak for pid, peak in self._peak.items() if pid in open_ids}
         blocked = 0
@@ -355,10 +400,12 @@ class ExitMonitor(TickLoopMonitor):
 
     async def _evaluate(self, held: HeldPosition, catalog: MarketStore, ts: float) -> bool:
         """Evaluate one position. Returns True when it could not be evaluated
-        (no order book, or no level deep enough to mark against — counted as
-        ``blocked``); False when held within thresholds, dust, or closed. ok /
-        error closes are logged; within-threshold and unmarkable holds are not
-        (see tick telemetry)."""
+        or closed (no order book, no level deep enough to mark against, a dead
+        / stale book held for settlement, or a decided close that did not
+        fill or is backing off — counted as ``blocked``); False when held
+        within thresholds, dust, or closed. ok / error closes and holds are
+        logged once per (position, reason); within-threshold evaluations are
+        not (see tick telemetry)."""
         if is_dust_qty(held.qty):
             # A remainder below one share cannot be sold at all (see
             # execution.sizing): the row stays open until settlement closes it
@@ -372,50 +419,46 @@ class ExitMonitor(TickLoopMonitor):
                 self._log(held, ts, verdict="skip", reason="dust_remainder")
             return False
         book = catalog.get_order_book(held.token_id)
-        if book is None or not book.bids:
+        if book is None:
+            if catalog.is_book_gone(held.token_id):
+                # CLOB has no book for the token any more: the market
+                # resolved. Hold for the settlement monitor.
+                self._hold_once(held, ts, "market_closed_await_settlement")
             return True
-        current_price = self._mark(book)
-        if current_price is None:
+        if not book.bids:
+            return True
+        decision = self._decide(held, book)
+        intent_before = _close_intent(decision.out) if decision is not None else None
+        if decision is not None and intent_before is not None:
+            if self._backing_off(held.position_id, intent_before.trigger):
+                # A close for this very decision failed recently: wait out the
+                # backoff instead of retrying (and re-confirming) every tick.
+                return True
+            confirmed = await self._confirm_close(held, decision, catalog)
+            if isinstance(confirmed, str):
+                # Refetch failed on a market that is gone / looks closed, or
+                # whose book stopped refreshing: a fill at the stale bid would
+                # be a phantom close. Hold (logged once per reason).
+                self._hold_once(held, ts, confirmed)
+                return True
+            decision = confirmed
+        self._track_thin_streak(held.position_id, decision)
+        if decision is None or (decision.thin and _close_intent(decision.out) is None):
             # The book has bids but none deep enough to sell into: the position
-            # is unevaluable, not cheap. Log the first tick of each occurrence
-            # (see ``_unmarkable``) so it doesn't fail silently.
-            if held.position_id not in self._unmarkable:
-                self._unmarkable.add(held.position_id)
-                self._log(held, ts, verdict="skip", reason="no_executable_bid")
+            # is unevaluable, not cheap (a thin-mark section still got to fire
+            # its hard stop above). Log the first tick of each occurrence (see
+            # ``_logged``) so it doesn't fail silently.
+            self._hold_once(held, ts, "no_executable_bid")
             return True
-        self._unmarkable.discard(held.position_id)
-        # Spread against the SAME depth-guarded bid the mark uses. The raw
-        # level-1 bid can be a dust probe: one resting near the ask understates
-        # the spread floor (premature trailing exits inside real quote noise),
-        # one far below it inflates the floor until the trailing lock can never
-        # fire. ``current_price`` is the executable bid, so ask - mark is the
-        # spread the position actually faces.
-        spread = book.asks[0][0] - current_price if book.asks else None
-        # Monotone-increasing per-position peak. New open positions seed at
-        # current_price; bootstrap_peaks / observe_price may have seeded a
-        # higher one already.
-        prev_peak = self._peak.get(held.position_id, current_price)
-        peak_price = max(prev_peak, current_price)
-        self._peak[held.position_id] = peak_price
-
-        marked = MarkedPosition(
-            market_id=held.market_id,
-            side=held.side,
-            avg_entry_price=held.avg_entry_price,
-            qty=held.qty,
-            current_price=current_price,
-            peak_price=peak_price,
-            spread=spread,
-            # Polymarket exposes no per-market tick size through Gamma or the
-            # book endpoint, so the section falls back to its configured tick.
-            tick_size=None,
-        )
-        out = self._exit.run(SectionInput(tick_type="hard", payload=marked))
+        self._clear_holds(held.position_id)
+        out, peak_price = decision.out, decision.peak_price
         return_pct = out.signals.get("return_pct")
         if out.verdict != "ok" or not isinstance(out.payload, CloseIntent):
             # Held within thresholds — no close, no log entry (peak already
             # tracked above; tick telemetry records that this position was
-            # evaluated).
+            # evaluated). The decision changed, so any close backoff is over.
+            self._backoff.pop(held.position_id, None)
+            self._clear_errors(held.position_id)
             return False
 
         intent = out.payload
@@ -441,18 +484,207 @@ class ExitMonitor(TickLoopMonitor):
         # has been persisted, the settlement and reconciliation monitors must
         # not close this id underneath us (see closing_registry).
         mark_closing(held.position_id)
-        task = asyncio.create_task(self._close(held, intent.trigger, ts, return_pct, peak_price))
+        task = asyncio.create_task(
+            self._close(held, intent.trigger, ts, return_pct, peak_price, floor_price=intent.price)
+        )
         self._inflight = task
         try:
             # Shielded: if the tick loop is cancelled mid-sell, this await is
             # cancelled but the task keeps running and stop() drains it. The
             # sell itself is already uncancellable — only its bookkeeping was
             # at risk.
-            await asyncio.shield(task)
+            filled = await asyncio.shield(task)
         finally:
             if task.done():
                 self._inflight = None
-        return False
+        # A close that was decided but did not fill leaves a position that
+        # should be closed still open: it is blocked, not "evaluated".
+        return not filled
+
+    # ---------- hold logging / backoff ----------
+
+    def _hold_once(self, held: HeldPosition, ts: float, reason: str) -> None:
+        """Log a ``skip`` row for ``reason`` once while it persists for this
+        position; any other held reason for it is forgotten, so returning to
+        it logs again."""
+        key = (held.position_id, reason)
+        if key in self._logged:
+            return
+        self._clear_holds(held.position_id)
+        self._logged.add(key)
+        self._log(held, ts, verdict="skip", reason=reason)
+
+    def _clear_holds(self, position_id: int) -> None:
+        """Forget every logged hold reason of ``position_id``."""
+        self._logged = {key for key in self._logged if key[0] != position_id}
+
+    def _clear_errors(self, position_id: int) -> None:
+        """Forget every logged close failure of ``position_id``."""
+        self._logged_errors = {key for key in self._logged_errors if key[0] != position_id}
+
+    def _backing_off(self, position_id: int, trigger: str) -> bool:
+        """Whether a close of ``position_id`` for ``trigger`` is still inside
+        its failure backoff. A different trigger is a changed decision: the
+        backoff is dropped and the close is attempted."""
+        backoff = self._backoff.get(position_id)
+        if backoff is None:
+            return False
+        if backoff.trigger != trigger:
+            del self._backoff[position_id]
+            self._clear_errors(position_id)
+            return False
+        return time.monotonic() < backoff.until
+
+    def _record_close_failure(self, position_id: int, trigger: str) -> None:
+        """Start (or double) the backoff of a close that did not fill."""
+        prev = self._backoff.get(position_id)
+        if prev is not None and prev.trigger == trigger:
+            delay = min(prev.delay * 2.0, CLOSE_BACKOFF_MAX_SECONDS)
+        else:
+            delay = min(float(self._tick_interval), CLOSE_BACKOFF_MAX_SECONDS)
+        self._backoff[position_id] = _Backoff(
+            trigger=trigger, delay=delay, until=time.monotonic() + delay
+        )
+
+    def _track_thin_streak(self, position_id: int, decision: _Decision | None) -> None:
+        """Count consecutive ticks on which a thin hard stop was pending
+        confirmation; any other outcome resets the streak."""
+        if (
+            decision is not None
+            and decision.thin
+            and decision.out.signals.get("thin_stop_pending") is True
+        ):
+            self._thin_streak[position_id] = self._thin_streak.get(position_id, 0) + 1
+        else:
+            self._thin_streak.pop(position_id, None)
+
+    def _decide(self, held: HeldPosition, book: OrderBook) -> _Decision | None:
+        """Mark ``held`` against ``book`` and run the exit section on it.
+
+        None when the book has no bid level deep enough to mark against —
+        unless the section declares ``EVALUATES_THIN_MARKS``: then it is run
+        on the raw best bid with ``thin=True`` (threshold_v1 evaluates only
+        its hard stop there — closing into a thin book beats riding a
+        collapse to zero) and the peak is left alone, a dust bid not being a
+        price the position ever had."""
+        current_price = self._mark(book)
+        thin = False
+        if current_price is None:
+            if not book.bids or not getattr(self._exit, "EVALUATES_THIN_MARKS", False):
+                return None
+            current_price = book.bids[0][0]
+            thin = True
+        # The bid is depth-guarded (a dust probe far below the real bids would
+        # inflate the spread floor until the trailing lock can never fire);
+        # the ask is the raw level 1. Depth-guarding the ask only ever moved
+        # it up or to None: that inflated threshold_v1's stop mid (suppressing
+        # the normal stop) and an all-dust ask side removed the trailing spread
+        # floor altogether. threshold_v1 caps the spread floor, which already
+        # bounds what a dust ask can do to the trailing distance.
+        ask = book.asks[0][0] if book.asks else None
+        spread = ask - current_price if ask is not None else None
+        # Monotone-increasing per-position peak. New open positions seed at
+        # current_price; bootstrap_peaks / observe_price may have seeded a
+        # higher one already.
+        prev_peak = self._peak.get(held.position_id, current_price)
+        peak_price = prev_peak if thin else max(prev_peak, current_price)
+        if not thin:
+            self._peak[held.position_id] = peak_price
+
+        marked = MarkedPosition(
+            market_id=held.market_id,
+            side=held.side,
+            avg_entry_price=held.avg_entry_price,
+            qty=held.qty,
+            current_price=current_price,
+            peak_price=peak_price,
+            spread=spread,
+            ask=ask,
+            # Polymarket exposes no per-market tick size through Gamma or the
+            # book endpoint, so the section falls back to its configured tick.
+            tick_size=None,
+            thin=thin,
+            thin_streak=self._thin_streak.get(held.position_id, 0) if thin else 0,
+        )
+        out = self._exit.run(SectionInput(tick_type="hard", payload=marked))
+        return _Decision(out=out, peak_price=peak_price, thin=thin)
+
+    async def _confirm_close(
+        self, held: HeldPosition, decision: _Decision, catalog: MarketStore
+    ) -> _Decision | str:
+        """Confirm a close decided on a stale book before acting on it.
+
+        The cached book can be up to a sample interval old; a stop fired off
+        it may be firing on a price long gone. When the book is older than
+        ``MAX_BOOK_AGE_SECONDS`` it is re-fetched (``ensure_fresh``), the
+        position re-marked and the exit section re-run on the fresh mark —
+        the returned decision is the one to act on, which may no longer close.
+        A refresh that fails keeps the original decision (with a warning): a
+        stop must not be blocked by the venue being slow — fail toward
+        closing, not toward holding. The refreshed book stays in the shared
+        store, so the sell fill that follows reads it (or a newer one).
+
+        The exceptions are a failed refresh on a market whose book is gone
+        (CLOB 404) or that the catalog shows as closed / not accepting orders
+        — its cached book is a corpse, and a fill at its bid would book a
+        phantom close (``"market_closed_await_settlement"``) — and one whose
+        cached book has stopped refreshing altogether (older than
+        ``KEPT_BOOK_MAX_AGE_SECONDS``: ``"stale_order_book"``). The hold
+        reason is returned then: hold, and let the settlement monitor close
+        the position at the resolution price.
+        """
+        source = self._book_source
+        if source is None:
+            return decision
+        token = held.token_id
+        age = source.store.order_book_age(token)
+        if age is not None and age <= MAX_BOOK_AGE_SECONDS:
+            return decision
+        fresh_age = (await source.ensure_fresh([token], MAX_BOOK_AGE_SECONDS)).get(token)
+        book = source.store.get_order_book(token)
+        if fresh_age is None or fresh_age > MAX_BOOK_AGE_SECONDS or book is None:
+            market = catalog.get(held.market_id)
+            # Only explicit evidence counts: a 404 from CLOB, or "closed" from
+            # the venue. A market merely missing from the catalog (startup, a
+            # failed holding sync) is not evidence of resolution, and holding
+            # there would block a real stop.
+            if source.store.is_book_gone(token) or (
+                market is not None and (market.closed or not market.accepting_orders)
+            ):
+                logger.warning(
+                    "exit monitor: position %d — book refresh failed and market %s looks "
+                    "closed; holding for settlement",
+                    held.position_id,
+                    held.market_id,
+                )
+                return "market_closed_await_settlement"
+            if fresh_age is not None and fresh_age > KEPT_BOOK_MAX_AGE_SECONDS:
+                logger.warning(
+                    "exit monitor: position %d — the %.0fs-old book could not be "
+                    "refreshed; not closing at a quote that stopped updating",
+                    held.position_id,
+                    fresh_age,
+                )
+                return "stale_order_book"
+            logger.warning(
+                "exit monitor: position %d — could not refresh a %s book before "
+                "closing; acting on it",
+                held.position_id,
+                "missing" if age is None else f"{age:.0f}s-old",
+            )
+            return decision
+        confirmed = self._decide(held, book) if book.bids else None
+        if confirmed is None:
+            # The fresh book cannot be marked; the stale decision stands (the
+            # sell itself decides whether there is anything to sell into).
+            return decision
+        if _close_intent(confirmed.out) is None:
+            logger.info(
+                "exit monitor: position %d — close on a %s book not confirmed by a fresh one",
+                held.position_id,
+                "missing" if age is None else f"{age:.0f}s-old",
+            )
+        return confirmed
 
     def _still_open(self, position_id: int) -> bool:
         """Fresh read of one position's status — synchronous by design, so the
@@ -470,25 +702,35 @@ class ExitMonitor(TickLoopMonitor):
         ts: float,
         return_pct: float | None,
         peak_price: float,
-    ) -> None:
-        """Sell one position and record the outcome.
+        *,
+        floor_price: float | None = None,
+    ) -> bool:
+        """Sell one position and record the outcome; returns whether it filled.
 
         Runs as its own task so a cancelled tick loop cannot strand the
-        bookkeeping; clears the in-flight claim on every exit path.
+        bookkeeping; clears the in-flight claim on every exit path. A fill
+        resets the position's close backoff; a failure starts / doubles it and
+        logs its ``error`` row once per (position, reason).
         """
         try:
             # execute_sell blocks for seconds on the live path — keep the event
             # loop free (same offload the orchestrator does for its sections).
+            # ``floor_price`` is the mark the decision was made on: the sell
+            # may sweep bid levels down to it, but never below the price the
+            # trigger was evaluated at.
             result = await asyncio.to_thread(
                 self._executor.execute_sell,
                 held,
                 close_reason=trigger,
                 ts=ts,
                 trigger=trigger,
+                floor_price=floor_price,
             )
         finally:
             clear_closing(held.position_id)
         if result.filled and result.price is not None:
+            self._backoff.pop(held.position_id, None)
+            self._clear_errors(held.position_id)
             # A sell is not necessarily the whole position: a crossing order
             # takes whatever depth was resting and the executor cancels the
             # rest rather than leaving it on the book; ``record_sell`` reduces
@@ -525,9 +767,16 @@ class ExitMonitor(TickLoopMonitor):
                 realized_pnl=realized,
                 reason=trigger,
             )
-        else:
-            # The section decided to close but the fill did not land — a
-            # position that should be closed is still open: surface as error.
+            return True
+        # The section decided to close but the fill did not land — a position
+        # that should be closed is still open: surface as error, once per
+        # (position, reason) while it persists, and back off the retries.
+        self._record_close_failure(held.position_id, trigger)
+        error = f"sell not filled: {result.skip_reason}"
+        key = (held.position_id, error)
+        if key not in self._logged_errors:
+            self._clear_errors(held.position_id)
+            self._logged_errors.add(key)
             self._log(
                 held,
                 ts,
@@ -535,8 +784,9 @@ class ExitMonitor(TickLoopMonitor):
                 trigger=trigger,
                 return_pct=return_pct,
                 peak_price=peak_price,
-                error=f"sell not filled: {result.skip_reason}",
+                error=error,
             )
+        return False
 
     # ---------- canvas-sync v2 ----------
 
@@ -584,6 +834,29 @@ class ExitMonitor(TickLoopMonitor):
         )
 
 
+class _Backoff(NamedTuple):
+    """A failed close's retry backoff for one position."""
+
+    trigger: str  # the decision that failed — a different one resets the backoff
+    delay: float  # seconds of the current backoff step
+    until: float  # time.monotonic() before which the close is not retried
+
+
+class _Decision(NamedTuple):
+    """One exit-section evaluation and the peak it was marked with."""
+
+    out: SectionOutput
+    peak_price: float
+    thin: bool = False  # marked on the raw best bid (no executable level)
+
+
+def _close_intent(out: SectionOutput) -> CloseIntent | None:
+    """The CloseIntent of an ok exit decision, else None."""
+    if out.verdict == "ok" and isinstance(out.payload, CloseIntent):
+        return out.payload
+    return None
+
+
 def _parse_levels(raw: str | None) -> list[tuple[float, float]]:
     """Parse a persisted ``bids_json`` / ``asks_json`` ladder. Malformed rows
     yield an empty ladder rather than aborting the bootstrap scan."""
@@ -604,7 +877,16 @@ def _parse_levels(raw: str | None) -> list[tuple[float, float]]:
 
 # Module-level singleton — the FastAPI lifespan injects its PortfolioStore via
 # configure() and start()s it. Shares the one executor with the orchestrator.
-exit_monitor = ExitMonitor(
-    exit_section=ThresholdExitV0(ThresholdExitConfig()),
-    executor=_executor_singleton,
-)
+def _build_exit_monitor() -> ExitMonitor:
+    """The process exit monitor: the active exit impl with the persisted
+    canvas exit node's config (defaults when absent / invalid), so a restart
+    keeps the operator's thresholds; a later canvas edit swaps in via
+    ``replace_exit_section``."""
+    return ExitMonitor(
+        exit_section=build_section("exit"),
+        executor=_executor_singleton,
+        book_source=market_source_manager,
+    )
+
+
+exit_monitor = _build_exit_monitor()

@@ -128,7 +128,7 @@ const startup = templateToCanvas(startupTemplate)
 bumpIdCounterFrom(startup.nodes)
 const initialStartupFlash =
   loaded?.status === 'ok' && loaded.migrated
-    ? 'Migrated draft to v3: linked Embedding → Database'
+    ? 'Migrated draft to the current canvas version'
     : loaded?.status === 'incompatible'
       ? 'Saved draft used a removed section type — reset to seed'
       : null
@@ -332,7 +332,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
             serverRev: result.rev,
             isOnline: true,
             startupFlash: result.migrated
-              ? 'Loaded backend canvas (migrated to v3)'
+              ? 'Loaded backend canvas (migrated to the current version)'
               : 'Loaded canvas from backend',
           })
           // Also mirror to localStorage so a network drop leaves a sane
