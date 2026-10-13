@@ -85,8 +85,14 @@ def load_template_with_rev() -> tuple[dict[str, Any], str] | None:
 # frontend's ``TEMPLATE_VERSION`` (``frontend/src/canvas/templateIO.ts``).
 CANVAS_TEMPLATE_VERSION = 4
 
-# Entry v1's cooldown default; v3 canvases persisted entry v0's 0 instead.
-_ENTRY_V1_COOLDOWN_MINUTES = 60
+
+def _entry_v1_cooldown_minutes() -> int:
+    """Entry v1's cooldown default; v3 canvases persisted entry v0's 0
+    instead. Read from the config model (imported lazily: the canvas store
+    must not pull the entry section in at import time)."""
+    from openpoly.sections.entry.edge_threshold_v1 import EdgeThresholdConfigV1
+
+    return int(EdgeThresholdConfigV1.model_fields["same_market_cooldown_minutes"].default)
 
 
 def upgrade_template(template: dict[str, Any]) -> dict[str, Any]:
@@ -121,7 +127,7 @@ def upgrade_template(template: dict[str, Any]) -> dict[str, Any]:
                 **node,
                 "config": {
                     **node["config"],
-                    "same_market_cooldown_minutes": _ENTRY_V1_COOLDOWN_MINUTES,
+                    "same_market_cooldown_minutes": _entry_v1_cooldown_minutes(),
                 },
             }
         upgraded_nodes.append(node)

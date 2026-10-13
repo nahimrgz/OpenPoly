@@ -357,6 +357,7 @@ class MarketSourceManager:
         YES and NO token (concurrency-bounded), then atomically store the fresh
         set. Both sides are sampled so entry / exit read the held side's own
         book — a NO decision is not a flipped YES book."""
+        self._prune_last_persisted()
         markets = self.store.snapshot()
         cycle_start = book_clock()
         if not markets:
@@ -414,6 +415,17 @@ class MarketSourceManager:
         except Exception as exc:  # noqa: BLE001 — callers judge a missing book themselves
             logger.warning("order book fetch failed for %s: %s", token_id, exc)
             return None
+
+    def _prune_last_persisted(self) -> None:
+        """Drop ``_last_persisted`` stamps at least one persist interval old:
+        they no longer throttle anything (``_deliver_books`` treats them like a
+        missing stamp), and without pruning every token ever refreshed stayed
+        in the dict for the life of the process."""
+        now = time.monotonic()
+        interval = self._persist_interval()
+        self._last_persisted = {
+            token: at for token, at in self._last_persisted.items() if now - at < interval
+        }
 
     def _persist_interval(self) -> float:
         """At most one persisted snapshot per token per this many seconds from
@@ -513,8 +525,8 @@ class MarketSourceManager:
                 logger.warning("order book refresh of %d token(s) timed out", len(stale))
         ages: dict[str, float | None] = {}
         for t in token_ids:
-            fetched = self.store.order_book_fetched_at(t)
-            ages[t] = None if fetched is None else max(0.0, decision_at - fetched)
+            age = self.store.order_book_age(t, decision_at)
+            ages[t] = None if age is None else max(0.0, age)
         return ages
 
     async def _refresh_held_books_once(self) -> int:

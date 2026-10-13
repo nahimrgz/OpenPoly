@@ -89,6 +89,7 @@ from openpoly.execution.sizing import (
 )
 from openpoly.execution.types import ExecResult
 from openpoly.markets.manager import manager as market_source_manager
+from openpoly.markets.pricing import sweep
 from openpoly.portfolio import CloseReason, HeldPosition, PortfolioStore
 from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
 
@@ -303,16 +304,9 @@ def _sell_price_estimate(
     levels = [(p, s) for p, s in bids if p >= limit and s > 0]
     if not levels:
         current = market_source_manager.store.get_order_book(token_id)
-        best = current.bids[0][0] if current is not None and current.bids else None
+        best = current.best_bid if current is not None else None
         return max(limit, best) if best is not None and in_price_band(best) else limit
-    remaining = qty
-    notional = 0.0
-    for price, size in levels:
-        take = min(remaining, size)
-        notional += take * price
-        remaining -= take
-        if remaining <= 0:
-            break
+    notional, remaining = sweep(levels, qty)
     if remaining > 0:
         notional += remaining * limit
     return max(limit, notional / qty) if qty > 0 else limit

@@ -1,6 +1,7 @@
 import { apiFetch } from '../lib/apiClient'
 import {
   defaultConfigForType,
+  ENTRY_V1_COOLDOWN_MINUTES,
   MOCK_RUNTIME_CATALOG,
   SECTION_ORDER,
 } from '../sections/catalog'
@@ -305,7 +306,6 @@ function migrateV2toV3(v2: StoredTemplate): StoredTemplate {
 // user who deliberately sets 0 after the upgrade keeps it. The backend applies
 // the same step when it reads a v3 canvas (``canvas_store.upgrade_template``),
 // so the runtime agrees before the frontend has saved the upgraded canvas.
-export const ENTRY_V1_COOLDOWN_MINUTES = 60
 
 function migrateV3toV4(v3: StoredTemplate): StoredTemplate {
   const nodes = v3.nodes.map((n) =>

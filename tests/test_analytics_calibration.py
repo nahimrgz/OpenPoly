@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from openpoly.analytics.calibration import BUCKET_EDGES, calibration_report, calibration_summary
+from openpoly.analytics.calibration import BUCKET_EDGES, calibration_summary
 from openpoly.db.engine import init_db, make_engine, make_session_factory
 from openpoly.portfolio import PortfolioStore, PositionRecord
 
@@ -71,7 +71,7 @@ def _open(*, p_model: float, position_id: int = 99) -> PositionRecord:
 
 
 def test_report_shape_is_one_bucket_per_edge_pair() -> None:
-    buckets = calibration_report([])
+    buckets = calibration_summary([]).buckets
     assert [(b.lower, b.upper) for b in buckets] == list(zip(BUCKET_EDGES, BUCKET_EDGES[1:]))
     assert all(b.count == 0 for b in buckets)
     assert all(b.win_rate is None and b.mean_return is None for b in buckets)
@@ -84,7 +84,7 @@ def test_buckets_by_probability_and_counts_wins() -> None:
         _closed(p_model=0.68, realized_pnl=3.0, position_id=3),
         _closed(p_model=0.75, realized_pnl=-1.0, position_id=4),
     ]
-    by_lower = {b.lower: b for b in calibration_report(positions)}
+    by_lower = {b.lower: b for b in calibration_summary(positions).buckets}
 
     assert by_lower[0.6].count == 3
     assert by_lower[0.6].win_rate == pytest.approx(2 / 3)
@@ -99,7 +99,7 @@ def test_mean_return_is_realized_pnl_over_cost_basis() -> None:
         _closed(p_model=0.55, realized_pnl=1.0, position_id=1),
         _closed(p_model=0.55, realized_pnl=-2.0, position_id=2),
     ]
-    bucket = next(b for b in calibration_report(positions) if b.lower == 0.5)
+    bucket = next(b for b in calibration_summary(positions).buckets if b.lower == 0.5)
     assert bucket.mean_return == pytest.approx(-0.10)
 
 
@@ -107,7 +107,7 @@ def test_no_side_is_bucketed_by_the_held_side_probability() -> None:
     """A NO position on p_model=0.2 is a 0.8 bet on the side actually held —
     bucketing the raw 0.2 would drop it out of the report entirely."""
     positions = [_closed(p_model=0.2, side="no", realized_pnl=1.0)]
-    by_lower = {b.lower: b for b in calibration_report(positions)}
+    by_lower = {b.lower: b for b in calibration_summary(positions).buckets}
     assert by_lower[0.8].count == 1
 
 
@@ -117,24 +117,28 @@ def test_open_and_unlabelled_positions_are_excluded() -> None:
     unlabelled = _closed(p_model=0.7, realized_pnl=1.0, position_id=2)
     unlabelled = PositionRecord(**{**unlabelled.__dict__, "entry_p_model": None})
     positions = [_open(p_model=0.7), unlabelled]
-    assert all(b.count == 0 for b in calibration_report(positions))
+    assert all(b.count == 0 for b in calibration_summary(positions).buckets)
 
 
 def test_top_bucket_includes_certainty() -> None:
     """p=1.0 belongs in the last bucket, not off the end of it."""
-    by_lower = {b.lower: b for b in calibration_report([_closed(p_model=1.0, realized_pnl=1.0)])}
+    by_lower = {
+        b.lower: b for b in calibration_summary([_closed(p_model=1.0, realized_pnl=1.0)]).buckets
+    }
     assert by_lower[0.9].count == 1
 
 
 def test_bucket_boundary_belongs_to_the_upper_bucket() -> None:
-    by_lower = {b.lower: b for b in calibration_report([_closed(p_model=0.70, realized_pnl=1.0)])}
+    by_lower = {
+        b.lower: b for b in calibration_summary([_closed(p_model=0.70, realized_pnl=1.0)]).buckets
+    }
     assert by_lower[0.7].count == 1
     assert by_lower[0.6].count == 0
 
 
 def test_zero_cost_basis_does_not_divide_by_zero() -> None:
     positions = [_closed(p_model=0.65, realized_pnl=0.0, entry=0.0, position_id=1)]
-    bucket = next(b for b in calibration_report(positions) if b.lower == 0.6)
+    bucket = next(b for b in calibration_summary(positions).buckets if b.lower == 0.6)
     assert bucket.count == 1
     # Unmeasurable basis: excluded from mean_return rather than counted as a
     # fake 0.0 return that dilutes the bucket's average.
@@ -175,7 +179,9 @@ def test_return_is_measured_against_the_opened_cost_basis_not_the_residual(store
 
     positions = store.list_positions(10)
     assert positions[0].realized_pnl == pytest.approx(1.17)
-    buckets = calibration_report(positions, store.buy_cost_basis([p.id for p in positions]))
+    buckets = calibration_summary(
+        positions, store.buy_cost_basis([p.id for p in positions])
+    ).buckets
 
     bucket = next(b for b in buckets if b.lower == 0.7)
     assert bucket.count == 1
@@ -196,7 +202,7 @@ def test_reconciled_closes_are_excluded() -> None:
         _closed(p_model=0.85, realized_pnl=0.0, position_id=2, close_reason="reconciled"),
         _closed(p_model=0.85, realized_pnl=5.0, position_id=3),
     ]
-    buckets = calibration_report(positions)
+    buckets = calibration_summary(positions).buckets
     top = [b for b in buckets if b.lower == 0.8][0]
     assert top.count == 1
     assert top.win_rate == pytest.approx(1.0)
@@ -207,14 +213,14 @@ def test_reconciled_closes_are_excluded() -> None:
 )
 def test_real_close_reasons_are_counted(close_reason: str) -> None:
     positions = [_closed(p_model=0.85, realized_pnl=5.0, close_reason=close_reason)]
-    top = [b for b in calibration_report(positions) if b.lower == 0.8][0]
+    top = [b for b in calibration_summary(positions).buckets if b.lower == 0.8][0]
     assert top.count == 1
 
 
 def test_a_null_close_reason_is_still_counted() -> None:
     """Only ``reconciled`` is fabricated; an unlabelled close is not."""
     positions = [_closed(p_model=0.85, realized_pnl=5.0, close_reason=None)]
-    top = [b for b in calibration_report(positions) if b.lower == 0.8][0]
+    top = [b for b in calibration_summary(positions).buckets if b.lower == 0.8][0]
     assert top.count == 1
 
 

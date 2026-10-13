@@ -42,6 +42,7 @@ from typing import Any, Literal, NamedTuple, Protocol, TypeVar
 from pydantic import BaseModel
 
 from openpoly.embedding.models import MarketCandidates
+from openpoly.llm.client import cost_or_none, int_or
 from openpoly.llm.usage_store import usage_store
 from openpoly.markets.manager import MAX_BOOK_AGE_SECONDS, FreshBookSource
 from openpoly.markets.models import Market
@@ -55,8 +56,8 @@ from openpoly.runtime.section_log import (
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.execution import ExecResult, executor
 from openpoly.sections.analyzer.llm_v0 import AnalysisResult
-from openpoly.sections.entry.edge_threshold_v0 import OrderIntent, Side
-from openpoly.sections.entry.edge_threshold_v1 import FreshBooks
+from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
+from openpoly.sections.entry._types import FreshBooks, candidate_sides
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +370,7 @@ class PipelineOrchestrator:
 
         ar = out.payload if out is not None and isinstance(out.payload, AnalysisResult) else None
         usage = _usage_signal(out)
+        reasoning, reasoning_truncated = _reasoning(out)
 
         self._analyzer_log.append(
             AnalyzerCall(
@@ -387,8 +389,8 @@ class PipelineOrchestrator:
                 # string from the model is also informative ("intentionally
                 # said nothing") — keep it; only None when ar itself is None.
                 rationale=ar.rationale if ar is not None else None,
-                reasoning=_reasoning_signal(out),
-                reasoning_truncated=_reasoning_truncated(out),
+                reasoning=reasoning,
+                reasoning_truncated=reasoning_truncated,
                 **_usage_fields(usage),
             )
         )
@@ -417,7 +419,7 @@ class PipelineOrchestrator:
         entry's ``side_lock``, else both sides (v1 picks the side by comparing
         both books)."""
         side_lock = getattr(getattr(self._entry, "config", None), "side_lock", False)
-        sides: tuple[Side, ...] = ("yes",) if side_lock else ("yes", "no")
+        sides = candidate_sides(side_lock)
         return [t for t in (market.token_for(s) for s in sides) if t is not None]
 
     async def _ensure_fresh_books(self, market_id: str) -> _BookCheck | None:
@@ -582,15 +584,15 @@ class PipelineOrchestrator:
         )
 
 
-def _reasoning_signal(out: SectionOutput | None) -> str | None:
+def _reasoning(out: SectionOutput | None) -> tuple[str | None, bool]:
     """The analyzer's written self-check, when its impl produces one — capped
-    so the polled /api/analyzer/log payload stays small."""
-    if out is None:
-        return None
-    reasoning = out.signals.get("reasoning")
+    so the polled /api/analyzer/log payload stays small — and whether the cap
+    cut it (surfaced so the UI can mark it rather than read as the model
+    stopping mid-thought)."""
+    reasoning = out.signals.get("reasoning") if out is not None else None
     if not isinstance(reasoning, str) or not reasoning:
-        return None
-    return reasoning[:MAX_LOGGED_REASONING_CHARS]
+        return None, False
+    return reasoning[:MAX_LOGGED_REASONING_CHARS], len(reasoning) > MAX_LOGGED_REASONING_CHARS
 
 
 def _usage_signal(out: SectionOutput | None) -> dict[str, Any] | None:
@@ -606,30 +608,16 @@ def _usage_fields(usage: dict[str, Any] | None) -> dict[str, Any]:
     if usage is None:
         return {}
 
-    def _int(name: str) -> int | None:
-        value = usage.get(name)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    cost = usage.get("cost_usd")
     model = usage.get("model")
     return {
         "llm_model": model if isinstance(model, str) else None,
-        "input_tokens": _int("input_tokens"),
-        "output_tokens": _int("output_tokens"),
-        "cache_read_input_tokens": _int("cache_read_input_tokens"),
-        "cache_creation_input_tokens": _int("cache_creation_input_tokens"),
-        "llm_attempts": _int("attempts"),
-        "cost_usd": float(cost) if isinstance(cost, (int, float)) else None,
+        "input_tokens": int_or(usage.get("input_tokens"), None),
+        "output_tokens": int_or(usage.get("output_tokens"), None),
+        "cache_read_input_tokens": int_or(usage.get("cache_read_input_tokens"), None),
+        "cache_creation_input_tokens": int_or(usage.get("cache_creation_input_tokens"), None),
+        "llm_attempts": int_or(usage.get("attempts"), None),
+        "cost_usd": cost_or_none(usage.get("cost_usd")),
     }
-
-
-def _reasoning_truncated(out: SectionOutput | None) -> bool:
-    """Whether ``_reasoning_signal`` cut the reasoning at its cap — surfaced
-    so the UI can mark it rather than read as the model stopping mid-thought."""
-    if out is None:
-        return False
-    reasoning = out.signals.get("reasoning")
-    return isinstance(reasoning, str) and len(reasoning) > MAX_LOGGED_REASONING_CHARS
 
 
 # Module-level singleton built lazily so tests can substitute. Real

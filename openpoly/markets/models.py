@@ -98,8 +98,9 @@ def _to_float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def _parse_iso(value: Any) -> datetime | None:
-    """Parse an ISO-8601 string (date or datetime, optional 'Z') to aware UTC."""
+def parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 string (date or datetime, optional 'Z') to aware UTC.
+    A naive value is read as UTC; anything unparseable yields None."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -153,7 +154,7 @@ def normalize_gamma_market(
         slug=str(raw.get("slug", "")),
         yes_token_id=token_ids[0],
         no_token_id=token_ids[1] if len(token_ids) > 1 else None,
-        end_date=_parse_iso(raw.get("endDate") or raw.get("endDateIso")),
+        end_date=parse_iso(raw.get("endDate") or raw.get("endDateIso")),
         best_bid=_to_float(raw.get("bestBid")),
         best_ask=_to_float(raw.get("bestAsk")),
         spread=_to_float(raw.get("spread")),

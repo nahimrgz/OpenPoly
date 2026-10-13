@@ -31,3 +31,20 @@ def first_level_with_size(
         if size >= min_size:
             return price
     return None
+
+
+def sweep(levels: list[tuple[float, float]], qty: float) -> tuple[float, float]:
+    """Take ``qty`` from ``levels`` best-first.
+
+    Returns ``(notional, remaining)``: the price-weighted notional of what the
+    levels covered, and the part of ``qty`` they could not cover (``<= 0`` when
+    fully covered)."""
+    remaining = qty
+    notional = 0.0
+    for price, size in levels:
+        take = min(remaining, size)
+        notional += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+    return notional, remaining

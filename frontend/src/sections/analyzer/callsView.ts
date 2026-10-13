@@ -36,21 +36,28 @@ export function reasoningText(text: string, truncated: boolean): string {
 /**
  * State of one call's on-demand reasoning fetch. ``requestId`` is the newest
  * request; a response for an older one is ignored, and a failure never
- * replaces text that is already loaded.
+ * replaces text that is already loaded. ``truncated`` belongs to ``text``:
+ * whether the backend cut it at its cap.
  */
 export type ReasoningState = {
   text: string | null
+  truncated: boolean
   failed: boolean
   requestId: number
 }
 
-export const INITIAL_REASONING: ReasoningState = { text: null, failed: false, requestId: 0 }
+export const INITIAL_REASONING: ReasoningState = {
+  text: null,
+  truncated: false,
+  failed: false,
+  requestId: 0,
+}
 
 export function startReasoningRequest(s: ReasoningState): ReasoningState {
   return { ...s, failed: false, requestId: s.requestId + 1 }
 }
 
-export type ReasoningOutcome = { ok: true; text: string } | { ok: false }
+export type ReasoningOutcome = { ok: true; text: string; truncated?: boolean } | { ok: false }
 
 export function settleReasoningRequest(
   s: ReasoningState,
@@ -60,7 +67,7 @@ export function settleReasoningRequest(
   if (outcome.ok) {
     // Text wins whenever it arrives — even a late one for an older request
     // is the same call's reasoning.
-    return { ...s, text: outcome.text, failed: false }
+    return { ...s, text: outcome.text, truncated: outcome.truncated === true, failed: false }
   }
   // A failure only counts for the newest request and only while nothing has
   // loaded: a late failed retry must not overwrite text already shown.

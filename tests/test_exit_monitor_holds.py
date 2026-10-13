@@ -343,7 +343,7 @@ async def test_backoff_resets_when_the_close_succeeds(monkeypatch) -> None:
     clock[0] += 11.0
     await m._tick_once()
     assert len(ex.calls) == 2
-    assert m._backoff == {}
+    assert all(st.backoff is None for st in m._states.values())
     assert [e.verdict for e in exit_log.entries()] == ["error", "ok"]
 
 
@@ -357,13 +357,13 @@ async def test_backoff_drops_when_the_decision_changes(monkeypatch) -> None:
     ex = _FakeExecutor(result=ExecResult.skip("ctf_cache_not_synced"))
     m = _v1_monitor(ex)
     await m._tick_once()
-    assert 1 in m._backoff
+    assert m._states[1].backoff is not None
     # The book recovers: no close decision any more → the backoff is over.
     store.set_order_books(
         [OrderBook(token_id="t1", ts=1.0, bids=[(0.50, 100.0)], asks=[(0.51, 100.0)])]
     )
     await m._tick_once()
-    assert m._backoff == {}
+    assert all(st.backoff is None for st in m._states.values())
 
 
 async def test_hold_reasons_are_deduped_per_position_and_reason() -> None:

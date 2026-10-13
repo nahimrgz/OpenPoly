@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal, NamedTuple, Protocol, TYPE_CHECKING
+from typing import Callable, NamedTuple, Protocol, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -45,12 +45,12 @@ from openpoly.markets.models import OrderBook
 from openpoly.markets.polymarket_api import recent_move
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.analyzer.llm_v0 import AnalysisResult
+from openpoly.sections.entry._types import Side, held_side_probability
 
 if TYPE_CHECKING:
     from openpoly.portfolio import HeldPosition, PortfolioStore, PositionRecord
 
 
-Side = Literal["yes", "no"]
 PortfolioProvider = Callable[[], "PortfolioStore | None"]
 
 
@@ -279,8 +279,7 @@ class EdgeThresholdEntryV0:
         token_id, held_price, best_bid = quote
 
         spread = held_price - best_bid
-        fair = res.p_model if side == "yes" else 1.0 - res.p_model
-        edge = fair - held_price
+        edge = held_side_probability(res.p_model, side) - held_price
         signals: dict[str, object] = {
             **side_signals,
             "edge": round(edge, 4),

@@ -960,13 +960,12 @@ def test_default_orchestrator_wires_the_v1_sections_and_both_guards(tmp_path, mo
 def test_reasoning_truncation_is_flagged() -> None:
     from openpoly.runtime.orchestrator import (
         MAX_LOGGED_REASONING_CHARS,
-        _reasoning_signal,
-        _reasoning_truncated,
+        _reasoning,
     )
 
     long = SectionOutput(signals={"reasoning": "x" * (MAX_LOGGED_REASONING_CHARS + 1)})
     short = SectionOutput(signals={"reasoning": "x" * MAX_LOGGED_REASONING_CHARS})
-    assert _reasoning_truncated(long) is True
-    assert _reasoning_truncated(short) is False
-    assert _reasoning_truncated(None) is False
-    assert len(_reasoning_signal(long) or "") == MAX_LOGGED_REASONING_CHARS
+    assert _reasoning(long)[1] is True
+    assert _reasoning(short)[1] is False
+    assert _reasoning(None) == (None, False)
+    assert len(_reasoning(long)[0] or "") == MAX_LOGGED_REASONING_CHARS

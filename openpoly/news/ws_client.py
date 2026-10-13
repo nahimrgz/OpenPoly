@@ -17,11 +17,12 @@ import json
 import logging
 import time
 import re
-from datetime import datetime, timezone
 from typing import Callable
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
+
+from openpoly.markets.models import parse_iso
 
 from .ring_buffer import NewsItem, NewsRingBuffer
 
@@ -73,16 +74,13 @@ def _to_epoch(value: object, fallback: float) -> float:
         if _NUMERIC_RE.fullmatch(value.strip()):
             return _epoch_seconds(float(value))
         # tradingnews emits ISO 8601 with offset (e.g. 2026-05-19T10:49:35+00:00).
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parse_iso(value)
+        if parsed is not None:
             return parsed.timestamp()
+        try:
+            return _epoch_seconds(float(value))
         except ValueError:
-            try:
-                return _epoch_seconds(float(value))
-            except ValueError:
-                return fallback
+            return fallback
     return fallback
 
 

@@ -38,7 +38,7 @@ from pydantic import Field
 
 from openpoly.embedding.models import MarketCandidates
 from openpoly.llm import LLMError
-from openpoly.llm.client import LLMClient, LLMUsage, ToolDefinition
+from openpoly.llm.client import LLMUsage, ToolDefinition
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.analyzer.llm_v0 import (
     AnalysisResult,
@@ -180,16 +180,10 @@ class LLMAnalyzerV1(LLMAnalyzerV0):
     REQUIRES = ["llm", "market_data"]
     Config = LLMAnalyzerConfigV1
 
-    def _client(self) -> LLMClient:
-        if self._llm is None:
-            self._llm = LLMClient(
-                api_key_ref=self.config.api_key_ref,
-                model=self.config.llm_model,
-                temperature=self.config.temperature,
-                base_url=self.config.base_url,
-                effort=getattr(self.config, "llm_effort", "low"),
-            )
-        return self._llm
+    config: LLMAnalyzerConfigV1
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        return {**super()._client_kwargs(), "effort": self.config.llm_effort}
 
     def run(self, input: SectionInput) -> SectionOutput:
         candidates = input.payload

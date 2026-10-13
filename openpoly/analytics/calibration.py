@@ -32,6 +32,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from openpoly.portfolio import PositionRecord
+from openpoly.sections.entry._types import held_side_probability
 
 # Bucket boundaries over the *held side's* probability, full range (see the
 # module docstring for why it is not ≥ 0.5 any more).
@@ -82,7 +83,7 @@ def _held_side_probability(record: PositionRecord) -> float | None:
     p_model = record.entry_p_model
     if p_model is None:
         return None
-    held = p_model if record.side == "yes" else 1.0 - p_model
+    held = held_side_probability(p_model, record.side)
     if not (BUCKET_EDGES[0] <= held <= BUCKET_EDGES[-1]):  # also rejects NaN
         return None
     return held
@@ -106,14 +107,6 @@ class CalibrationReport:
 
     buckets: list[CalibrationBucket]
     excluded: int
-
-
-def calibration_report(
-    positions: Iterable[PositionRecord],
-    cost_basis: Mapping[int, float] | None = None,
-) -> list[CalibrationBucket]:
-    """The buckets of ``calibration_summary`` (kept for existing callers)."""
-    return calibration_summary(positions, cost_basis).buckets
 
 
 def calibration_summary(

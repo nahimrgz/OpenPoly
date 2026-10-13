@@ -409,6 +409,10 @@ const ANALYZER_V1: RuntimeCatalogEntry = {
 
 const ENTRY_V0_PROPS = ENTRY_V0.param_schema.properties as Record<string, object>
 
+// Entry v1's ``same_market_cooldown_minutes`` default (v0: 0, off). The canvas
+// v3 → v4 migration (``templateIO``) lifts a persisted v0 default to it.
+export const ENTRY_V1_COOLDOWN_MINUTES = 60
+
 const ENTRY_V1: RuntimeCatalogEntry = {
   ...ENTRY_V0,
   name: 'EdgeThresholdEntryV1',
@@ -422,7 +426,7 @@ const ENTRY_V1: RuntimeCatalogEntry = {
       ...ENTRY_V0_PROPS,
       same_market_cooldown_minutes: {
         ...ENTRY_V0_PROPS.same_market_cooldown_minutes,
-        default: 60,
+        default: ENTRY_V1_COOLDOWN_MINUTES,
       },
       max_spread_pct: {
         type: 'number',

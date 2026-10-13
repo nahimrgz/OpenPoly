@@ -147,14 +147,14 @@ async def test_older_book_never_reaches_the_peak_tracker_after_a_newer_one() -> 
     batch_started = book_clock()
     source.next_book = _book("t1", 0.52, 0.53)
     await source.refresh_order_book("t1")
-    assert m._peak[1] == 0.52  # noqa: SLF001
+    assert m._states[1].peak == 0.52  # noqa: SLF001
 
     accepted = source.store.set_order_books(
         [_book("t1", 0.70, 0.71)], fetched_at=batch_started - 1.0
     )
     source._deliver_books(accepted)  # noqa: SLF001 — what _sample_books_once does
     assert accepted == []
-    assert m._peak[1] == 0.52  # noqa: SLF001
+    assert m._states[1].peak == 0.52  # noqa: SLF001
     book = source.store.get_order_book("t1")
     assert book is not None and book.bids[0][0] == 0.52
 

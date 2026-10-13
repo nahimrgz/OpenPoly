@@ -3,7 +3,7 @@
  * keyed by news_id; users cross-reference with news_source Recent
  * messages and entry Decisions tab to trace a single news through.
  */
-import { useRef, useState, type SyntheticEvent } from 'react'
+import { useMemo, useState, type SyntheticEvent } from 'react'
 
 import { formatRelativeAgo, formatUTC } from '../news_source/time'
 import {
@@ -121,6 +121,9 @@ function SummaryHeader({
 }
 
 function CallsTimeline({ entries }: { entries: AnalyzerLogEntry[] }) {
+  // Newest first, one row per call; recomputed only when a poll delivers a
+  // new list, not on every render.
+  const ordered = useMemo(() => dedupeCalls([...entries].reverse()), [entries])
   if (entries.length === 0) {
     return (
       <div className="text-[11px] text-neutral-500">
@@ -129,7 +132,6 @@ function CallsTimeline({ entries }: { entries: AnalyzerLogEntry[] }) {
       </div>
     )
   }
-  const ordered = dedupeCalls([...entries].reverse()) // newest first
   return (
     <ol className="flex flex-col gap-1.5">
       {ordered.map((e) => (
@@ -219,21 +221,23 @@ function UsageLine({ entry }: { entry: AnalyzerLogEntry }) {
  */
 function ReasoningDetails({ newsId, ts }: { newsId: string; ts: number }) {
   const [state, setState] = useState<ReasoningState>(INITIAL_REASONING)
-  const [truncated, setTruncated] = useState(false)
-  const latest = useRef(0)
 
   const onToggle = (ev: SyntheticEvent<HTMLDetailsElement>) => {
     if (!ev.currentTarget.open || state.text !== null) return
-    const requestId = latest.current + 1
-    latest.current = requestId
+    // The id ``startReasoningRequest`` assigns: each toggle is a discrete
+    // event, so ``state`` is current here.
+    const requestId = state.requestId + 1
     setState((s) => startReasoningRequest(s))
     fetchReasoning(newsId, ts)
-      .then((r) => {
-        setTruncated(r.truncated)
+      .then((r) =>
         setState((s) =>
-          settleReasoningRequest(s, requestId, { ok: true, text: r.reasoning ?? '' }),
-        )
-      })
+          settleReasoningRequest(s, requestId, {
+            ok: true,
+            text: r.reasoning ?? '',
+            truncated: r.truncated,
+          }),
+        ),
+      )
       .catch(() => setState((s) => settleReasoningRequest(s, requestId, { ok: false })))
   }
 
@@ -242,7 +246,7 @@ function ReasoningDetails({ newsId, ts }: { newsId: string; ts: number }) {
       <summary className="cursor-pointer text-neutral-500">reasoning</summary>
       <div className="whitespace-pre-wrap break-words">
         {state.text !== null
-          ? reasoningText(state.text, truncated)
+          ? reasoningText(state.text, state.truncated)
           : state.failed
             ? 'Could not load reasoning.'
             : 'Loading…'}

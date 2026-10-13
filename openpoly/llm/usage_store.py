@@ -12,18 +12,15 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select, true
 from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.db.tables import LLMUsageRow
+from openpoly.llm.client import cost_or_none, int_or
 
 logger = logging.getLogger(__name__)
 
 _WEEK_SECONDS = 7 * 86_400
-
-
-def _int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 class UsageStore:
@@ -48,18 +45,17 @@ class UsageStore:
         """Persist one call's usage (the ``llm_usage`` signal dict)."""
         if self._factory is None:
             return
-        cost = usage.get("cost_usd")
         row = LLMUsageRow(
             ts=ts,
             news_id=news_id,
             model=str(usage.get("model") or ""),
             verdict=verdict,
-            input_tokens=_int(usage.get("input_tokens")),
-            output_tokens=_int(usage.get("output_tokens")),
-            cache_read_input_tokens=_int(usage.get("cache_read_input_tokens")),
-            cache_creation_input_tokens=_int(usage.get("cache_creation_input_tokens")),
-            attempts=_int(usage.get("attempts")) or 1,
-            cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+            input_tokens=int_or(usage.get("input_tokens"), 0),
+            output_tokens=int_or(usage.get("output_tokens"), 0),
+            cache_read_input_tokens=int_or(usage.get("cache_read_input_tokens"), 0),
+            cache_creation_input_tokens=int_or(usage.get("cache_creation_input_tokens"), 0),
+            attempts=int_or(usage.get("attempts"), 0) or 1,
+            cost_usd=cost_or_none(usage.get("cost_usd")),
         )
         with self._factory() as session:
             session.add(row)
@@ -80,30 +76,38 @@ def usage_totals(
         .timestamp()
     )
     windows = {"today": day_start, "last_7_days": now - _WEEK_SECONDS, "all_time": None}
-    out: dict[str, dict[str, Any]] = {}
+    token_columns = (
+        LLMUsageRow.input_tokens,
+        LLMUsageRow.output_tokens,
+        LLMUsageRow.cache_read_input_tokens,
+        LLMUsageRow.cache_creation_input_tokens,
+    )
+    # One scan for every window: each aggregate is FILTERed to its window
+    # (all-time: an always-true filter), seven columns per window in
+    # ``windows`` order.
+    columns: list[Any] = []
+    for since in windows.values():
+        cond = LLMUsageRow.ts >= since if since is not None else true()
+        columns += [
+            func.count(LLMUsageRow.id).filter(cond),
+            *(func.coalesce(func.sum(col).filter(cond), 0) for col in token_columns),
+            func.coalesce(func.sum(LLMUsageRow.cost_usd).filter(cond), 0.0),
+            func.count(LLMUsageRow.id).filter(and_(cond, LLMUsageRow.cost_usd.is_(None))),
+        ]
     with session_factory() as session:
-        for name, since in windows.items():
-            stmt = select(
-                func.count(LLMUsageRow.id),
-                func.coalesce(func.sum(LLMUsageRow.input_tokens), 0),
-                func.coalesce(func.sum(LLMUsageRow.output_tokens), 0),
-                func.coalesce(func.sum(LLMUsageRow.cache_read_input_tokens), 0),
-                func.coalesce(func.sum(LLMUsageRow.cache_creation_input_tokens), 0),
-                func.coalesce(func.sum(LLMUsageRow.cost_usd), 0.0),
-                func.count(LLMUsageRow.id).filter(LLMUsageRow.cost_usd.is_(None)),
-            )
-            if since is not None:
-                stmt = stmt.where(LLMUsageRow.ts >= since)
-            calls, tin, tout, cread, ccreate, cost, unpriced = session.execute(stmt).one()
-            out[name] = {
-                "calls": int(calls),
-                "input_tokens": int(tin),
-                "output_tokens": int(tout),
-                "cache_read_input_tokens": int(cread),
-                "cache_creation_input_tokens": int(ccreate),
-                "cost_usd": float(cost),
-                "unpriced_calls": int(unpriced),
-            }
+        row = session.execute(select(*columns)).one()
+    out: dict[str, dict[str, Any]] = {}
+    for n, name in enumerate(windows):
+        calls, tin, tout, cread, ccreate, cost, unpriced_calls = row[n * 7 : (n + 1) * 7]
+        out[name] = {
+            "calls": int(calls),
+            "input_tokens": int(tin),
+            "output_tokens": int(tout),
+            "cache_read_input_tokens": int(cread),
+            "cache_creation_input_tokens": int(ccreate),
+            "cost_usd": float(cost),
+            "unpriced_calls": int(unpriced_calls),
+        }
     return out
 
 

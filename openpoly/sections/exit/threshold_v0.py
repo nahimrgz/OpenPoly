@@ -186,7 +186,13 @@ class ThresholdExitV0:
         tick = pos.tick_size if pos.tick_size and pos.tick_size > 0 else self.config.tick_size
         spread = pos.spread if pos.spread is not None and pos.spread > 0 else 0.0
         pct_trail = self.config.peak_drawdown_pct * (pos.peak_price - pos.avg_entry_price)
-        return max(self.config.min_trail_ticks * tick, spread, pct_trail)
+        spread_floor = self._spread_floor(spread, pct_trail, tick)
+        return max(self.config.min_trail_ticks * tick, spread_floor, pct_trail)
+
+    def _spread_floor(self, spread: float, pct_trail: float, tick: float) -> float:
+        """The spread's contribution to the trailing distance. v0 uses the
+        live spread as is; subclasses may bound it."""
+        return spread
 
     def _stop_triggered(self, pos: MarkedPosition, return_pct: float) -> bool:
         """Whether the stop-loss fires. v0 compares the mark (bid) return with

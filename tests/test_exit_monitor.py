@@ -22,13 +22,18 @@ from openpoly.markets.store import MarketStore
 from openpoly.portfolio import HeldPosition, PortfolioStore
 from openpoly.portfolio.models import PositionRecord
 from openpoly.runtime.closing_registry import is_closing, mark_closing
-from openpoly.runtime.exit_monitor import ExitMonitor
+from openpoly.runtime.exit_monitor import ExitMonitor, _PositionState
 from openpoly.runtime.reconciliation_monitor import ReconciliationMonitor
 from openpoly.runtime.section_log import exit_log
 from openpoly.sections.exit.threshold_v0 import (
     ThresholdExitConfig,
     ThresholdExitV0,
 )
+
+
+def _peaks(m: ExitMonitor) -> dict[int, float]:
+    """The per-position peaks the monitor currently holds."""
+    return {pid: st.peak for pid, st in m._states.items() if st.peak is not None}
 
 
 @pytest.fixture(autouse=True)
@@ -326,14 +331,14 @@ async def test_peak_persists_across_ticks_and_triggers_drawdown() -> None:
     # v18: a hold writes no log entry — assert via the peak instead.
     store.set_order_books([_book("t1", bid=0.46)])
     await monitor._tick_once()
-    assert monitor._peak[1] == pytest.approx(0.46)
+    assert _peaks(monitor)[1] == pytest.approx(0.46)
     assert exit_log.entries() == []
 
     # Tick 2: bid climbs to 0.56; peak follows and the lock arms
     # (peak gain 0.16 × 20 = $3.20 ≥ the $2.40 floor).
     store.set_order_books([_book("t1", bid=0.56)])
     await monitor._tick_once()
-    assert monitor._peak[1] == pytest.approx(0.56)
+    assert _peaks(monitor)[1] == pytest.approx(0.56)
     assert exit_log.entries() == []
 
     # Tick 3: bid retreats to 0.50; peak stays at 0.56. Retrace 0.06 clears the
@@ -345,7 +350,7 @@ async def test_peak_persists_across_ticks_and_triggers_drawdown() -> None:
     assert last.trigger == "peak_drawdown"
     assert last.peak_price == pytest.approx(0.56)
     # On a successful close the peak entry is dropped.
-    assert 1 not in monitor._peak
+    assert 1 not in _peaks(monitor)
 
 
 async def test_peak_tracked_on_hold() -> None:
@@ -356,7 +361,7 @@ async def test_peak_tracked_on_hold() -> None:
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), ex)
     await m._tick_once()
     assert exit_log.entries() == []
-    assert m._peak[1] == pytest.approx(0.41)
+    assert _peaks(m)[1] == pytest.approx(0.41)
 
 
 async def test_bootstrap_peaks_rebuilds_from_snapshots(tmp_path) -> None:
@@ -417,7 +422,7 @@ async def test_bootstrap_peaks_rebuilds_from_snapshots(tmp_path) -> None:
     )
     monitor.configure(pf)
     monitor.bootstrap_peaks(sf)
-    assert monitor._peak[held.position_id] == pytest.approx(0.55)
+    assert _peaks(monitor)[held.position_id] == pytest.approx(0.55)
 
 
 async def test_bootstrap_peaks_no_snapshot_falls_back_to_entry(tmp_path) -> None:
@@ -446,7 +451,7 @@ async def test_bootstrap_peaks_no_snapshot_falls_back_to_entry(tmp_path) -> None
     monitor.configure(pf)
     monitor.bootstrap_peaks(sf)
     # No snapshots after opened_at → peak defaults to avg_entry_price (0.40).
-    assert monitor._peak[held.position_id] == pytest.approx(0.40)
+    assert _peaks(monitor)[held.position_id] == pytest.approx(0.40)
 
 
 # ---------- mark sanity (depth-guarded bid) ----------
@@ -466,7 +471,7 @@ async def test_thin_l1_bid_blocks_the_position_and_never_marks_at_the_mid() -> N
     await m._tick_once()
     assert ex.calls == []
     assert m.blocked == 1
-    assert 1 not in m._peak
+    assert 1 not in _peaks(m)
 
 
 async def test_unmarkable_position_is_logged_once_until_the_state_changes() -> None:
@@ -517,7 +522,7 @@ async def test_mark_walks_to_first_bid_level_meeting_min_size() -> None:
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.50)]), ex)
     await m._tick_once()
     assert ex.calls == []  # +8% on a 0.50 entry — held
-    assert m._peak[1] == pytest.approx(0.54)
+    assert _peaks(m)[1] == pytest.approx(0.54)
 
 
 async def test_deep_l1_bid_is_used_as_is() -> None:
@@ -525,7 +530,7 @@ async def test_deep_l1_bid_is_used_as_is() -> None:
     ex = _FakeExecutor()
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), ex)
     await m._tick_once()
-    assert m._peak[1] == pytest.approx(0.41)
+    assert _peaks(m)[1] == pytest.approx(0.41)
 
 
 async def test_thin_bid_with_no_ask_counts_as_blocked() -> None:
@@ -653,7 +658,7 @@ async def test_bootstrap_peaks_ignores_thin_snapshot_bids(tmp_path) -> None:
     monitor.bootstrap_peaks(sf)
     # The 0.90 dust bid is rejected and the walk lands on the 0.60 level that
     # actually had depth, so that — not 0.90 — becomes the peak.
-    assert monitor._peak[held.position_id] == pytest.approx(0.60)
+    assert _peaks(monitor)[held.position_id] == pytest.approx(0.60)
 
 
 # ---------- observe_price push hook ----------
@@ -671,14 +676,14 @@ async def test_observe_price_lifts_peak_between_ticks() -> None:
     )
     monitor.configure(_FakePortfolio([_held(1, "t1", avg=0.40)]))  # type: ignore[arg-type]
     await monitor._tick_once()
-    assert monitor._peak[1] == pytest.approx(0.46)
+    assert _peaks(monitor)[1] == pytest.approx(0.46)
 
     # Between ticks the book sampler observes a spike the 120s tick would miss.
     monitor.observe_price("t1", 0.56)
-    assert monitor._peak[1] == pytest.approx(0.56)
+    assert _peaks(monitor)[1] == pytest.approx(0.56)
     # A lower observation never lowers the peak.
     monitor.observe_price("t1", 0.52)
-    assert monitor._peak[1] == pytest.approx(0.56)
+    assert _peaks(monitor)[1] == pytest.approx(0.56)
 
     # Next tick sees 0.50 and closes against the observed peak, not 0.46.
     market_source_manager.store.set_order_books([_book("t1", bid=0.50)])
@@ -691,7 +696,7 @@ async def test_observe_price_ignores_unwatched_tokens() -> None:
     ex = _FakeExecutor()
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), ex)
     m.observe_price("t-unknown", 0.99)
-    assert m._peak == {}
+    assert _peaks(m) == {}
 
 
 async def test_observe_book_applies_the_depth_guard() -> None:
@@ -709,9 +714,9 @@ async def test_observe_book_applies_the_depth_guard() -> None:
             asks=[(0.91, 100.0)],
         )
     )
-    assert m._peak[1] == pytest.approx(0.60)
+    assert _peaks(m)[1] == pytest.approx(0.60)
     m.observe_book(OrderBook(token_id="t1", ts=3.0, bids=[(0.95, 50.0)], asks=[(0.96, 100.0)]))
-    assert m._peak[1] == pytest.approx(0.95)
+    assert _peaks(m)[1] == pytest.approx(0.95)
 
 
 async def test_observe_book_thin_ladder_with_wide_ask_does_not_raise_the_peak() -> None:
@@ -730,7 +735,7 @@ async def test_observe_book_thin_ladder_with_wide_ask_does_not_raise_the_peak() 
             asks=[(0.88, 100.0)],
         )
     )
-    assert m._peak[1] == pytest.approx(0.46)
+    assert _peaks(m)[1] == pytest.approx(0.46)
 
 
 async def test_observe_book_with_no_bids_is_a_noop() -> None:
@@ -738,7 +743,7 @@ async def test_observe_book_with_no_bids_is_a_noop() -> None:
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), _FakeExecutor())
     await m._tick_once()
     m.observe_book(OrderBook(token_id="t1", ts=2.0, bids=[], asks=[]))
-    assert m._peak[1] == pytest.approx(0.46)
+    assert _peaks(m)[1] == pytest.approx(0.46)
 
 
 # ---------- blocking I/O must not stall the event loop ----------
@@ -802,10 +807,10 @@ async def test_closed_position_stops_being_observed() -> None:
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), ex)
     await m._tick_once()  # +37.5% → take_profit → closed
     assert ex.calls
-    assert m._peak == {}
+    assert _peaks(m) == {}
     # A book delivered before the next sweep must not resurrect the peak.
     m.observe_book(_book("t1", bid=0.60))
-    assert m._peak == {}
+    assert _peaks(m) == {}
 
 
 # ---------- in-flight sell guard ----------
@@ -927,7 +932,7 @@ async def test_stop_waits_for_an_in_flight_sell_to_record_its_close() -> None:
     assert [e.verdict for e in entries] == ["ok"]
     assert entries[0].trigger == "take_profit"
     assert entries[0].fill_price == 0.55
-    assert m._peak == {}  # peak cleanup ran
+    assert _peaks(m) == {}  # peak cleanup ran
     assert not is_closing(1)
 
 
@@ -1072,11 +1077,11 @@ async def test_dust_marker_is_pruned_when_the_position_stops_being_open() -> Non
     m = _monitor(pf, ex)
 
     await m._tick_once()
-    assert m._dust == {1}
+    assert {pid for pid, st in m._states.items() if st.dust} == {1}
 
     pf._positions = []
     await m._tick_once()
-    assert m._dust == set()
+    assert not any(st.dust for st in m._states.values())
 
 
 # ---------- partial fills (a sell that did not clear the position) ----------
@@ -1154,7 +1159,7 @@ async def test_partial_fill_keeps_tracking_the_remainder() -> None:
 
     await m._tick_once()
 
-    assert m._peak[1] == pytest.approx(0.55)
+    assert _peaks(m)[1] == pytest.approx(0.55)
     assert m._watch["t1"] == [1]
 
 
@@ -1165,7 +1170,7 @@ async def test_full_fill_still_drops_the_peak_and_unwatches() -> None:
 
     await m._tick_once()
 
-    assert 1 not in m._peak
+    assert 1 not in _peaks(m)
     assert "t1" not in m._watch
     assert exit_log.entries()[-1].realized_pnl == pytest.approx((0.55 - 0.40) * 20.0)
 
@@ -1180,7 +1185,7 @@ async def test_dust_residual_close_is_not_treated_as_partial() -> None:
 
     await m._tick_once()
 
-    assert 1 not in m._peak
+    assert 1 not in _peaks(m)
     assert "t1" not in m._watch
 
 
@@ -1197,12 +1202,12 @@ async def test_peak_entries_for_closed_positions_are_pruned_each_tick() -> None:
     m = _monitor(pf, _FakeExecutor())
 
     await m._tick_once()
-    m._peak[99] = 0.9  # closed elsewhere; never seen by _close
-    assert m._peak[1] == pytest.approx(0.41)
+    m._states[99] = _PositionState(peak=0.9)  # closed elsewhere; never seen by _close
+    assert _peaks(m)[1] == pytest.approx(0.41)
 
     await m._tick_once()
-    assert 99 not in m._peak
-    assert m._peak[1] == pytest.approx(0.41)
+    assert 99 not in _peaks(m)
+    assert _peaks(m)[1] == pytest.approx(0.41)
 
 
 async def test_peak_is_dropped_when_the_position_stops_being_open() -> None:
@@ -1211,11 +1216,11 @@ async def test_peak_is_dropped_when_the_position_stops_being_open() -> None:
     m = _monitor(pf, _FakeExecutor())
 
     await m._tick_once()
-    assert 1 in m._peak
+    assert 1 in _peaks(m)
 
     pf._positions = []
     await m._tick_once()
-    assert m._peak == {}
+    assert _peaks(m) == {}
 
 
 # ---------- the lifespan must rebuild peaks before the first tick ----------
@@ -1280,15 +1285,15 @@ async def test_lifespan_bootstraps_peaks_before_the_first_tick(tmp_path, monkeyp
 
     from openpoly.runtime.exit_monitor import exit_monitor as singleton
 
-    saved_peak, saved_watch = singleton._peak, singleton._watch
+    saved_states, saved_watch = singleton._states, singleton._watch
     saved_portfolio = singleton._portfolio
-    singleton._peak = {}
+    singleton._states = {}
     try:
         async with main_mod.lifespan(main_mod.app):
             pass
-        peak = singleton._peak
+        peak = _peaks(singleton)
     finally:
-        singleton._peak, singleton._watch = saved_peak, saved_watch
+        singleton._states, singleton._watch = saved_states, saved_watch
         singleton._portfolio = saved_portfolio
         engine.dispose()
 

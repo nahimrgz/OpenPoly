@@ -159,11 +159,11 @@ def _m005_llm_usage_table(conn: Connection) -> None:
 
     ``create_all`` already adds a missing table to an existing database; this
     makes the change explicit and versioned, and is a no-op when the table is
-    there (``checkfirst``)."""
+    there (``checkfirst``). The table's ``ts`` index (``ix_llm_usage_ts``) is
+    part of the table definition, so creating the table creates it too."""
     from openpoly.db.tables import LLMUsageRow
 
     LLMUsageRow.__table__.create(conn, checkfirst=True)  # type: ignore[attr-defined]
-    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_llm_usage_ts ON llm_usage (ts)"))
 
 
 # Ordered, append-only. Never renumber or reuse a version: the number recorded

@@ -234,7 +234,9 @@ class MarketStore:
         seconds. A held token's book is refreshed every ~10s, so one older
         than the default has stopped updating."""
         age = self.order_book_age(token_id, now)
-        return age is not None and age <= max_age and token_id not in self._gone
+        # A gone token has no cached book (``mark_book_gone`` evicts it and
+        # every store clears the mark), so ``age is not None`` excludes it.
+        return age is not None and age <= max_age
 
     def get_order_book(self, token_id: str) -> OrderBook | None:
         cached = self._order_books.get(token_id)
@@ -247,12 +249,6 @@ class MarketStore:
         if cached is None:
             return None
         return (now if now is not None else book_clock()) - cached.fetched_at
-
-    def order_book_fetched_at(self, token_id: str) -> float | None:
-        """The ``book_clock()`` reading at which ``token_id``'s cached book
-        was fetched, or None when there is no cached book."""
-        cached = self._order_books.get(token_id)
-        return cached.fetched_at if cached is not None else None
 
     @property
     def order_book_count(self) -> int:

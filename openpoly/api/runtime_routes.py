@@ -22,6 +22,7 @@ can verify the key / base URL / model before running the pipeline.
 from __future__ import annotations
 
 import time
+from dataclasses import fields
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -84,8 +85,10 @@ def _analyzer_list_entry(entry: AnalyzerCall) -> dict[str, Any]:
     ``reasoning`` is replaced by a ``has_reasoning`` flag — the Calls tab polls
     the whole ring every 3s and fetches one entry's reasoning on demand
     (``GET /api/analyzer/log/{news_id}/reasoning?ts=<ts>``)."""
-    d = entry.to_dict()
-    d["has_reasoning"] = bool(d.pop("reasoning", None))
+    # Every field is a scalar, so a shallow read equals ``asdict`` without
+    # deep-copying the reasoning only to drop it.
+    d = {f.name: getattr(entry, f.name) for f in fields(entry) if f.name != "reasoning"}
+    d["has_reasoning"] = bool(entry.reasoning)
     return d
 
 

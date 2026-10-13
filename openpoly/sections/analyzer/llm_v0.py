@@ -196,13 +196,18 @@ class LLMAnalyzerV0:
 
     def _client(self) -> LLMClient:
         if self._llm is None:
-            self._llm = LLMClient(
-                api_key_ref=self.config.api_key_ref,
-                model=self.config.llm_model,
-                temperature=self.config.temperature,
-                base_url=self.config.base_url,
-            )
+            self._llm = LLMClient(**self._client_kwargs())
         return self._llm
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        """Keyword arguments of the lazily built ``LLMClient``; subclasses
+        extend them."""
+        return {
+            "api_key_ref": self.config.api_key_ref,
+            "model": self.config.llm_model,
+            "temperature": self.config.temperature,
+            "base_url": self.config.base_url,
+        }
 
     def run(self, input: SectionInput) -> SectionOutput:
         candidates = input.payload

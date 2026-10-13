@@ -134,14 +134,10 @@ class ThresholdExitV1(ThresholdExitV0):
 
     config: ThresholdExitConfigV1
 
-    def _trail_distance(self, pos: MarkedPosition) -> float:
-        """v0's trailing distance with the spread floor capped at
-        ``pct_trail + 2 ticks`` (still never below ``min_trail_ticks``)."""
-        tick = pos.tick_size if pos.tick_size and pos.tick_size > 0 else self.config.tick_size
-        spread = pos.spread if pos.spread is not None and pos.spread > 0 else 0.0
-        pct_trail = self.config.peak_drawdown_pct * (pos.peak_price - pos.avg_entry_price)
-        capped_spread = min(spread, max(pct_trail, 0.0) + _SPREAD_CAP_TICKS * tick)
-        return max(self.config.min_trail_ticks * tick, capped_spread, pct_trail)
+    def _spread_floor(self, spread: float, pct_trail: float, tick: float) -> float:
+        """v0's spread floor capped at ``pct_trail + 2 ticks`` (the trailing
+        distance is still never below ``min_trail_ticks``)."""
+        return min(spread, max(pct_trail, 0.0) + _SPREAD_CAP_TICKS * tick)
 
     def _thin_mark_decision(self, pos: MarkedPosition) -> SectionOutput:
         """No executable bid level: only the hard stop, on the raw best bid,

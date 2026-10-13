@@ -35,6 +35,7 @@ from openpoly.execution.sizing import (
 )
 from openpoly.execution.types import ExecResult
 from openpoly.markets.manager import manager as market_source_manager
+from openpoly.markets.pricing import sweep
 from openpoly.portfolio import CloseReason, HeldPosition, PortfolioStore
 from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
 
@@ -188,7 +189,9 @@ class PaperExecutor:
             if quantize_size(position.qty, best_bid) <= 0:
                 return dust_remainder_skip(position)
             return ExecResult.skip("bid_depth_below_min_size")
-        price = _sweep_vwap(levels, qty)
+        # VWAP of taking ``qty`` best-first (``qty`` never exceeds ``depth``).
+        notional, _ = sweep(levels, qty)
+        price = notional / qty
 
         self._store.record_sell(
             position.position_id,
@@ -213,17 +216,3 @@ class PaperExecutor:
             qty=qty,
             position_id=position.position_id,
         )
-
-
-def _sweep_vwap(levels: list[tuple[float, float]], qty: float) -> float:
-    """Volume-weighted price of taking ``qty`` from ``levels`` best-first
-    (``qty`` must not exceed their total size)."""
-    remaining = qty
-    notional = 0.0
-    for price, size in levels:
-        take = min(remaining, size)
-        notional += take * price
-        remaining -= take
-        if remaining <= 0:
-            break
-    return notional / qty

@@ -48,8 +48,6 @@ a drop-in swap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from pydantic import Field
 
 from openpoly.execution.sizing import is_dust_qty
@@ -58,6 +56,7 @@ from openpoly.markets.models import OrderBook
 from openpoly.markets.pricing import first_level_with_size
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.analyzer.llm_v0 import AnalysisResult
+from openpoly.sections.entry._types import FreshBooks, candidate_sides, held_side_probability
 from openpoly.sections.entry.edge_threshold_v0 import (
     EdgeThresholdConfig,
     EdgeThresholdEntryV0,
@@ -70,16 +69,6 @@ from openpoly.sections.entry.edge_threshold_v0 import (
 )
 
 __all__ = ["EdgeThresholdConfigV1", "EdgeThresholdEntryV1", "FreshBooks", "OrderIntent"]
-
-
-@dataclass(frozen=True)
-class FreshBooks:
-    """Entry payload for sections declaring ``ACCEPTS_FRESH_BOOKS``: the
-    analysis plus the tokens whose books the orchestrator found within the
-    freshness budget for this decision."""
-
-    analysis: AnalysisResult
-    fresh_tokens: frozenset[str]
 
 
 class EdgeThresholdConfigV1(EdgeThresholdConfig):
@@ -155,7 +144,7 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
         market = market_source_manager.store.get(res.market_id)
         if market is None:
             return SectionOutput(payload=None, verdict="skip", reason="market not found")
-        sides: tuple[Side, ...] = ("yes",) if self.config.side_lock else ("yes", "no")
+        sides = candidate_sides(self.config.side_lock)
         quotes: dict[Side, Quote] = {}
         edges: dict[Side, float] = {}
         skipped: dict[Side, str] = {}
@@ -172,9 +161,8 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
             if isinstance(quote, SectionOutput):
                 skipped[side] = quote.reason or "unpriceable"
                 continue
-            fair = res.p_model if side == "yes" else 1.0 - res.p_model
             quotes[side] = quote
-            edges[side] = fair - quote[1]
+            edges[side] = held_side_probability(res.p_model, side) - quote[1]
         if not edges:
             return SectionOutput(
                 payload=None,
@@ -246,16 +234,15 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
     @staticmethod
     def CONTRACT_TEST() -> None:
         inst = EdgeThresholdEntryV1(EdgeThresholdConfigV1())
-        res0 = AnalysisResult(market_id="__contract_test__", p_model=0.6, confidence="medium")
-        wrapped = inst.run(SectionInput(tick_type="event", payload=FreshBooks(res0, frozenset())))
+        # A synthetic market_id is never in the live catalog, so these skip at
+        # the market lookup — registry scan stays light, touches no DB.
+        res = AnalysisResult(market_id="__contract_test__", p_model=0.6, confidence="medium")
+        wrapped = inst.run(SectionInput(tick_type="event", payload=FreshBooks(res, frozenset())))
         assert wrapped.verdict == "skip"
 
         out_none = inst.run(SectionInput(tick_type="event", payload=None))
         assert out_none.verdict == "skip"
 
-        # A synthetic market_id is never in the live catalog, so this skips at
-        # the market lookup — registry scan stays light, touches no DB.
-        res = AnalysisResult(market_id="__contract_test__", p_model=0.6, confidence="medium")
         out_no_market = inst.run(SectionInput(tick_type="event", payload=res))
         assert out_no_market.verdict == "skip"
 

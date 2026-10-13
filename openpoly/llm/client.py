@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import anthropic
 from anthropic.types import ToolParam
@@ -178,6 +178,21 @@ def model_price(model: str) -> ModelPrice | None:
     """The price of ``model`` per ``MODEL_PRICING``, None when unknown."""
     parsed = _parse_model(model)
     return MODEL_PRICING.get(parsed) if parsed is not None else None
+
+
+_T = TypeVar("_T")
+
+
+def int_or(value: object, default: _T) -> int | _T:
+    """``value`` when it is an int (a bool is not), else ``default`` — the
+    coercion for one field of an ``llm_usage`` signal dict."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def cost_or_none(value: object) -> float | None:
+    """The ``cost_usd`` of an ``llm_usage`` signal dict as a float, None when
+    it is not a number (an unpriced model)."""
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 @dataclass(frozen=True)
