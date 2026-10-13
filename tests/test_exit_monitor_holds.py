@@ -24,7 +24,6 @@ from openpoly.markets.manager import MarketSourceManager
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook
 from openpoly.markets.store import KEPT_BOOK_MAX_AGE_SECONDS, book_clock
-from openpoly.runtime import exit_monitor as em
 from openpoly.runtime.exit_monitor import CLOSE_BACKOFF_MAX_SECONDS, ExitMonitor
 from openpoly.runtime.section_log import exit_log
 from openpoly.sections.exit.threshold_v1 import (
@@ -40,12 +39,28 @@ from tests.test_exit_monitor import (  # noqa: F401 — autouse fixture
 )
 
 
-def _v1_monitor(ex: _FakeExecutor, *, source: MarketSourceManager | None = None) -> ExitMonitor:
+class _Clock:
+    """Injected monitor clock — tests never patch the process-wide ``time``."""
+
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _v1_monitor(
+    ex: _FakeExecutor,
+    *,
+    source: MarketSourceManager | None = None,
+    clock: _Clock | None = None,
+) -> ExitMonitor:
     m = ExitMonitor(
         exit_section=ThresholdExitV1(ThresholdExitConfigV1()),
         executor=ex,
         tick_interval_seconds=10,
         book_source=source,
+        clock=clock if clock is not None else _Clock(),
     )
     m.configure(_FakePortfolio([_held(1, "t1", avg=0.50)]))  # type: ignore[arg-type]
     return m
@@ -220,14 +235,18 @@ async def test_dust_bid_with_healthy_asks_does_not_fire_the_thin_hard_stop() -> 
 
 
 async def test_thin_collapse_with_no_ask_fires_only_after_it_persists() -> None:
-    market_source_manager.store.set_order_books(
-        [OrderBook(token_id="t1", ts=1.0, bids=[(0.20, 2.0)], asks=[])]
-    )
+    def fetch() -> None:  # a new fetch of the same collapsed book
+        market_source_manager.store.set_order_books(
+            [OrderBook(token_id="t1", ts=1.0, bids=[(0.20, 2.0)], asks=[])]
+        )
+
     ex = _FakeExecutor()
     m = _v1_monitor(ex)
     for _ in range(THIN_NO_ASK_CONFIRM_TICKS - 1):
+        fetch()
         await m._tick_once()
         assert ex.calls == []
+    fetch()
     await m._tick_once()
     assert [c["trigger"] for c in ex.calls] == ["stop_loss"]
 
@@ -235,10 +254,10 @@ async def test_thin_collapse_with_no_ask_fires_only_after_it_persists() -> None:
 async def test_thin_no_ask_streak_resets_when_the_book_recovers() -> None:
     store = market_source_manager.store
     thin = OrderBook(token_id="t1", ts=1.0, bids=[(0.20, 2.0)], asks=[])
-    store.set_order_books([thin])
     ex = _FakeExecutor()
     m = _v1_monitor(ex)
     for _ in range(THIN_NO_ASK_CONFIRM_TICKS - 1):
+        store.set_order_books([thin])
         await m._tick_once()
     store.set_order_books([OrderBook(token_id="t1", ts=1.0, bids=[(0.48, 50.0)], asks=[])])
     await m._tick_once()
@@ -272,8 +291,8 @@ async def test_confirmed_thin_stop_sweeps_past_a_sub_share_level_one(tmp_path) -
             OrderBook(
                 token_id="t1",
                 ts=1.0,
-                bids=[(0.30, 0.5), (0.28, 3.0), (0.26, 4.0), (0.20, 4.0)],
-                asks=[(0.33, 2.0)],  # the ask confirms the collapse (-34%)
+                bids=[(0.34, 0.5), (0.32, 3.0), (0.31, 4.0), (0.29, 4.0)],
+                asks=[(0.33, 50.0)],  # a real ask confirms the collapse (-34%)
             )
         ]
     )
@@ -286,9 +305,9 @@ async def test_confirmed_thin_stop_sweeps_past_a_sub_share_level_one(tmp_path) -
     await m._tick_once()
     entries = exit_log.entries()
     assert [e.verdict for e in entries] == ["ok"], entries
-    # Floor 0.30 - 0.10 * 0.50 = 0.25: 0.5 @ .30 + 3 @ .28 + 4 @ .26 swept,
-    # the 0.20 level below the floor is not.
-    assert entries[0].fill_price == pytest.approx((0.5 * 0.30 + 3 * 0.28 + 4 * 0.26) / 7.5)
+    # Floor 0.50 × (1 - 0.30 - 0.10) = 0.30: 0.5 @ .34 + 3 @ .32 + 4 @ .31
+    # swept, the 0.29 level below the floor is not.
+    assert entries[0].fill_price == pytest.approx((0.5 * 0.34 + 3 * 0.32 + 4 * 0.31) / 7.5)
     rec = store.get_position(held.position_id)
     assert rec is not None and rec.qty == pytest.approx(2.5)
     engine.dispose()
@@ -297,31 +316,30 @@ async def test_confirmed_thin_stop_sweeps_past_a_sub_share_level_one(tmp_path) -
 # ---------- failing close: backoff, blocked, log once ----------
 
 
-async def test_failing_close_backs_off_counts_blocked_and_logs_once(monkeypatch) -> None:
-    clock = [1_000.0]
-    monkeypatch.setattr(em.time, "monotonic", lambda: clock[0])
+async def test_failing_close_backs_off_counts_blocked_and_logs_once() -> None:
+    clock = _Clock()
     market_source_manager.store.set_order_books(
         [OrderBook(token_id="t1", ts=1.0, bids=[(0.30, 100.0)], asks=[(0.31, 100.0)])]
     )
     ex = _FakeExecutor(result=ExecResult.skip("ctf_cache_not_synced"))
-    m = _v1_monitor(ex)
+    m = _v1_monitor(ex, clock=clock)
 
     await m._tick_once()
     assert len(ex.calls) == 1
     assert m.blocked == 1
     # Within the first backoff step (one 10s tick): no retry.
-    clock[0] += 5.0
+    clock.now += 5.0
     await m._tick_once()
     assert len(ex.calls) == 1
     assert m.blocked == 1
     # Delays double: 10, 20, 40, 80, 120, 120 ...
     attempts_at = []
     for _ in range(60):
-        clock[0] += 10.0
+        clock.now += 10.0
         before = len(ex.calls)
         await m._tick_once()
         if len(ex.calls) > before:
-            attempts_at.append(clock[0])
+            attempts_at.append(clock.now)
     gaps = [b - a for a, b in zip(attempts_at, attempts_at[1:])]
     assert gaps[:3] == [20.0, 40.0, 80.0]
     assert max(gaps) <= CLOSE_BACKOFF_MAX_SECONDS + 10.0
@@ -330,26 +348,23 @@ async def test_failing_close_backs_off_counts_blocked_and_logs_once(monkeypatch)
     assert errors[0].error == "sell not filled: ctf_cache_not_synced"
 
 
-async def test_backoff_resets_when_the_close_succeeds(monkeypatch) -> None:
-    clock = [1_000.0]
-    monkeypatch.setattr(em.time, "monotonic", lambda: clock[0])
+async def test_backoff_resets_when_the_close_succeeds() -> None:
+    clock = _Clock()
     market_source_manager.store.set_order_books(
         [OrderBook(token_id="t1", ts=1.0, bids=[(0.30, 100.0)], asks=[(0.31, 100.0)])]
     )
     ex = _FakeExecutor(result=ExecResult.skip("ctf_cache_not_synced"))
-    m = _v1_monitor(ex)
+    m = _v1_monitor(ex, clock=clock)
     await m._tick_once()
     ex._result = ExecResult.ok(price=0.30, qty=20.0, position_id=1)
-    clock[0] += 11.0
+    clock.now += 11.0
     await m._tick_once()
     assert len(ex.calls) == 2
     assert all(st.backoff is None for st in m._states.values())
     assert [e.verdict for e in exit_log.entries()] == ["error", "ok"]
 
 
-async def test_backoff_drops_when_the_decision_changes(monkeypatch) -> None:
-    clock = [1_000.0]
-    monkeypatch.setattr(em.time, "monotonic", lambda: clock[0])
+async def test_backoff_drops_when_the_decision_changes() -> None:
     store = market_source_manager.store
     store.set_order_books(
         [OrderBook(token_id="t1", ts=1.0, bids=[(0.30, 100.0)], asks=[(0.31, 100.0)])]

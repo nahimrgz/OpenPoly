@@ -81,8 +81,9 @@ class MarketStore:
         self._last_poll: PollSummary | None = None
         self._order_books: dict[str, _CachedBook] = {}
         # Tokens whose CLOB /book answered 404 (the market is gone, normally
-        # resolved) since their last successful fetch — see ``mark_book_gone``.
-        self._gone: set[str] = set()
+        # resolved) since their last successful fetch, mapped to the
+        # ``book_clock()`` reading of the latest 404 — see ``mark_book_gone``.
+        self._gone: dict[str, float] = {}
 
     def __len__(self) -> int:
         return len(self._catalog)
@@ -187,12 +188,17 @@ class MarketStore:
         for b in books:
             at = stamps.get(b.token_id, batch_at)
             prev = self._order_books.get(b.token_id)
+            if self._predates_gone_mark(b.token_id, at):
+                # Received before the venue said the book is gone: a quote of
+                # a market that no longer exists. Neither stored nor allowed
+                # to clear the mark.
+                continue
             if prev is not None and prev.fetched_at > at:
                 cached[b.token_id] = prev
             else:
                 cached[b.token_id] = _CachedBook(b, at)
                 accepted.append(b)
-                self._gone.discard(b.token_id)
+                self._gone.pop(b.token_id, None)
         self._order_books = cached
         return accepted
 
@@ -206,22 +212,39 @@ class MarketStore:
         prev = self._order_books.get(book.token_id)
         if prev is not None and prev.fetched_at > at:
             return False
+        if self._predates_gone_mark(book.token_id, at):
+            return False
         self._order_books[book.token_id] = _CachedBook(book, at)
-        self._gone.discard(book.token_id)
+        self._gone.pop(book.token_id, None)
         return True
 
-    def mark_book_gone(self, token_id: str) -> None:
+    def mark_book_gone(self, token_id: str, *, at: float | None = None) -> None:
         """Record that ``token_id``'s CLOB /book answered 404 — the market no
         longer has a book (it resolved or was removed) — and evict its cached
-        book, so nothing fills or marks against that market's last quote. A
-        later successful fetch clears the mark."""
+        book, so nothing fills or marks against that market's last quote.
+
+        The mark is stamped (``at``, a ``book_clock()`` reading; default now).
+        Only a book *received after* it clears it: a sample batch whose fetch
+        of this token completed before the 404 carries the dead market's last
+        quote and must not resurrect it."""
         self._order_books.pop(token_id, None)
-        self._gone.add(token_id)
+        self._gone[token_id] = at if at is not None else book_clock()
 
     def is_book_gone(self, token_id: str) -> bool:
         """Whether the venue reported ``token_id``'s book as gone (404) since
         its last successful fetch."""
         return token_id in self._gone
+
+    def gone_since(self, token_id: str) -> float | None:
+        """``book_clock()`` reading of the latest 404 for ``token_id``, or None
+        when it is not marked gone."""
+        return self._gone.get(token_id)
+
+    def _predates_gone_mark(self, token_id: str, received_at: float) -> bool:
+        """Whether a book received at ``received_at`` is older than the gone
+        mark of its token (so it must not be stored nor clear the mark)."""
+        gone_at = self._gone.get(token_id)
+        return gone_at is not None and received_at <= gone_at
 
     def is_order_book_usable(
         self,
@@ -241,6 +264,13 @@ class MarketStore:
     def get_order_book(self, token_id: str) -> OrderBook | None:
         cached = self._order_books.get(token_id)
         return cached.book if cached is not None else None
+
+    def order_book_fetched_at(self, token_id: str) -> float | None:
+        """``book_clock()`` reading at which ``token_id``'s cached book was
+        received, or None when there is none. Two reads returning the same
+        stamp saw the same fetch."""
+        cached = self._order_books.get(token_id)
+        return cached.fetched_at if cached is not None else None
 
     def order_book_age(self, token_id: str, now: float | None = None) -> float | None:
         """Seconds since ``token_id``'s cached book was fetched, or None when

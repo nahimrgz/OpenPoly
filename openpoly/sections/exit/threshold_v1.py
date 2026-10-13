@@ -52,13 +52,21 @@ evaluated — closing into a thin book beats riding a collapse to zero.
 
 A thin bid is not evidence of a collapse on its own: a momentary bid pull
 leaves only dust at level 1 while the asks stay healthy. The thin hard stop
-therefore fires only when the *ask* confirms it — the level-1 ask's return
-vs. entry is also at or below ``-hard_stop_loss_pct`` — or, with no ask at
-all, when the collapse persists for ``THIN_NO_ASK_CONFIRM_TICKS`` consecutive
-ticks (``MarkedPosition.thin_streak``, kept by the exit monitor). Its close
-floor is ``THIN_STOP_SWEEP_MARGIN`` of the entry price below the raw bid (and
-never under the venue's minimum price): pinned to the raw level-1 bid, a sell
-into a sub-share dust level could never fill.
+therefore fires only when the *ask* confirms it — the ask's return vs. entry
+is also at or below ``-hard_stop_loss_pct`` — or, with no ask at all, when
+the collapse persists over ``THIN_NO_ASK_CONFIRM_TICKS`` distinct book
+fetches (``MarkedPosition.thin_streak``, kept by the exit monitor). On a thin
+mark the exit monitor passes the *depth-qualified* ask (the first ask level
+with real size) as ``MarkedPosition.ask``: a dust or probe ask must not
+confirm a collapse. (No mid is computed on a thin mark, so the raw level-1
+ask the normal path uses is not needed there.)
+
+A confirmed thin hard stop is the one close allowed to sweep below level 1.
+Its floor is ``entry × (1 − hard_stop_loss_pct − THIN_STOP_SWEEP_MARGIN)`` —
+at most ``THIN_STOP_SWEEP_MARGIN`` of the entry price past the hard stop —
+and never below one price tick: the venue rejects a sub-tick price, so a
+floor under it could never be signed. Every other close (stop-loss, trailing,
+take-profit) sells against level 1 only; the exit monitor sets that floor.
 
 The trailing distance's spread floor is capped at ``pct_trail + 2 ticks``: an
 uncapped floor let one wide (or dust-inflated) spread push the trailing
@@ -73,7 +81,6 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from openpoly.execution.sizing import MIN_TOKEN_PRICE
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.exit.threshold_v0 import (
     CloseIntent,
@@ -105,13 +112,15 @@ class ThresholdExitConfigV1(ThresholdExitConfig):
 _SPREAD_CAP_TICKS = 2
 
 # A thin-book hard stop with no ask to confirm it fires only after the bid
-# collapse has been seen on this many consecutive ticks (~30s at the 10s tick).
+# collapse has been seen on this many distinct book fetches in a row (~30s at
+# the 10s held-book refresh); re-reading one fetch does not count again.
 THIN_NO_ASK_CONFIRM_TICKS = 3
 
-# How far below the raw best bid a confirmed thin hard stop may sweep, as a
-# fraction of the entry price. The raw bid is a dust level by definition here
-# (no level has real size), so the sell must be allowed to reach the levels
-# under it; this bounds the slippage it accepts to do so.
+# How far past the hard stop a confirmed thin hard stop may sweep, as a
+# fraction of the entry price: floor = entry × (1 − hard_stop_loss_pct − this).
+# The raw bid is a dust level by definition here (no level has real size), so
+# the sell must be allowed to reach the levels under it; this bounds the
+# slippage it accepts to do so.
 THIN_STOP_SWEEP_MARGIN = 0.10
 
 
@@ -173,7 +182,8 @@ class ThresholdExitV1(ThresholdExitV0):
                     signals=signals,
                 )
         signals["trigger"] = "stop_loss"
-        floor = max(MIN_TOKEN_PRICE, pos.current_price - THIN_STOP_SWEEP_MARGIN * entry)
+        tick = pos.tick_size if pos.tick_size and pos.tick_size > 0 else self.config.tick_size
+        floor = max(tick, entry * (1.0 - hard - THIN_STOP_SWEEP_MARGIN))
         signals["floor_price"] = round(floor, 4)
         intent = CloseIntent(
             market_id=pos.market_id,

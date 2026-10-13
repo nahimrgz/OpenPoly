@@ -43,9 +43,10 @@ def _run(inst: EdgeThresholdEntryV1, payload: object):
 # ---------- ensure_fresh ----------
 
 
-async def test_a_slow_sibling_does_not_age_a_freshly_refreshed_side() -> None:
-    """Regression: ages were measured once, after the slowest refresh ended,
-    so a side refreshed at t=0 read as 0.3s old against a 0.2s budget."""
+async def test_ages_are_honest_after_a_slow_sibling() -> None:
+    """Ages are measured when ensure_fresh returns: a side refreshed at t=0
+    really is ~0.3s old once the slow sibling finishes, so it is reported as
+    such (the caller excludes it as stale instead of trading an old book)."""
 
     async def fetch(token_id: str) -> OrderBook:
         if token_id == "slow":
@@ -54,7 +55,7 @@ async def test_a_slow_sibling_does_not_age_a_freshly_refreshed_side() -> None:
 
     mgr = MarketSourceManager(book_fetcher=fetch)
     ages = await mgr.ensure_fresh(["fast", "slow"], 0.2)
-    assert ages["fast"] is not None and ages["fast"] <= 0.2
+    assert ages["fast"] is not None and ages["fast"] >= 0.25
     assert ages["slow"] is not None and ages["slow"] <= 0.2
 
 

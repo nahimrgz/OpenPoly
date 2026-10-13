@@ -79,6 +79,9 @@ from openpoly.execution.clob_patch import (
     PolyApiException,
     Side,
 )
+
+# After the patch above (it must precede every SDK import).
+from py_clob_client_v2.exceptions import PolyException
 from openpoly.execution.sizing import (
     MAX_TOKEN_PRICE,
     MIN_NOTIONAL_USD,
@@ -226,6 +229,41 @@ _PERSIST_SLEEP = 0.5
 # client timeout is the gap.
 
 _T = TypeVar("_T")
+
+# Polymarket's CLOB tick when the market does not state its own: a price below
+# one tick (or off the tick grid) is rejected by the SDK before it is posted.
+DEFAULT_TICK_SIZE = 0.01
+
+
+def _market_tick(market: Any) -> float:
+    """The market's price tick (``order_price_min_tick_size`` when the market
+    carries a usable one), else ``DEFAULT_TICK_SIZE``."""
+    tick = getattr(market, "order_price_min_tick_size", None)
+    if isinstance(tick, (int, float)) and not isinstance(tick, bool) and 0 < tick < 1:
+        return float(tick)
+    return DEFAULT_TICK_SIZE
+
+
+def _is_price_validation_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the SDK refusing to SIGN the order over its price or
+    tick (``create_order`` validates before anything is posted): a
+    deterministic rejection — the order was never sent, so there is nothing
+    to confirm through the CTF balance and nothing lost."""
+    if not isinstance(exc, PolyException) or isinstance(exc, PolyApiException):
+        return False
+    msg = str(getattr(exc, "msg", "") or exc)
+    return msg.startswith("invalid price") or msg.startswith("invalid tick size")
+
+
+@dataclass(frozen=True)
+class _RestingOrder:
+    """A SELL of ours that may still rest on the book after its settle (no
+    cancel could be confirmed): its id, its full size, and how much of it the
+    ledger already booked."""
+
+    order_id: str
+    size: float
+    booked: float
 
 
 def _bookable_price(
@@ -573,6 +611,10 @@ class LiveExecutor:
     ) -> None:
         self._store = portfolio
         self._clob = clob_client
+        # position_id → a SELL of ours that may still rest on the book. While
+        # one does, no new SELL is posted for that position (see
+        # ``execute_sell``).
+        self._resting: dict[int, _RestingOrder] = {}
 
     def _post_order(self, order_args: OrderArgs, *, neg_risk: bool) -> dict[str, Any]:
         """POST the order (GTC — see the note in ``execute_buy``) and return the
@@ -936,10 +978,28 @@ class LiveExecutor:
                 no_fill_reason,
                 resting_order_id=order_id if resting else None,
             )
+        price: float | None
         if shares > 0 and usdc > 0:
-            # The raced-extra portion (if any) filled at our limit price, so
-            # pricing it at the response average is conservative-enough (≤1 tick).
-            price: float | None = usdc / shares
+            # The cross is booked at the venue's own amounts. A remainder that
+            # filled after the response (raced the cancel) did so as a maker
+            # resting at our limit, so it is priced at the limit — not at the
+            # cross average, which for a SELL limit below level 1 would
+            # overstate its proceeds.
+            raced = max(0.0, qty - shares)
+            price = (usdc * min(qty, shares) / shares + raced * limit_price) / qty
+        elif not bad and shares == 0:
+            # The response is well-formed and says nothing crossed: the order
+            # rested, and whatever filled since did so as a maker at our limit.
+            # Any book-based estimate would credit levels above the limit that
+            # the order never took.
+            logger.info(
+                "%s: %.4f filled after a no-cross response — booking the limit %.4f (order=%s)",
+                side,
+                qty,
+                limit_price,
+                order_id,
+            )
+            price = limit_price
         else:
             # Nothing had crossed at response time, or a field is unusable: the
             # real price is unknown. Our limit is the conservative stand-in —
@@ -1226,6 +1286,14 @@ class LiveExecutor:
                 neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
+            if _is_price_validation_error(exc):
+                logger.warning(
+                    "buy refused before posting for %s %s: %s",
+                    intent.market_id,
+                    intent.side,
+                    exc,
+                )
+                return ExecResult.skip(f"live_rejected:{getattr(exc, 'msg', exc)}")
             if (
                 isinstance(exc, PolyApiException)
                 and exc.status_code is not None
@@ -1293,14 +1361,87 @@ class LiveExecutor:
     ) -> ExecResult:
         """Sell a held position with a crossing GTC limit order.
 
-        The limit is the book's best bid, or ``floor_price`` — the mark the
-        exit decision was made on — when that is lower: a crossing SELL limit
-        at the mark fills against every bid level down to it, the live
-        counterpart of the paper executor's sweep, instead of only the level-1
-        sliver. A mark above the best bid (the book fell since the decision)
-        keeps the best bid, as paper does. Only the limit price changes; the
-        order type, size and the settle / confirm flow are the same either way.
+        The limit is the book's best bid, or ``floor_price`` — the lowest
+        price the exit decision allows — when that is lower: a crossing SELL
+        limit at the floor fills against every bid level down to it, the live
+        counterpart of the paper executor's sweep. A floor above the best bid
+        (the book fell since the decision) keeps the best bid, as paper does.
+        The limit is never below one market tick: the SDK refuses to sign a
+        sub-tick price. Only the
+        limit price changes; the order type, size and the settle / confirm
+        flow are the same either way.
+
+        A SELL of ours that may still rest on the book for this position (an
+        earlier settle could not confirm its cancel) blocks a new one: it is
+        cancelled / re-read first, and while it may still rest the call skips
+        with ``resting_order_pending`` and posts nothing.
         """
+        pending = self._resting.get(position.position_id)
+        if pending is not None:
+            if not self._resting_order_off_book(pending):
+                return ExecResult.skip("resting_order_pending", resting_order_id=pending.order_id)
+            del self._resting[position.position_id]
+        result = self._execute_sell(
+            position,
+            close_reason=close_reason,
+            ts=ts,
+            trigger=trigger,
+            floor_price=floor_price,
+        )
+        if result.resting_order_id is not None:
+            self._resting[position.position_id] = _RestingOrder(
+                order_id=result.resting_order_id,
+                # The size the order was posted for (``quantize_size`` does
+                # not depend on the price).
+                size=quantize_size(position.qty, 1.0),
+                booked=result.qty or 0.0,
+            )
+        return result
+
+    def _resting_order_off_book(self, order: _RestingOrder) -> bool:
+        """One cancel attempt plus one read of a SELL that may still rest:
+        True once the venue says it is off the book (cancel acknowledged, a
+        terminal status, or fully matched). A fill it took since its settle
+        is not in the ledger — that is alerted for reconciliation, not booked
+        here."""
+        try:
+            res = self._clob.cancel_order(OrderPayload(orderID=order.order_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cancel of resting order %s failed: %s", order.order_id, exc)
+            res = None
+        raw_acked = res.get("canceled") if isinstance(res, dict) else None
+        acked = isinstance(raw_acked, list) and order.order_id in {
+            _parse_order_id(e) for e in raw_acked
+        }
+        state = self._read_order(order.order_id)
+        matched = state[0] if state is not None else None
+        terminal = state is not None and (
+            state[1] in _ORDER_DONE_STATUSES
+            or (matched is not None and matched >= order.size - 1e-9)
+        )
+        if not (acked or terminal):
+            logger.info("resting order %s may still rest — no new SELL posted", order.order_id)
+            return False
+        if matched is not None and matched > order.booked + 1e-9:
+            logger.error(
+                "RESTING ORDER ALERT: order %s matched %.4f but %.4f was booked — the "
+                "difference filled untracked; reverse-reconciliation will flag it",
+                order.order_id,
+                matched,
+                order.booked,
+            )
+        return True
+
+    def _execute_sell(
+        self,
+        position: HeldPosition,
+        *,
+        close_reason: CloseReason,
+        ts: float,
+        trigger: str | None,
+        floor_price: float | None,
+    ) -> ExecResult:
+        """``execute_sell`` without the resting-order guard."""
         catalog = market_source_manager.store
         market = catalog.get(position.market_id)
         if market is None:
@@ -1312,6 +1453,9 @@ class LiveExecutor:
         bid_price = book.bids[0][0]
         if floor_price is not None and floor_price < bid_price:
             bid_price = floor_price
+        # Never below one tick: the SDK refuses to sign a sub-tick price (it
+        # rounds anything else to the market's own tick grid itself).
+        bid_price = max(bid_price, _market_tick(market))
         # The order is SIGNED at this price. Refusing afterwards only declines to
         # RECORD a price we already traded at, so a book the venue could not have
         # produced stops the trade here — nothing upstream validates its levels.
@@ -1374,6 +1518,13 @@ class LiveExecutor:
                 neg_risk=market.neg_risk,
             )
         except Exception as exc:  # noqa: BLE001
+            if _is_price_validation_error(exc):
+                logger.warning(
+                    "sell refused before posting for position %d: %s",
+                    position.position_id,
+                    exc,
+                )
+                return ExecResult.skip(f"live_rejected:{getattr(exc, 'msg', exc)}")
             if (
                 isinstance(exc, PolyApiException)
                 and exc.status_code is not None

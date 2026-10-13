@@ -20,20 +20,30 @@ Marking is depth-guarded (v0.3.0). A resting level-1 bid can be a single
 minimum-size probe order sitting far from fair value; marking there produced
 false stop-outs. The mark is the first bid level carrying at least
 ``min_mark_bid_size`` shares (``openpoly.markets.pricing`` — the same rule
-entry v1 gates its spread on); the ask passed along is the raw level-1 ask
-(see ``_decide``). There is deliberately no mid mark: take-profit and peak-drawdown must be
-evaluated against a price the position can realize. The sell sweeps bid
-levels down to the mark the decision used (``floor_price``), so the fill
-matches the decision rather than a level-1 sliver.
+entry v1 gates its spread on), searched only near the top of the book: within
+the first ``MARK_MAX_LEVELS`` levels and no more than ``MARK_MAX_GAP`` below
+the best bid (``_guarded_mark``). A depth-qualified level further down is a
+stink bid resting far from the market, not where the position trades: on a
+bid pull it became the mark, fired a stop and the sell swept every level down
+to it. Such a book is treated as *thin* instead (below), the path that needs
+confirmation. The ask passed along is the raw level-1 ask (see ``_decide``).
+There is deliberately no mid mark: take-profit and peak-drawdown must be
+evaluated against a price the position can realize.
+
+Every normal close (stop-loss, trailing, take-profit) sells against level 1
+only: its floor is the best bid of the book the decision was made on. Only a
+confirmed thin hard stop may sweep deeper, to the floor its section computed
+(``CloseIntent.price`` on a thin decision — see threshold_v1).
 
 When no bid level qualifies, a v0 exit section never sees the position: it is
 reported *blocked*, held, and logged once as ``no_executable_bid`` so the gap
 is visible rather than silent. A section declaring ``EVALUATES_THIN_MARKS``
 (threshold_v1) is still run on the raw best bid, where it evaluates only its
 hard stop — closing into a thin book beats riding a collapse to zero. It fires
-only once the ask confirms the collapse, or — with no ask — once it has
-persisted for several ticks; the monitor keeps that streak per position
-(``MarkedPosition.thin_streak``).
+only once the depth-qualified ask confirms the collapse, or — with no such
+ask — once it has persisted over several distinct book fetches; the monitor
+keeps that streak per position (``MarkedPosition.thin_streak``), counting a
+fetch once however many ticks read it.
 
 Held, not traded: a position whose token's CLOB book is gone (404 — the
 market resolved) or has stopped refreshing is never closed off its last
@@ -43,7 +53,18 @@ monitor closes it at 0/1.
 
 A close that is decided but does not fill backs off per position —
 exponentially from one tick to ``CLOSE_BACKOFF_MAX_SECONDS`` — and counts as
-blocked meanwhile; the backoff resets on a fill or when the decision changes.
+blocked meanwhile. The backoff is checked against the *confirmed* decision; it
+resets on a fill or when the decision stops being a close, a different
+trigger is retried at once, and a lower floor (the market moved on) is retried
+at once with the wait reset to one tick rather than doubled.
+
+A live sell whose remainder may still rest on the book (no cancel could be
+confirmed — ``ExecResult.resting_order_id``) is remembered per position. The
+position is held, logged once as ``resting_order_pending``, and later ticks
+re-check through ``execute_sell``: the live executor, which owns the order,
+cancels / re-reads it first and posts no new SELL while it may still rest.
+A book dropped from the cache (not reported gone) is held and logged once as
+``no_order_book``.
 Every skip / error row is written once per (position, reason) while that
 reason persists, so a failing close cannot flood the exit-log ring.
 
@@ -65,6 +86,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Protocol
 
@@ -113,6 +135,13 @@ CLOSE_BACKOFF_MAX_SECONDS = 120.0
 # already happened on-chain. 30s covers the live executor's own retry budget.
 INFLIGHT_DRAIN_TIMEOUT_SECONDS = 30.0
 
+# How near the top of the book the depth-qualified mark must be (see the
+# module docstring). Beyond either bound the book is treated as thin: a size
+# level three or more levels — or five ticks — under the best bid is a stink
+# bid, not the price the position trades at.
+MARK_MAX_LEVELS = 3
+MARK_MAX_GAP = 0.05
+
 __all__ = ["ExitMonitor", "State", "exit_monitor"]
 
 
@@ -157,8 +186,11 @@ class ExitMonitor(TickLoopMonitor):
         # the mark — the shared rule (see ``openpoly.markets.pricing``).
         min_mark_bid_size: float = MIN_LEVEL_SIZE,
         book_source: FreshBookSource | None = None,
+        # Monotonic clock for the close backoff; injectable for tests.
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(tick_interval_seconds=tick_interval_seconds)
+        self._clock = clock
         self._exit = exit_section
         self._executor = executor
         self._min_mark_bid_size = min_mark_bid_size
@@ -240,7 +272,7 @@ class ExitMonitor(TickLoopMonitor):
                 peak = held.avg_entry_price
                 for (bids_json,) in session.execute(stmt):
                     bids = _parse_levels(bids_json)
-                    mark = first_level_with_size(bids, self._min_mark_bid_size)
+                    mark = _guarded_mark(bids, self._min_mark_bid_size)
                     if mark is not None and mark > peak:
                         peak = mark
                 self._position_state(held.position_id).peak = peak
@@ -276,11 +308,9 @@ class ExitMonitor(TickLoopMonitor):
     # ---------- price observation ----------
 
     def _mark(self, book: OrderBook) -> float | None:
-        """Depth-guarded mark for ``book`` — an *executable* price or None
-        (``first_level_with_size``). The first bid level carrying
-        ``min_mark_bid_size`` or more is where the position could actually be
-        sold."""
-        return first_level_with_size(book.bids, self._min_mark_bid_size)
+        """Depth-guarded mark for ``book`` — an *executable* price near the
+        top of the book, or None (``_guarded_mark``)."""
+        return _guarded_mark(book.bids, self._min_mark_bid_size)
 
     def _position_state(self, position_id: int) -> _PositionState:
         """The runtime state of ``position_id``, created on first use."""
@@ -394,16 +424,16 @@ class ExitMonitor(TickLoopMonitor):
                 # CLOB has no book for the token any more: the market
                 # resolved. Hold for the settlement monitor.
                 self._hold_once(held, ts, "market_closed_await_settlement")
+            else:
+                # Dropped from the cache (it stopped refreshing, or was never
+                # fetched): the stop cannot fire, so it must be visible.
+                self._hold_once(held, ts, "no_order_book")
             return True
         if not book.bids:
             return True
-        decision = self._decide(held, book)
+        decision = self._decide(held, book, catalog.order_book_fetched_at(held.token_id))
         intent = _close_intent(decision.out) if decision is not None else None
         if decision is not None and intent is not None:
-            if self._backing_off(held.position_id, intent.trigger):
-                # A close for this very decision failed recently: wait out the
-                # backoff instead of retrying (and re-confirming) every tick.
-                return True
             confirmed = await self._confirm_close(held, decision, catalog)
             if isinstance(confirmed, str):
                 # Refetch failed on a market that is gone / looks closed, or
@@ -413,6 +443,12 @@ class ExitMonitor(TickLoopMonitor):
                 return True
             decision = confirmed
             intent = _close_intent(decision.out)
+            if intent is not None and self._backing_off(
+                held.position_id, intent.trigger, _sell_floor(decision, intent)
+            ):
+                # A close for this very (confirmed) decision failed recently:
+                # wait out the backoff instead of retrying every tick.
+                return True
         self._track_thin_streak(held.position_id, decision)
         if decision is None or (decision.thin and intent is None):
             # The book has bids but none deep enough to sell into: the position
@@ -454,7 +490,14 @@ class ExitMonitor(TickLoopMonitor):
         # not close this id underneath us (see closing_registry).
         mark_closing(held.position_id)
         task = asyncio.create_task(
-            self._close(held, intent.trigger, ts, return_pct, peak_price, floor_price=intent.price)
+            self._close(
+                held,
+                intent.trigger,
+                ts,
+                return_pct,
+                peak_price,
+                floor_price=_sell_floor(decision, intent),
+            )
         )
         self._inflight = task
         try:
@@ -515,44 +558,63 @@ class ExitMonitor(TickLoopMonitor):
             state.backoff = None
             state.error_key = None
 
-    def _backing_off(self, position_id: int, trigger: str) -> bool:
-        """Whether a close of ``position_id`` for ``trigger`` is still inside
-        its failure backoff. A different trigger is a changed decision: the
-        backoff is dropped and the close is attempted."""
+    def _backing_off(self, position_id: int, trigger: str, floor: float | None) -> bool:
+        """Whether a close of ``position_id`` for ``trigger`` at ``floor`` is
+        still inside its failure backoff. Called with the *confirmed*
+        decision. A different trigger, or a floor lower than the one that
+        failed (the market moved on), is a new close: it is attempted now. The
+        backoff itself is kept — a stale trigger flip must not wipe it — and
+        is replaced by the outcome of that attempt."""
         state = self._states.get(position_id)
         backoff = state.backoff if state is not None else None
-        if backoff is None:
+        if backoff is None or backoff.trigger != trigger:
             return False
-        if backoff.trigger != trigger:
-            self._clear_backoff(position_id)
+        if _floor_moved_lower(floor, backoff.floor):
             return False
-        return time.monotonic() < backoff.until
+        return self._clock() < backoff.until
 
-    def _record_close_failure(self, position_id: int, trigger: str) -> None:
-        """Start (or double) the backoff of a close that did not fill."""
+    def _record_close_failure(self, position_id: int, trigger: str, floor: float | None) -> None:
+        """Start (or double) the backoff of a close that did not fill. A
+        retry at a lower floor than the failed one restarts at the base
+        delay: a moving market must not keep doubling the wait."""
         state = self._position_state(position_id)
         prev = state.backoff
-        if prev is not None and prev.trigger == trigger:
+        if (
+            prev is not None
+            and prev.trigger == trigger
+            and not _floor_moved_lower(floor, prev.floor)
+        ):
             delay = min(prev.delay * 2.0, CLOSE_BACKOFF_MAX_SECONDS)
         else:
             delay = min(float(self._tick_interval), CLOSE_BACKOFF_MAX_SECONDS)
-        state.backoff = _Backoff(trigger=trigger, delay=delay, until=time.monotonic() + delay)
+        state.backoff = _Backoff(
+            trigger=trigger, delay=delay, until=self._clock() + delay, floor=floor
+        )
 
     def _track_thin_streak(self, position_id: int, decision: _Decision | None) -> None:
-        """Count consecutive ticks on which a thin hard stop was pending
-        confirmation; any other outcome resets the streak."""
+        """Count the distinct book fetches on which a thin hard stop was
+        pending confirmation; any other outcome resets the streak. A tick
+        that reads the same fetch again (same stamp) neither adds nor resets,
+        so a frozen snapshot cannot complete the streak."""
         if (
             decision is not None
             and decision.thin
             and decision.out.signals.get("thin_stop_pending") is True
         ):
-            self._position_state(position_id).thin_streak += 1
+            state = self._position_state(position_id)
+            stamp = decision.stamp
+            if stamp is None or state.thin_stamp is None or stamp > state.thin_stamp:
+                state.thin_streak += 1
+                state.thin_stamp = stamp
         else:
-            state = self._states.get(position_id)
-            if state is not None:
-                state.thin_streak = 0
+            state_or_none = self._states.get(position_id)
+            if state_or_none is not None:
+                state_or_none.thin_streak = 0
+                state_or_none.thin_stamp = None
 
-    def _decide(self, held: HeldPosition, book: OrderBook) -> _Decision | None:
+    def _decide(
+        self, held: HeldPosition, book: OrderBook, stamp: float | None = None
+    ) -> _Decision | None:
         """Mark ``held`` against ``book`` and run the exit section on it.
 
         None when the book has no bid level deep enough to mark against —
@@ -560,22 +622,35 @@ class ExitMonitor(TickLoopMonitor):
         on the raw best bid with ``thin=True`` (threshold_v1 evaluates only
         its hard stop there — closing into a thin book beats riding a
         collapse to zero) and the peak is left alone, a dust bid not being a
-        price the position ever had."""
+        price the position ever had.
+
+        ``stamp`` is the book's fetch stamp (``MarketStore.order_book_fetched_at``);
+        the thin streak counts distinct fetches by it."""
+        if not book.bids:
+            return None
+        best_bid = book.bids[0][0]
         current_price = self._mark(book)
         thin = False
         if current_price is None:
-            if not book.bids or not getattr(self._exit, "EVALUATES_THIN_MARKS", False):
+            if not getattr(self._exit, "EVALUATES_THIN_MARKS", False):
                 return None
-            current_price = book.bids[0][0]
+            current_price = best_bid
             thin = True
-        # The bid is depth-guarded (a dust probe far below the real bids would
-        # inflate the spread floor until the trailing lock can never fire);
-        # the ask is the raw level 1. Depth-guarding the ask only ever moved
-        # it up or to None: that inflated threshold_v1's stop mid (suppressing
-        # the normal stop) and an all-dust ask side removed the trailing spread
-        # floor altogether. threshold_v1 caps the spread floor, which already
-        # bounds what a dust ask can do to the trailing distance.
-        ask = book.asks[0][0] if book.asks else None
+        if thin:
+            # Only the hard stop's confirmation reads the ask on a thin mark
+            # (no mid is computed there): a dust or probe level-1 ask must not
+            # confirm a collapse, so it is the depth-qualified ask.
+            ask = first_level_with_size(book.asks, self._min_mark_bid_size)
+        else:
+            # The bid is depth-guarded (a dust probe far below the real bids
+            # would inflate the spread floor until the trailing lock can never
+            # fire); the ask is the raw level 1. Depth-guarding the ask only
+            # ever moved it up or to None: that inflated threshold_v1's stop
+            # mid (suppressing the normal stop) and an all-dust ask side
+            # removed the trailing spread floor altogether. threshold_v1 caps
+            # the spread floor, which already bounds what a dust ask can do to
+            # the trailing distance.
+            ask = book.asks[0][0] if book.asks else None
         spread = ask - current_price if ask is not None else None
         # Monotone-increasing per-position peak. New open positions seed at
         # current_price; bootstrap_peaks / observe_price may have seeded a
@@ -599,10 +674,10 @@ class ExitMonitor(TickLoopMonitor):
             # book endpoint, so the section falls back to its configured tick.
             tick_size=None,
             thin=thin,
-            thin_streak=state.thin_streak if thin else 0,
+            thin_streak=_prior_thin_streak(state, stamp) if thin else 0,
         )
         out = self._exit.run(SectionInput(tick_type="hard", payload=marked))
-        return _Decision(out=out, peak_price=peak_price, thin=thin)
+        return _Decision(out=out, peak_price=peak_price, best_bid=best_bid, thin=thin, stamp=stamp)
 
     async def _confirm_close(
         self, held: HeldPosition, decision: _Decision, catalog: MarketStore
@@ -668,7 +743,7 @@ class ExitMonitor(TickLoopMonitor):
                 "missing" if age is None else f"{age:.0f}s-old",
             )
             return decision
-        confirmed = self._decide(held, book) if book.bids else None
+        confirmed = self._decide(held, book, source.store.order_book_fetched_at(token))
         if confirmed is None:
             # The fresh book cannot be marked; the stale decision stands (the
             # sell itself decides whether there is anything to sell into).
@@ -705,14 +780,16 @@ class ExitMonitor(TickLoopMonitor):
         Runs as its own task so a cancelled tick loop cannot strand the
         bookkeeping; clears the in-flight claim on every exit path. A fill
         resets the position's close backoff; a failure starts / doubles it and
-        logs its ``error`` row once per (position, reason).
+        logs its ``error`` row once per (position, reason) — or, when an order
+        of ours may still rest on the book, a ``resting_order_pending`` hold
+        once while it does.
         """
         try:
             # execute_sell blocks for seconds on the live path — keep the event
             # loop free (same offload the orchestrator does for its sections).
-            # ``floor_price`` is the mark the decision was made on: the sell
-            # may sweep bid levels down to it, but never below the price the
-            # trigger was evaluated at.
+            # ``floor_price`` is the lowest price the sell may take: level 1
+            # for a normal close, the section's floor for a confirmed thin
+            # hard stop (see ``_sell_floor``).
             result = await asyncio.to_thread(
                 self._executor.execute_sell,
                 held,
@@ -723,6 +800,9 @@ class ExitMonitor(TickLoopMonitor):
             )
         finally:
             clear_closing(held.position_id)
+        # Remember (or forget) an order of ours that may still rest: while it
+        # does, the next close is a re-check of it, not a new order.
+        self._position_state(held.position_id).resting_order_id = result.resting_order_id
         if result.filled and result.price is not None:
             self._clear_backoff(held.position_id)
             # A sell is not necessarily the whole position: a crossing order
@@ -767,7 +847,22 @@ class ExitMonitor(TickLoopMonitor):
         # The section decided to close but the fill did not land — a position
         # that should be closed is still open: surface as error, once per
         # (position, reason) while it persists, and back off the retries.
-        self._record_close_failure(held.position_id, trigger)
+        self._record_close_failure(held.position_id, trigger, floor_price)
+        if result.resting_order_id is not None:
+            # Not a failure to report as an error: a SELL of ours is still
+            # on the book and may yet fill. Held until it is off the book;
+            # logged once in the close-failure slot, which — unlike the hold
+            # slot — survives the evaluable ticks in between.
+            self._log_once(
+                held,
+                ts,
+                "error_key",
+                "resting_order_pending",
+                verdict="skip",
+                trigger=trigger,
+                reason="resting_order_pending",
+            )
+            return False
         error = f"sell not filled: {result.skip_reason}"
         # Kept apart from the holds (``error_key``): a retried close of the
         # same decision must not log again just because the position was
@@ -852,9 +947,15 @@ class _PositionState:
     error_key: str | None = None
     # Close backoff (see ``CLOSE_BACKOFF_MAX_SECONDS``).
     backoff: _Backoff | None = None
-    # Consecutive ticks on which a thin-book hard stop was pending
-    # confirmation (``MarkedPosition.thin_streak``).
+    # Distinct book fetches on which a thin-book hard stop was pending
+    # confirmation (``MarkedPosition.thin_streak``), and the fetch stamp of
+    # the last one counted.
     thin_streak: int = 0
+    thin_stamp: float | None = None
+    # A live SELL of ours that may still rest on the book (no cancel could be
+    # confirmed). While set, no new order is posted for the position; the
+    # live executor re-checks / cancels it on the next close attempt.
+    resting_order_id: str | None = None
     # Already logged as ``dust_remainder``. A sub-one-share remainder is not a
     # placeable order, so evaluating it produced a CloseIntent → a sell the
     # executor can only skip → an ``error`` row, every tick, for as long as the
@@ -866,9 +967,10 @@ class _PositionState:
 class _Backoff(NamedTuple):
     """A failed close's retry backoff for one position."""
 
-    trigger: str  # the decision that failed — a different one resets the backoff
+    trigger: str  # the decision that failed — a different one is retried at once
     delay: float  # seconds of the current backoff step
-    until: float  # time.monotonic() before which the close is not retried
+    until: float  # monitor clock reading before which the close is not retried
+    floor: float | None = None  # the failed sell's floor — a lower one is retried
 
 
 class _Decision(NamedTuple):
@@ -876,7 +978,46 @@ class _Decision(NamedTuple):
 
     out: SectionOutput
     peak_price: float
+    best_bid: float  # level-1 bid of the book the decision was made on
     thin: bool = False  # marked on the raw best bid (no executable level)
+    stamp: float | None = None  # that book's fetch stamp (``book_clock()``)
+
+
+def _guarded_mark(bids: list[tuple[float, float]], min_size: float) -> float | None:
+    """The first bid level carrying ``min_size`` or more within the top
+    ``MARK_MAX_LEVELS`` levels and no more than ``MARK_MAX_GAP`` below the
+    best bid; None (a thin book) when none qualifies. A size level further
+    down is a stink bid, not a price the position trades at."""
+    if not bids:
+        return None
+    best = bids[0][0]
+    for price, size in bids[:MARK_MAX_LEVELS]:
+        if best - price > MARK_MAX_GAP + 1e-9:
+            return None
+        if size >= min_size:
+            return price
+    return None
+
+
+def _sell_floor(decision: _Decision, intent: CloseIntent) -> float:
+    """The lowest price the sell of ``intent`` may take. A normal close sells
+    against level 1 only (the best bid the decision saw); a thin decision is
+    a confirmed hard stop, whose section set the deeper floor it may sweep
+    to as ``intent.price``."""
+    return intent.price if decision.thin else decision.best_bid
+
+
+def _floor_moved_lower(floor: float | None, prev: float | None) -> bool:
+    """Whether ``floor`` is a lower price than the failed close's ``prev``."""
+    return floor is not None and prev is not None and floor < prev - 1e-9
+
+
+def _prior_thin_streak(state: _PositionState, stamp: float | None) -> int:
+    """The streak to hand the section, *excluding* the current book: when
+    this fetch was already counted (same stamp), it must not count twice."""
+    if stamp is not None and stamp == state.thin_stamp and state.thin_streak > 0:
+        return state.thin_streak - 1
+    return state.thin_streak
 
 
 def _close_intent(out: SectionOutput) -> CloseIntent | None:

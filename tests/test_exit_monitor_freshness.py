@@ -256,15 +256,31 @@ def test_entry_v1_gates_the_spread_on_the_bid_the_exit_marks_at() -> None:
     assert v1.signals["spread"] == pytest.approx(0.17)
 
 
-async def test_exit_marks_and_hard_stops_on_the_depth_guarded_bid() -> None:
-    """The book the old entry let through: the exit mark is 0.33, not 0.48."""
+async def test_exit_does_not_mark_at_a_size_level_far_below_the_top() -> None:
+    """The book the old entry let through: its only real size (0.33) sits
+    0.15 under the probe top. That is a thin book, not a 0.33 mark — a stink
+    bid alone must not fire a normal stop (the thin hard stop needs the ask
+    to confirm, and the 0.50 ask does not)."""
     store = market_source_manager.store
     store.set_order_books([_thin_top_book("t1")])
     ex = _FakeExecutor()
+    m = _monitor(None, ex)
+    await m._tick_once()
+    assert ex.calls == []
+    assert m.blocked == 1
+    assert exit_log.entries()[0].reason == "no_executable_bid"
+
+
+async def test_a_normal_stop_sells_against_level_one_only() -> None:
+    """A dust top over real size a tick lower: the mark is the real level,
+    but the sell's floor is the best bid — no sweep below level 1."""
+    market_source_manager.store.set_order_books(
+        [OrderBook(token_id="t1", ts=1.0, bids=[(0.34, 2.0), (0.33, 50.0)], asks=[(0.35, 50.0)])]
+    )
+    ex = _FakeExecutor()
     await _monitor(None, ex)._tick_once()
     assert ex.calls[0]["trigger"] == "stop_loss"
-    # The sell may sweep down to the mark the decision used.
-    assert ex.floors == [0.33]
+    assert ex.floors == [0.34]
 
 
 async def test_real_size_below_a_dusty_top_three_is_found() -> None:
@@ -289,22 +305,25 @@ async def test_real_size_below_a_dusty_top_three_is_found() -> None:
     assert len(book.bids) == 5
     market_source_manager.store.set_order_books([book])
     ex = _FakeExecutor()
-    await _monitor(None, ex)._tick_once()
-    assert ex.calls[0]["trigger"] == "stop_loss"
-    assert ex.floors == [0.30]
+    m = _monitor(None, ex)
+    await m._tick_once()
+    # Every level is kept, but the 0.30 size sits five levels / 0.19 under the
+    # top: a thin book (needs confirmation), not a 0.30 mark that stops out.
+    assert ex.calls == []
+    assert exit_log.entries()[0].reason == "no_executable_bid"
 
 
 async def test_no_executable_level_still_fires_the_hard_stop_on_the_raw_bid() -> None:
-    """Every level is dust and the raw best bid shows a -40% collapse that the
-    ask confirms (-34%): v1's hard stop closes into the thin book rather than
-    riding it to zero, sweeping below the dust bid (floor 0.30 - 0.10 * 0.50)."""
+    """Every bid level is dust and the raw best bid shows a -40% collapse that
+    a real ask confirms (-34%): v1's hard stop closes into the thin book rather
+    than riding it to zero, its floor at entry × (1 - 0.30 - 0.10) = 0.30."""
     market_source_manager.store.set_order_books(
-        [OrderBook(token_id="t1", ts=1.0, bids=[(0.30, 2.0), (0.20, 1.0)], asks=[(0.33, 1.0)])]
+        [OrderBook(token_id="t1", ts=1.0, bids=[(0.30, 2.0), (0.20, 1.0)], asks=[(0.33, 50.0)])]
     )
     ex = _FakeExecutor()
     await _monitor(None, ex)._tick_once()
     assert ex.calls[0]["trigger"] == "stop_loss"
-    assert ex.floors == [pytest.approx(0.25)]
+    assert ex.floors == [pytest.approx(0.30)]
 
 
 async def test_no_executable_level_without_a_collapse_is_blocked_not_closed() -> None:

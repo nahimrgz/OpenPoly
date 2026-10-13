@@ -203,12 +203,14 @@ async def test_within_thresholds_holds() -> None:
 
 
 async def test_no_order_book_blocked() -> None:
-    # v18: no order book → can't evaluate → counted as blocked, no log entry.
+    # No order book → can't evaluate → counted as blocked, and logged once as
+    # a ``no_order_book`` hold (its stop cannot fire — that must be visible).
     ex = _FakeExecutor()
     m = _monitor(_FakePortfolio([_held(1, "t-missing")]), ex)
     await m._tick_once()
+    await m._tick_once()
     assert ex.calls == []
-    assert exit_log.entries() == []
+    assert [(e.verdict, e.reason) for e in exit_log.entries()] == [("skip", "no_order_book")]
     assert m.open_positions == 1
     assert m.blocked == 1
 
@@ -227,7 +229,7 @@ async def test_empty_bids_blocked() -> None:
 
 async def test_tick_telemetry_open_and_blocked() -> None:
     # One evaluable (held within thresholds) + one blocked (no order book) →
-    # open=2, blocked=1, and still zero log entries.
+    # open=2, blocked=1; only the blocked one is logged (once).
     market_source_manager.store.set_order_books([_book("t1", bid=0.41)])
     ex = _FakeExecutor()
     positions = [_held(1, "t1", avg=0.40), _held(2, "t-missing", market_id="m2")]
@@ -235,7 +237,7 @@ async def test_tick_telemetry_open_and_blocked() -> None:
     await m._tick_once()
     assert m.open_positions == 2
     assert m.blocked == 1
-    assert exit_log.entries() == []
+    assert [(e.position_id, e.reason) for e in exit_log.entries()] == [(2, "no_order_book")]
     assert m.last_tick_at is not None
 
 
@@ -642,8 +644,8 @@ async def test_bootstrap_peaks_ignores_thin_snapshot_bids(tmp_path) -> None:
                 OrderBookSnapshot(
                     token_id="t1",
                     recorded_at=120.0,
-                    bids_json=json.dumps([[0.90, 1], [0.60, 100]]),
-                    asks_json=json.dumps([[0.91, 100]]),
+                    bids_json=json.dumps([[0.62, 1], [0.60, 100]]),
+                    asks_json=json.dumps([[0.63, 100]]),
                 ),
             ]
         )
@@ -656,8 +658,8 @@ async def test_bootstrap_peaks_ignores_thin_snapshot_bids(tmp_path) -> None:
     )
     monitor.configure(pf)
     monitor.bootstrap_peaks(sf)
-    # The 0.90 dust bid is rejected and the walk lands on the 0.60 level that
-    # actually had depth, so that — not 0.90 — becomes the peak.
+    # The 0.62 dust bid is rejected and the walk lands on the 0.60 level that
+    # actually had depth, so that — not 0.62 — becomes the peak.
     assert _peaks(monitor)[held.position_id] == pytest.approx(0.60)
 
 
@@ -704,16 +706,19 @@ async def test_observe_book_applies_the_depth_guard() -> None:
     ex = _FakeExecutor()
     m = _monitor(_FakePortfolio([_held(1, "t1", avg=0.40)]), ex)
     await m._tick_once()
-    # A 1-share spike bid at 0.90 over a real 0.60 book must not become the
+    # A 1-share spike bid at 0.62 over a real 0.60 book must not become the
     # peak — the walk lands on the first level with depth.
     m.observe_book(
         OrderBook(
             token_id="t1",
             ts=2.0,
-            bids=[(0.90, 1.0), (0.60, 100.0)],
-            asks=[(0.91, 100.0)],
+            bids=[(0.62, 1.0), (0.60, 100.0)],
+            asks=[(0.63, 100.0)],
         )
     )
+    assert _peaks(m)[1] == pytest.approx(0.60)
+    # A size level far under a dust top is a thin book, not a price: no peak.
+    m.observe_book(OrderBook(token_id="t1", ts=2.5, bids=[(0.90, 1.0), (0.80, 100.0)], asks=[]))
     assert _peaks(m)[1] == pytest.approx(0.60)
     m.observe_book(OrderBook(token_id="t1", ts=3.0, bids=[(0.95, 50.0)], asks=[(0.96, 100.0)]))
     assert _peaks(m)[1] == pytest.approx(0.95)

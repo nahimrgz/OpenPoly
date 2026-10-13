@@ -68,6 +68,9 @@ BOOK_REFRESH_TIMEOUT_SECONDS = 10.0
 # stop-loss acting on a 60s-old book fires late (or on a price long gone).
 # Only held tokens — a handful at micro-stakes — so the REST cost stays small.
 HELD_BOOK_INTERVAL_SECONDS = 10.0
+# A held token whose /book answered 404 (resolved market) is re-checked this
+# often by the held-book loop instead of every ``HELD_BOOK_INTERVAL_SECONDS``.
+GONE_BOOK_RECHECK_SECONDS = 300.0
 
 
 class FreshBookSource(Protocol):
@@ -405,9 +408,12 @@ class MarketSourceManager:
             return await self._book_fetcher(token_id)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
-                logger.warning(
-                    "order book for %s is gone (404); evicting its cached book", token_id
-                )
+                # Logged once per gone state: a resolved market's token keeps
+                # answering 404 on every recheck.
+                if not self.store.is_book_gone(token_id):
+                    logger.warning(
+                        "order book for %s is gone (404); evicting its cached book", token_id
+                    )
                 self.store.mark_book_gone(token_id)
             else:
                 logger.warning("order book fetch failed for %s: %s", token_id, exc)
@@ -498,19 +504,16 @@ class MarketSourceManager:
         book age *after* the refresh (None: no book at all) — a failed
         refresh shows up as a still-stale age, never as an exception.
 
-        Ages are measured per token against the moment of the call — the
-        decision time — from that book's own fetch stamp: a book refreshed
-        during the call is 0s old, however long a slow sibling kept the
-        gather open. Measuring every age once after the gather ended made one
-        slow side turn a side refreshed seconds earlier "stale" (the timeout
-        exceeds the 5s entry budget), so a single slow refresh vetoed the
-        other, fresh side.
+        Ages are measured at return time, after the gather, from each book's
+        own fetch stamp: the caller acts on the books now, so a side that
+        aged past the budget while a slow sibling kept the gather open is
+        reported with its real age rather than with the age it had when the
+        call started.
         """
-        decision_at = book_clock()
         stale = [
             t
             for t in dict.fromkeys(token_ids)
-            if (age := self.store.order_book_age(t, decision_at)) is None or age > max_age
+            if (age := self.store.order_book_age(t)) is None or age > max_age
         ]
         if stale:
             sem = asyncio.Semaphore(BOOK_SAMPLE_CONCURRENCY)
@@ -523,9 +526,10 @@ class MarketSourceManager:
                 await asyncio.wait_for(asyncio.gather(*(_one(t) for t in stale)), timeout=timeout)
             except asyncio.TimeoutError:
                 logger.warning("order book refresh of %d token(s) timed out", len(stale))
+        returned_at = book_clock()
         ages: dict[str, float | None] = {}
         for t in token_ids:
-            age = self.store.order_book_age(t, decision_at)
+            age = self.store.order_book_age(t, returned_at)
             ages[t] = None if age is None else max(0.0, age)
         return ages
 
@@ -544,10 +548,20 @@ class MarketSourceManager:
             return 0
         tokens = sorted({p.token_id for p in positions})
         self._held_tokens = frozenset(tokens)
-        if tokens:
+        # A token whose /book answered 404 belongs to a resolved market: it is
+        # rechecked every ``GONE_BOOK_RECHECK_SECONDS`` (a later 404 re-stamps
+        # the mark), not every cycle — a 404 costs two requests and a warning.
+        now = book_clock()
+        due = [
+            t
+            for t in tokens
+            if (gone_at := self.store.gone_since(t)) is None
+            or now - gone_at >= GONE_BOOK_RECHECK_SECONDS
+        ]
+        if due:
             # Half the interval: a book fetched on the previous cycle is due
             # again on this one, so held books stay within ~one interval.
-            await self.ensure_fresh(tokens, HELD_BOOK_INTERVAL_SECONDS / 2)
+            await self.ensure_fresh(due, HELD_BOOK_INTERVAL_SECONDS / 2)
         return len(tokens)
 
     async def _run_held_book_loop(self) -> None:
