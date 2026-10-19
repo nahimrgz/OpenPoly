@@ -30,6 +30,40 @@ openPoly **defaults to paper mode** — no real funds are touched until you
 explicitly switch to live (`POST /api/system/mode`). See the repository
 [DISCLAIMER](../../DISCLAIMER.md) before going live.
 
+### Opening the UI from another machine on the LAN
+
+To use the canvas from another computer on the same network, expose only the
+Vite dev server. The backend keeps binding `127.0.0.1`; the other machine
+reaches it through Vite's `/api` proxy.
+
+```bash
+# 1. Find this machine's LAN IP (e.g. 192.168.70.16)
+hostname -I
+
+# 2. Backend — still loopback-only, but accept the LAN IP as Host
+OPENPOLY_ALLOWED_HOSTS=192.168.70.16 uv run uvicorn openpoly.api.main:app
+
+# 3. Frontend — listen on all interfaces
+cd frontend && yarn dev --host
+
+# 4. If ufw is active, open :5173 to the local subnet only
+sudo ufw allow from 192.168.70.0/24 to any port 5173 proto tcp
+```
+
+Then open `http://<LAN-IP>:5173/` from the other machine.
+
+- **Page loads but shows no data / API calls return `421 host_not_allowed`** —
+  the LAN IP is missing from `OPENPOLY_ALLOWED_HOSTS` (see
+  [below](#openpoly_allowed_hosts--what-name-they-used)). It must be set every
+  time the backend starts.
+- **Page does not load at all** — check the firewall rule above, and that the
+  router does not isolate Wi-Fi clients (`ping <LAN-IP>` from the other machine).
+- **It stopped working after a reboot** — DHCP may have assigned a new IP.
+  Re-check `hostname -I` and update both the URL and `OPENPOLY_ALLOWED_HOSTS`,
+  or reserve the IP in the router.
+- Anyone on the network can now reach the API through Vite. On a shared network,
+  set [`OPENPOLY_API_TOKEN`](#openpoly_api_token--who-is-calling) as well.
+
 ## Securing the API
 
 The backend binds `127.0.0.1`, and until Phase 3 that was the whole of its
