@@ -218,6 +218,14 @@ def test_below_min_confidence_skips() -> None:
     out = _run(LLMAnalyzerConfig(), fake, _candidates("m-a"))
     assert out.verdict == "skip"
     assert out.reason == "below min_confidence"
+    # The would-be pick stays observable so a skip can be told from an abstain.
+    assert out.payload is None
+    assert out.signals == {
+        "selected_index": 1,
+        "market_id": "m-a",
+        "p_yes": 0.7,
+        "confidence": "low",
+    }
 
 
 def test_low_confidence_ok_when_min_is_low() -> None:

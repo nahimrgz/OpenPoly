@@ -384,6 +384,7 @@ class PipelineOrchestrator:
         latency_ms = int((time.monotonic() - start) * 1000)
 
         ar = out.payload if out is not None and isinstance(out.payload, AnalysisResult) else None
+        pick = _skipped_pick(out) if ar is None else {}
         usage = _usage_signal(out)
         reasoning, reasoning_truncated = _reasoning(out)
 
@@ -394,11 +395,14 @@ class PipelineOrchestrator:
                 news_content_preview=item.content[:80],
                 urgency=item.urgency,
                 verdict=verdict,  # type: ignore[arg-type]
-                p_model=ar.p_model if ar is not None else None,
-                confidence=ar.confidence if ar is not None else None,
-                market_id=ar.market_id if ar is not None else None,
+                p_model=ar.p_model if ar is not None else pick.get("p_model"),
+                confidence=ar.confidence if ar is not None else pick.get("confidence"),
+                market_id=ar.market_id if ar is not None else pick.get("market_id"),
                 latency_ms=latency_ms,
                 error=error,
+                # Why a non-error call produced no signal (abstain vs. a pick
+                # cut by min_confidence); errors already carry it in ``error``.
+                reason=out.reason if out is not None and verdict != "error" else None,
                 # PD1: surface the LLM's stated reason for the decision so
                 # PositionDetail UI can show it next to the position. Empty
                 # string from the model is also informative ("intentionally
@@ -612,6 +616,25 @@ def _reasoning(out: SectionOutput | None) -> tuple[str | None, bool]:
     if not isinstance(reasoning, str) or not reasoning:
         return None, False
     return reasoning[:MAX_LOGGED_REASONING_CHARS], len(reasoning) > MAX_LOGGED_REASONING_CHARS
+
+
+def _skipped_pick(out: SectionOutput | None) -> dict[str, Any]:
+    """The market / p_yes / confidence an analyzer chose but did not act on
+    (e.g. a ``below min_confidence`` skip), from its signals. Logged only, so
+    a skip can be told from an abstain; it never reaches entry."""
+    if out is None:
+        return {}
+    sig = out.signals
+    market_id = sig.get("market_id")
+    p_yes = sig.get("p_yes")
+    confidence = sig.get("confidence")
+    return {
+        "market_id": market_id if isinstance(market_id, str) else None,
+        "p_model": float(p_yes)
+        if isinstance(p_yes, (int, float)) and not isinstance(p_yes, bool)
+        else None,
+        "confidence": confidence if isinstance(confidence, str) else None,
+    }
 
 
 def _usage_signal(out: SectionOutput | None) -> dict[str, Any] | None:

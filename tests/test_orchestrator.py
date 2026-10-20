@@ -380,6 +380,61 @@ async def test_analyzer_skip_no_entry_call() -> None:
     assert len(e_log.entries()) == 0
 
 
+class _SignalSkipAnalyzer:
+    """A skip that carries the analyzer's would-be pick in its signals."""
+
+    def __init__(self, signals: dict[str, object], reason: str) -> None:
+        self._signals = signals
+        self._reason = reason
+
+    def run(self, input: SectionInput) -> SectionOutput:
+        return SectionOutput(
+            payload=None, verdict="skip", reason=self._reason, signals=dict(self._signals)
+        )
+
+
+async def test_analyzer_skip_logs_reason_and_would_be_pick() -> None:
+    analyzer = _SignalSkipAnalyzer(
+        {"selected_index": 1, "market_id": "m1", "p_yes": 0.7, "confidence": "low"},
+        "below min_confidence",
+    )
+    entry = FakeEntry()
+    orch, _, a_log, e_log = make_orchestrator(analyzer=analyzer, entry=entry)
+    await orch.start()
+    try:
+        orch.enqueue(_item("n1"))
+        await _drain(orch)
+    finally:
+        await orch.stop()
+    assert entry.call_count == 0
+    assert len(e_log.entries()) == 0
+    (call,) = a_log.entries()
+    assert call.verdict == "skip"
+    assert call.reason == "below min_confidence"
+    assert call.error is None
+    assert call.market_id == "m1"
+    assert call.p_model == 0.7
+    assert call.confidence == "low"
+
+
+async def test_analyzer_abstain_logs_reason_without_pick() -> None:
+    analyzer = _SignalSkipAnalyzer({"selected_index": 0}, "no actionable market")
+    orch, _, a_log, _ = make_orchestrator(analyzer=analyzer)
+    await orch.start()
+    try:
+        orch.enqueue(_item("n1"))
+        await _drain(orch)
+    finally:
+        await orch.stop()
+    (call,) = a_log.entries()
+    assert call.verdict == "skip"
+    assert call.reason == "no actionable market"
+    assert call.error is None
+    assert call.market_id is None
+    assert call.p_model is None
+    assert call.confidence is None
+
+
 async def test_analyzer_fail_open_no_entry_call() -> None:
     # fail_open is a "pass-through but mark dark" verdict in our protocol;
     # for v7 orchestrator we treat it the same as skip — no entry call,
