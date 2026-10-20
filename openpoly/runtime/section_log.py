@@ -99,8 +99,12 @@ class AnalyzerCall:
 
     ``reasoning`` is the analyzer's written self-check (``llm_v1``'s
     ``reasoning`` tool field), None for analyzers that do not produce one.
-    ``reason`` explains a runtime-level skip the analyzer never saw — e.g.
-    ``stale_news`` when the item aged out in the queue before its turn.
+    ``reason`` explains a non-error outcome: the analyzer's own skip reason
+    (``no actionable market`` / ``below min_confidence``) or a runtime-level
+    skip the analyzer never saw — e.g. ``stale_news`` when the item aged out
+    in the queue before its turn. On a ``below min_confidence`` skip,
+    ``market_id`` / ``p_model`` / ``confidence`` hold the pick that was not
+    acted on (log only; it never reaches entry).
     """
 
     ts: float

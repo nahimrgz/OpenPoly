@@ -265,15 +265,25 @@ def _interpret(
             reason=f"malformed confidence: {confidence!r}",
             signals=dict(extra),
         )
+    p_yes = result.get("p_yes")
     if _CONFIDENCE_RANK[confidence] < _CONFIDENCE_RANK[min_confidence]:
+        # Keep the would-be pick so the log tells this skip from an abstain.
+        pick_p: float | None = None
+        if isinstance(p_yes, (int, float)) and not isinstance(p_yes, bool):
+            pick_p = float(p_yes) if 0.0 <= p_yes <= 1.0 else None
         return SectionOutput(
             payload=None,
             verdict="skip",
             reason="below min_confidence",
-            signals={**extra, "confidence": confidence},
+            signals={
+                **extra,
+                "selected_index": idx,
+                "market_id": cands[idx - 1].market.market_id,
+                "p_yes": pick_p,
+                "confidence": confidence,
+            },
         )
 
-    p_yes = result.get("p_yes")
     if isinstance(p_yes, bool) or not isinstance(p_yes, (int, float)) or not 0.0 <= p_yes <= 1.0:
         return SectionOutput(
             payload=None,
