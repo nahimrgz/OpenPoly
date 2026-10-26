@@ -5,6 +5,10 @@
  * visibility, so a background tab does not keep hitting the API but also never
  * hangs forever on "Loading…". The fetcher is held in a ref so passing an
  * inline arrow does not re-subscribe the effect.
+ *
+ * A tick is skipped while the previous fetch is still in flight: an endpoint
+ * slower than the interval must not stack requests on the backend, which runs
+ * sync handlers in a bounded threadpool and would starve every other route.
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
@@ -14,6 +18,23 @@ export type PollResult<T> = {
   data: T | null
   status: PollStatus
   error: string | null
+}
+
+/**
+ * Wrap an async task so calls made while a previous run is still pending are
+ * dropped instead of starting a concurrent run.
+ */
+export function singleFlight(task: () => Promise<void>): () => void {
+  let inFlight = false
+  return () => {
+    if (inFlight) return
+    inFlight = true
+    task()
+      .catch(() => {})
+      .finally(() => {
+        inFlight = false
+      })
+  }
 }
 
 export function usePoll<T>(
@@ -43,9 +64,10 @@ export function usePoll<T>(
         setError(e instanceof Error ? e.message : String(e))
       }
     }
-    void refresh()
+    const tick = singleFlight(refresh)
+    tick()
     const maybeRefresh = () => {
-      if (document.visibilityState === 'visible') void refresh()
+      if (document.visibilityState === 'visible') tick()
     }
     const timer = setInterval(maybeRefresh, intervalMs)
     document.addEventListener('visibilitychange', maybeRefresh)
