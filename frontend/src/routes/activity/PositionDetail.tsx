@@ -17,14 +17,8 @@ import { OrderBookChart } from './OrderBookChart'
 import { fetchOrderBookHistory, type OrderBookHistory } from './orderBookClient'
 import { formatPnl, pnlClass } from './format'
 import type { PositionRecord } from './portfolioTypes'
+import { fetchPosition } from './positionsClient'
 import { usePoll } from './usePoll'
-
-async function fetchPosition(id: string): Promise<PositionRecord | null> {
-  const r = await fetch(`/api/positions/${encodeURIComponent(id)}`)
-  if (r.status === 404) return null
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()) as PositionRecord
-}
 
 type DetailData = {
   position: PositionRecord | null
@@ -34,14 +28,15 @@ type DetailData = {
 export function PositionDetail() {
   const { positionId } = useParams<{ positionId: string }>()
   const frozenRef = useRef<DetailData | null>(null)
-  const { data, status, error } = usePoll<DetailData>(async () => {
+  const { data, status, error } = usePoll<DetailData>(async (signal) => {
     if (frozenRef.current !== null) return frozenRef.current
-    const position = await fetchPosition(positionId ?? '')
+    const position = await fetchPosition(positionId ?? '', signal)
     if (position === null) return { position: null, history: null }
     const history = await fetchOrderBookHistory(
       position.token_id,
       position.opened_at,
       position.closed_at,
+      signal,
     )
     const result: DetailData = { position, history }
     if (position.closed_at !== null) frozenRef.current = result

@@ -8,8 +8,8 @@ export type WalletBalance = {
   ts: number | null
 }
 
-export async function fetchWalletBalance(): Promise<WalletBalance> {
-  const r = await fetch('/api/wallet/balance')
+export async function fetchWalletBalance(signal?: AbortSignal): Promise<WalletBalance> {
+  const r = await fetch('/api/wallet/balance', { signal })
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return (await r.json()) as WalletBalance
 }

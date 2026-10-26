@@ -12,6 +12,10 @@ Config comes from the environment, falling back to the repo's ``.env``:
 If the backend is down the script still sends a message saying so, so a
 missing summary never looks like a quiet day.
 
+Dates are UTC, like the rest of the repo. The message text is Spanish on
+purpose: it is a personal notification for the operator, not UI shipped with
+openPoly, so it is a deliberate exception to the English-only rule.
+
 Usage:
     python3 scripts/daily_report.py            # send
     python3 scripts/daily_report.py --dry-run  # print instead of sending
@@ -31,7 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,14 +67,22 @@ def money(x: float) -> str:
 
 def build_report(base: str, now: float) -> str:
     since = now - DAY
-    d = datetime.fromtimestamp(now)
+    d = datetime.fromtimestamp(now, UTC)
     mode = api(base, "/api/system/mode").get("mode", "?")
-    mode_label = "simulación, sin dinero real" if mode == "paper" else "⚠️ DINERO REAL" if mode == "live" else mode
+    mode_label = (
+        "simulación, sin dinero real"
+        if mode == "paper"
+        else "⚠️ DINERO REAL"
+        if mode == "live"
+        else mode
+    )
     lines = [f"📊 <b>OpenPoly — {d.day} {MONTHS[d.month - 1]}</b> ({mode_label})", ""]
 
     equity = api(base, "/api/portfolio/equity").get("summary", {})
     positions = api(base, "/api/positions?limit=500").get("positions", [])
-    closed = [p for p in positions if p["status"] == "closed" and (p.get("closed_at") or 0) >= since]
+    closed = [
+        p for p in positions if p["status"] == "closed" and (p.get("closed_at") or 0) >= since
+    ]
     open_now = [p for p in positions if p["status"] == "open"]
     exposure = sum(p["qty"] * p["avg_entry_price"] for p in open_now)
     wins = sum(1 for p in closed if (p.get("realized_pnl") or 0) > 0)
@@ -134,7 +146,9 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--dry-run", action="store_true", help="print the report instead of sending it")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print the report instead of sending it"
+    )
     args = parser.parse_args()
 
     load_env()
@@ -156,9 +170,12 @@ def main() -> int:
         send_telegram(token, chat_id, text)
     except urllib.error.HTTPError as exc:
         # The token is part of the URL; report only the status, never the URL.
-        print(f"Telegram API error: HTTP {exc.code} {exc.read().decode(errors='replace')}", file=sys.stderr)
+        print(
+            f"Telegram API error: HTTP {exc.code} {exc.read().decode(errors='replace')}",
+            file=sys.stderr,
+        )
         return 1
-    print(f"{datetime.now():%Y-%m-%d %H:%M} report sent")
+    print(f"{datetime.now(UTC):%Y-%m-%d %H:%M} report sent")
     return 0
 
 

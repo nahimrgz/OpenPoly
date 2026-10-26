@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
+import openpoly.db.engine as engine_module
+
 from openpoly.db.engine import (
     DEFAULT_DB_URL,
     database_url,
@@ -61,3 +63,26 @@ def test_position_table_has_entry_calibration_columns(tmp_path) -> None:
     with engine.begin() as conn:
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(position)")).fetchall()}
     assert {"entry_p_model", "entry_confidence", "entry_edge"} <= cols
+
+
+def test_sqlite_engine_caps_wal_size_after_checkpoint(tmp_path, monkeypatch):
+    # A small cap so the test can write past it quickly.
+    monkeypatch.setattr(engine_module, "WAL_SIZE_LIMIT_BYTES", 64 * 1024)
+    engine = make_engine(f"sqlite:///{tmp_path}/wal.db")
+    wal = tmp_path / "wal.db-wal"
+    # One connection throughout, so no other reader can pin the WAL whatever
+    # the pool does.
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA wal_autocheckpoint=0")
+        conn.execute(text("CREATE TABLE t (b BLOB)"))
+        for _ in range(64):
+            conn.execute(text("INSERT INTO t VALUES (zeroblob(16384))"))
+        conn.commit()
+        grown = wal.stat().st_size
+        conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)")
+        conn.execute(text("INSERT INTO t VALUES (1)"))  # resets the WAL from its start
+        conn.commit()
+        after = wal.stat().st_size  # while open: closing the last connection deletes it
+    engine.dispose()
+    assert grown > 64 * 1024
+    assert after <= 64 * 1024

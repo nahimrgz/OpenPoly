@@ -12,24 +12,10 @@ import { useMemo, useState } from 'react'
 import { formatRelativeAgo, formatUTC } from '../../sections/news_source/time'
 import { PositionCard } from './PositionCard'
 import type { Fill, PositionRecord } from './portfolioTypes'
+import { fetchPositionsData, type PositionsData } from './positionsClient'
 import { usePoll } from './usePoll'
 
-type PositionsData = { positions: PositionRecord[]; fills: Fill[] }
 type Filter = 'open' | 'closed' | 'all'
-
-async function fetchJSON<T>(url: string): Promise<T> {
-  const r = await fetch(url)
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()) as T
-}
-
-async function fetchPositionsData(): Promise<PositionsData> {
-  const [p, f] = await Promise.all([
-    fetchJSON<{ positions: PositionRecord[] }>('/api/positions'),
-    fetchJSON<{ fills: Fill[] }>('/api/fills'),
-  ])
-  return { positions: p.positions, fills: f.fills }
-}
 
 function sortPositions(rows: PositionRecord[], filter: Filter): PositionRecord[] {
   // Returns a new array; never mutates input. Sort keys per D1:
