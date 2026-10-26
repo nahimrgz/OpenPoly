@@ -175,7 +175,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC report sent")
+    print(f"{datetime.now(UTC):%Y-%m-%d %H:%M} report sent")
     return 0
 
 
