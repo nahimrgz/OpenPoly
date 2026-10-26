@@ -8,8 +8,8 @@ the Overview tab polls this every few seconds. The best bid is extracted in
 SQL (no per-row JSON parsing in Python), marks are looked up by bisection, and
 the snapshot part of the time axis is thinned to ``MAX_POINTS`` — a chart needs
 a few hundred points, not one per sample. The budget is split evenly across
-positions, so a short trade keeps its shape next to a long, densely sampled
-one. Open/close events and "now" are always kept, so the summary is exact.
+positions (at least one point each), so a short trade keeps its shape next to
+a long, densely sampled one. Open/close events and "now" are always kept, so the summary is exact.
 
 Unrealized P&L marks each open position at the level-1 bid of its token's most
 recent snapshot at-or-before the evaluated time (hold-last). That is the price
@@ -27,8 +27,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.db.tables import OrderBookSnapshot, PositionRow
 
-# Upper bound on snapshot-derived points in the curve (events are added on top),
-# shared evenly across positions.
+# Budget for snapshot-derived points in the curve (events are added on top),
+# shared evenly across positions. Each position keeps at least one point, so the
+# budget is exceeded only with more than MAX_POINTS positions.
 MAX_POINTS = 500
 
 
