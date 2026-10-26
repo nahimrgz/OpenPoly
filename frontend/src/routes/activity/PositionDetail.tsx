@@ -17,14 +17,8 @@ import { OrderBookChart } from './OrderBookChart'
 import { fetchOrderBookHistory, type OrderBookHistory } from './orderBookClient'
 import { formatPnl, pnlClass } from './format'
 import type { PositionRecord } from './portfolioTypes'
+import { fetchPosition } from './positionsClient'
 import { usePoll } from './usePoll'
-
-async function fetchPosition(id: string, signal?: AbortSignal): Promise<PositionRecord | null> {
-  const r = await fetch(`/api/positions/${encodeURIComponent(id)}`, { signal })
-  if (r.status === 404) return null
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()) as PositionRecord
-}
 
 type DetailData = {
   position: PositionRecord | null

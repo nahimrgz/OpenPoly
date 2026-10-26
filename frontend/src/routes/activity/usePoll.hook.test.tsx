@@ -112,4 +112,21 @@ describe('usePoll', () => {
     await act(async () => releaseStale('stale'))
     expect(result.current.data).toBe('fresh')
   })
+
+  it('reports a timeout even when the fetcher ignores the signal', async () => {
+    let calls = 0
+    const { result } = renderHook(() =>
+      usePoll(() => {
+        calls += 1
+        return calls === 1 ? Promise.resolve('first') : new Promise<string>(() => {})
+      }, 1000),
+    )
+    await advance(0)
+    await advance(1000 + 30_000)
+    expect(result.current).toEqual({
+      data: 'first',
+      status: 'error',
+      error: 'Request timed out after 30s',
+    })
+  })
 })

@@ -108,8 +108,14 @@ export function usePoll<T>(
     async function refresh(signal: AbortSignal) {
       const run = ++latestRun
       const stale = () => cancelled || run !== latestRun
+      // Settle on abort even if the fetcher ignores the signal, so a timeout
+      // always surfaces as an error instead of silently keeping stale data.
+      const aborted = new Promise<never>((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+      aborted.catch(() => {}) // an abort after success must not go unhandled
       try {
-        const result = await fetcherRef.current(signal)
+        const result = await Promise.race([fetcherRef.current(signal), aborted])
         if (stale()) return
         setData(result)
         setStatus('ready')

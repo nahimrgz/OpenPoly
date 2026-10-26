@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { fetchEquity } from './equityClient'
 import { fetchNewsPipeline } from './newsClient'
 import { fetchOrderBookHistory } from './orderBookClient'
+import { fetchPosition, fetchPositionsData } from './positionsClient'
 import { fetchWalletBalance } from './walletClient'
 
 // usePoll aborts timed-out and unmounted runs through this signal; a client
@@ -17,6 +18,8 @@ describe('activity clients forward the AbortSignal to fetch', () => {
     ['fetchWalletBalance', (s: AbortSignal) => fetchWalletBalance(s)],
     ['fetchOrderBookHistory', (s: AbortSignal) => fetchOrderBookHistory('t1', 0, null, s)],
     ['fetchNewsPipeline', (s: AbortSignal) => fetchNewsPipeline(10, s)],
+    ['fetchPositionsData', (s: AbortSignal) => fetchPositionsData(s)],
+    ['fetchPosition', (s: AbortSignal) => fetchPosition('p1', s)],
   ])('%s', async (_name, call) => {
     const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
