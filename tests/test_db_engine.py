@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from openpoly.db.engine import (
     DEFAULT_DB_URL,
+    WAL_SIZE_LIMIT_BYTES,
     database_url,
     init_db,
     make_engine,
@@ -61,3 +62,11 @@ def test_position_table_has_entry_calibration_columns(tmp_path) -> None:
     with engine.begin() as conn:
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(position)")).fetchall()}
     assert {"entry_p_model", "entry_confidence", "entry_edge"} <= cols
+
+
+def test_sqlite_engine_caps_wal_size_after_checkpoint(tmp_path):
+    engine = make_engine(f"sqlite:///{tmp_path}/wal.db")
+    with engine.connect() as conn:
+        limit = conn.execute(text("PRAGMA journal_size_limit")).scalar_one()
+    engine.dispose()
+    assert limit == WAL_SIZE_LIMIT_BYTES

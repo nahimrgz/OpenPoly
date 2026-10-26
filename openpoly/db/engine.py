@@ -20,6 +20,12 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 # A single SQLite file, relative to the working directory.
 DEFAULT_DB_URL = "sqlite:///openpoly.db"
 
+# Size the WAL file is truncated back to after a checkpoint resets it. SQLite
+# otherwise keeps the file at its high-water mark until the last connection
+# closes: one stretch of overlapping long reads that blocked checkpoints grew it
+# to ~900 MB of disk that stayed allocated until a restart.
+WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
 
 class Base(DeclarativeBase):
     """Declarative base for every openPoly ORM model."""
@@ -37,6 +43,8 @@ def make_engine(url: str | None = None) -> Engine:
     connection: the executor writes ``fill`` / ``position`` synchronously on
     the event loop while the write-behind writers write from worker threads, so
     a writer must wait its turn rather than fail with ``database is locked``.
+    ``journal_size_limit`` keeps the WAL file from staying at its high-water
+    mark (see ``WAL_SIZE_LIMIT_BYTES``).
     """
     resolved = url or database_url()
     if not resolved.startswith("sqlite"):
@@ -50,6 +58,7 @@ def make_engine(url: str | None = None) -> Engine:
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT_BYTES}")
         cursor.close()
 
     return engine
