@@ -102,15 +102,20 @@ export function usePoll<T>(
 
   useEffect(() => {
     let cancelled = false
+    // Only the latest run may write state: a run abandoned at its timeout can
+    // still settle later if its fetcher ignores the signal.
+    let latestRun = 0
     async function refresh(signal: AbortSignal) {
+      const run = ++latestRun
+      const stale = () => cancelled || run !== latestRun
       try {
         const result = await fetcherRef.current(signal)
-        if (cancelled) return
+        if (stale()) return
         setData(result)
         setStatus('ready')
         setError(null)
       } catch (e) {
-        if (cancelled) return
+        if (stale()) return
         setStatus('error')
         setError(e instanceof Error ? e.message : String(e))
       }

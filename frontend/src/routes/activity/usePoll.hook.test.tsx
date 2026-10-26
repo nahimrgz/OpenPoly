@@ -92,4 +92,24 @@ describe('usePoll', () => {
     await advance(60_000)
     expect(signals).toHaveLength(1)
   })
+
+  it('ignores a late result from an abandoned run', async () => {
+    let calls = 0
+    let releaseStale!: (v: string) => void
+    const { result } = renderHook(() =>
+      usePoll(() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve('first')
+        // Ignores the abort signal, so it outlives its timeout.
+        if (calls === 2) return new Promise<string>((r) => (releaseStale = r))
+        return Promise.resolve('fresh')
+      }, 1000),
+    )
+    await advance(0)
+    await advance(1000 + 30_000 + 1000) // run 2 abandoned at the deadline, run 3 done
+    expect(result.current.data).toBe('fresh')
+
+    await act(async () => releaseStale('stale'))
+    expect(result.current.data).toBe('fresh')
+  })
 })

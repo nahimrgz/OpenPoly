@@ -70,17 +70,19 @@ def test_sqlite_engine_caps_wal_size_after_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(engine_module, "WAL_SIZE_LIMIT_BYTES", 64 * 1024)
     engine = make_engine(f"sqlite:///{tmp_path}/wal.db")
     wal = tmp_path / "wal.db-wal"
-    with engine.begin() as conn:
+    # One connection throughout, so no other reader can pin the WAL whatever
+    # the pool does.
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA wal_autocheckpoint=0")
         conn.execute(text("CREATE TABLE t (b BLOB)"))
-        conn.execute(text("PRAGMA wal_autocheckpoint=0"))
         for _ in range(64):
             conn.execute(text("INSERT INTO t VALUES (zeroblob(16384))"))
-    grown = wal.stat().st_size
-    with engine.connect() as conn:
+        conn.commit()
+        grown = wal.stat().st_size
         conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)")
-    with engine.begin() as conn:
         conn.execute(text("INSERT INTO t VALUES (1)"))  # resets the WAL from its start
-    after = wal.stat().st_size  # before dispose: closing the last connection deletes it
+        conn.commit()
+        after = wal.stat().st_size  # while open: closing the last connection deletes it
     engine.dispose()
     assert grown > 64 * 1024
     assert after <= 64 * 1024
