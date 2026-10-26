@@ -60,7 +60,12 @@ export function schedulePoll(
     clearTimeout(timer)
     const controller = new AbortController()
     current = controller
-    const deadline = setTimeout(() => controller.abort(), timeoutMs)
+    // fetch rejects with the abort reason, so the UI shows this, not a bare
+    // "signal is aborted without reason".
+    const deadline = setTimeout(
+      () => controller.abort(new Error(`Request timed out after ${timeoutMs / 1000}s`)),
+      timeoutMs,
+    )
     const aborted = new Promise<void>((resolve) => {
       controller.signal.addEventListener('abort', () => resolve(), { once: true })
     })

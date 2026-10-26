@@ -117,6 +117,7 @@ describe('schedulePoll', () => {
     expect(signals[0].aborted).toBe(false)
     await vi.advanceTimersByTimeAsync(1)
     expect(signals[0].aborted).toBe(true)
+    expect((signals[0].reason as Error).message).toBe('Request timed out after 5s')
     await vi.advanceTimersByTimeAsync(1000)
     expect(signals).toHaveLength(2)
     poll.stop()
