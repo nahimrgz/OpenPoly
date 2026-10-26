@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { singleFlight } from './usePoll'
+import { schedulePoll } from './usePoll'
 
 function deferred() {
   let resolve!: () => void
@@ -10,37 +10,93 @@ function deferred() {
   return { promise, resolve }
 }
 
-describe('singleFlight', () => {
-  it('skips calls while the previous one is still pending', async () => {
+describe('schedulePoll', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('waits a full interval after each run finishes, never overlapping', async () => {
     const pending = deferred()
     let calls = 0
-    const tick = singleFlight(() => {
-      calls += 1
-      return pending.promise
-    })
+    const poll = schedulePoll(
+      () => {
+        calls += 1
+        return calls === 1 ? pending.promise : Promise.resolve()
+      },
+      1000,
+      () => true,
+    )
 
-    tick()
-    tick()
-    tick()
+    poll.kick()
+    await vi.advanceTimersByTimeAsync(5000) // first run is still pending
     expect(calls).toBe(1)
 
     pending.resolve()
-    await pending.promise
-    await Promise.resolve()
-    tick()
+    await vi.advanceTimersByTimeAsync(999)
+    expect(calls).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
     expect(calls).toBe(2)
+    poll.stop()
   })
 
-  it('allows the next call after a rejection', async () => {
+  it('kick runs now and restarts the interval instead of adding a run', async () => {
     let calls = 0
-    const tick = singleFlight(() => {
-      calls += 1
-      return Promise.reject(new Error('boom'))
-    })
+    const poll = schedulePoll(
+      () => {
+        calls += 1
+        return Promise.resolve()
+      },
+      1000,
+      () => true,
+    )
+    poll.kick()
+    await vi.advanceTimersByTimeAsync(600)
+    poll.kick() // e.g. the tab became visible again
+    await vi.advanceTimersByTimeAsync(600)
+    expect(calls).toBe(2)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(calls).toBe(3)
+    poll.stop()
+  })
 
-    tick()
-    await new Promise((r) => setTimeout(r, 0))
-    tick()
+  it('skips timed runs while hidden but keeps the timer armed', async () => {
+    let visible = false
+    let calls = 0
+    const poll = schedulePoll(
+      () => {
+        calls += 1
+        return Promise.resolve()
+      },
+      1000,
+      () => visible,
+    )
+    poll.kick({ force: true }) // the initial fetch ignores visibility
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(calls).toBe(1)
+    visible = true
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(calls).toBe(2)
+    poll.stop()
+  })
+
+  it('keeps polling after a failed run and stops for good on stop()', async () => {
+    let calls = 0
+    const poll = schedulePoll(
+      () => {
+        calls += 1
+        return Promise.reject(new Error('boom'))
+      },
+      1000,
+      () => true,
+    )
+    poll.kick()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(calls).toBe(2)
+    poll.stop()
+    await vi.advanceTimersByTimeAsync(5000)
     expect(calls).toBe(2)
   })
 })

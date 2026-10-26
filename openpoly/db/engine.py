@@ -43,8 +43,6 @@ def make_engine(url: str | None = None) -> Engine:
     connection: the executor writes ``fill`` / ``position`` synchronously on
     the event loop while the write-behind writers write from worker threads, so
     a writer must wait its turn rather than fail with ``database is locked``.
-    ``journal_size_limit`` keeps the WAL file from staying at its high-water
-    mark (see ``WAL_SIZE_LIMIT_BYTES``).
     """
     resolved = url or database_url()
     if not resolved.startswith("sqlite"):
