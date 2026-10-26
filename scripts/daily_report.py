@@ -12,6 +12,10 @@ Config comes from the environment, falling back to the repo's ``.env``:
 If the backend is down the script still sends a message saying so, so a
 missing summary never looks like a quiet day.
 
+Dates are UTC, like the rest of the repo. The message text is Spanish on
+purpose: it is a personal notification for the operator, not UI shipped with
+openPoly, so it is a deliberate exception to the English-only rule.
+
 Usage:
     python3 scripts/daily_report.py            # send
     python3 scripts/daily_report.py --dry-run  # print instead of sending
@@ -31,7 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +67,7 @@ def money(x: float) -> str:
 
 def build_report(base: str, now: float) -> str:
     since = now - DAY
-    d = datetime.fromtimestamp(now)
+    d = datetime.fromtimestamp(now, UTC)
     mode = api(base, "/api/system/mode").get("mode", "?")
     mode_label = (
         "simulación, sin dinero real"
@@ -171,7 +175,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"{datetime.now():%Y-%m-%d %H:%M} report sent")
+    print(f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC report sent")
     return 0
 
 
