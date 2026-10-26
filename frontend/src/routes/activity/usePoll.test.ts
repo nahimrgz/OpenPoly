@@ -99,4 +99,58 @@ describe('schedulePoll', () => {
     await vi.advanceTimersByTimeAsync(5000)
     expect(calls).toBe(2)
   })
+
+  it('aborts a run that never settles and keeps polling', async () => {
+    const signals: AbortSignal[] = []
+    const poll = schedulePoll(
+      (signal) => {
+        signals.push(signal)
+        return new Promise<void>(() => {}) // hung request
+      },
+      1000,
+      () => true,
+      5000,
+    )
+    poll.kick()
+    await vi.advanceTimersByTimeAsync(4999)
+    expect(signals).toHaveLength(1)
+    expect(signals[0].aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(signals[0].aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(signals).toHaveLength(2)
+    poll.stop()
+  })
+
+  it('does not lock up when the task throws synchronously', async () => {
+    let calls = 0
+    const poll = schedulePoll(
+      () => {
+        calls += 1
+        throw new Error('sync boom')
+      },
+      1000,
+      () => true,
+    )
+    poll.kick()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(calls).toBe(2)
+    poll.stop()
+  })
+
+  it('stop() aborts the run in flight', async () => {
+    let seen: AbortSignal | undefined
+    const poll = schedulePoll(
+      (signal) => {
+        seen = signal
+        return new Promise<void>(() => {})
+      },
+      1000,
+      () => true,
+    )
+    poll.kick()
+    await vi.advanceTimersByTimeAsync(10)
+    poll.stop()
+    expect(seen?.aborted).toBe(true)
+  })
 })

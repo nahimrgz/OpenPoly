@@ -58,7 +58,7 @@ export function NewsTab() {
   const [filter, setFilter] = useState<Filter>('all')
 
   const { data: cards, status, error } = usePoll<NewsPipelineCard[]>(
-    () => fetchNewsPipeline(displayLimit),
+    (signal) => fetchNewsPipeline(displayLimit, signal),
   )
 
   const counts = useMemo(() => {

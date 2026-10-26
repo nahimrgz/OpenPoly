@@ -16,11 +16,13 @@ export async function fetchOrderBookHistory(
   tokenId: string,
   since: number,
   until: number | null,
+  signal?: AbortSignal,
 ): Promise<OrderBookHistory> {
   const params = new URLSearchParams({ since: String(since) })
   if (until !== null) params.set('until', String(until))
   const r = await fetch(
     `/api/inspect/order-books/${encodeURIComponent(tokenId)}?${params}`,
+    { signal },
   )
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return (await r.json()) as OrderBookHistory

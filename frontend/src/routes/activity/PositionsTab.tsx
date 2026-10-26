@@ -17,16 +17,16 @@ import { usePoll } from './usePoll'
 type PositionsData = { positions: PositionRecord[]; fills: Fill[] }
 type Filter = 'open' | 'closed' | 'all'
 
-async function fetchJSON<T>(url: string): Promise<T> {
-  const r = await fetch(url)
+async function fetchJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const r = await fetch(url, { signal })
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return (await r.json()) as T
 }
 
-async function fetchPositionsData(): Promise<PositionsData> {
+async function fetchPositionsData(signal?: AbortSignal): Promise<PositionsData> {
   const [p, f] = await Promise.all([
-    fetchJSON<{ positions: PositionRecord[] }>('/api/positions'),
-    fetchJSON<{ fills: Fill[] }>('/api/fills'),
+    fetchJSON<{ positions: PositionRecord[] }>('/api/positions', signal),
+    fetchJSON<{ fills: Fill[] }>('/api/fills', signal),
   ])
   return { positions: p.positions, fills: f.fills }
 }

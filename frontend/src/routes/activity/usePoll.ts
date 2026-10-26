@@ -32,14 +32,19 @@ export type Poller = {
  * Poll `task` every `intervalMs` measured from the end of the previous
  * run, never overlapping. Timed runs are skipped while `shouldRun()` is
  * false; the timer stays armed so polling resumes on its own.
+ *
+ * Each run gets an `AbortSignal` that fires after `timeoutMs` or on `stop()`.
+ * A run that never settles is abandoned at the timeout, so a hung request
+ * cannot stop polling for good.
  */
 export function schedulePoll(
-  task: () => Promise<void>,
+  task: (signal: AbortSignal) => Promise<void>,
   intervalMs: number,
   shouldRun: () => boolean,
+  timeoutMs = Math.max(30_000, intervalMs),
 ): Poller {
   let timer: ReturnType<typeof setTimeout> | undefined
-  let running = false
+  let current: AbortController | undefined
   let stopped = false
 
   const arm = () => {
@@ -47,17 +52,23 @@ export function schedulePoll(
     if (!stopped) timer = setTimeout(() => run(false), intervalMs)
   }
   const run = (force: boolean) => {
-    if (stopped || running) return
+    if (stopped || current) return
     if (!force && !shouldRun()) {
       arm()
       return
     }
     clearTimeout(timer)
-    running = true
-    task()
+    const controller = new AbortController()
+    current = controller
+    const deadline = setTimeout(() => controller.abort(), timeoutMs)
+    const aborted = new Promise<void>((resolve) => {
+      controller.signal.addEventListener('abort', () => resolve(), { once: true })
+    })
+    Promise.race([Promise.resolve().then(() => task(controller.signal)), aborted])
       .catch(() => {})
       .finally(() => {
-        running = false
+        clearTimeout(deadline)
+        if (current === controller) current = undefined
         arm()
       })
   }
@@ -67,12 +78,13 @@ export function schedulePoll(
     stop: () => {
       stopped = true
       clearTimeout(timer)
+      current?.abort()
     },
   }
 }
 
 export function usePoll<T>(
-  fetcher: () => Promise<T>,
+  fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs = 3000,
 ): PollResult<T> {
   const [data, setData] = useState<T | null>(null)
@@ -85,9 +97,9 @@ export function usePoll<T>(
 
   useEffect(() => {
     let cancelled = false
-    async function refresh() {
+    async function refresh(signal: AbortSignal) {
       try {
-        const result = await fetcherRef.current()
+        const result = await fetcherRef.current(signal)
         if (cancelled) return
         setData(result)
         setStatus('ready')
