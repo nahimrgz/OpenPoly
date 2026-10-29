@@ -21,6 +21,7 @@
  */
 import { useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
+import { formatSentiment } from '../../lib/sentiment'
 import { formatRelativeAgo, formatUTC } from '../../sections/news_source/time'
 import { AnalyzerRationaleBlock } from './AnalyzerRationale'
 import type { AnalyzerDecision } from './portfolioTypes'
@@ -183,7 +184,7 @@ export function NewsCard({ card }: { card: NewsPipelineCard }) {
           </span>
           {news.sentiment !== null && (
             <span className="ml-2 text-neutral-500">
-              sentiment {news.sentiment.toFixed(2)}
+              sentiment {formatSentiment(news.sentiment)}
             </span>
           )}
         </div>
