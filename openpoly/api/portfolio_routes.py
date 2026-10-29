@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.api.security import require_api_token
 from openpoly.analytics.calibration import calibration_summary
+from openpoly.analytics.shadow import shadow_report
 from openpoly.db.engine import get_session_factory
 from openpoly.execution import executor
 from openpoly.portfolio import PortfolioStore
@@ -352,6 +353,31 @@ def get_calibration(
         # probability outside [0, 1]); 0 in a healthy ledger.
         "excluded": report.excluded,
     }
+
+
+@router.get("/analytics/shadow")
+async def get_shadow_report(
+    store: PortfolioStore = Depends(get_portfolio_store),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> dict[str, Any]:
+    """What the ``min_confidence`` filter turned down: every persisted shadow
+    pick marked at +6h / +24h / +48h / latest against the order-book
+    snapshots, grouped by confidence, next to the real closed positions
+    grouped by entry confidence (see ``openpoly.analytics.shadow``).
+
+    Read-only and derived per request. One indexed snapshot lookup per pick
+    and horizon, so it runs off the event loop.
+    """
+
+    def _build() -> dict[str, Any]:
+        positions = store.list_positions(CALIBRATION_LIMIT)
+        return shadow_report(
+            session_factory,
+            positions=positions,
+            cost_basis=store.buy_cost_basis([p.id for p in positions]),
+        )
+
+    return await asyncio.to_thread(_build)
 
 
 @router.get("/portfolio/equity")
