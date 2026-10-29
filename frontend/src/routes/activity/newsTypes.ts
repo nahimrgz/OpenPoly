@@ -4,6 +4,8 @@
 // ring logs on the backend, so any stage in a `NewsPipelineCard` may be
 // null when its log has evicted the news_id.
 
+import type { Sentiment } from '../../lib/sentiment'
+
 // Matches openpoly.news.ring_buffer.Urgency. Tradingnews tends to send
 // `regular`; `high`/`medium`/`low` are the bucketed view used by filters.
 export type Urgency = 'high' | 'medium' | 'low' | 'regular'
@@ -19,7 +21,7 @@ export type NewsItem = {
   news_id: string
   content: string
   urgency: Urgency
-  sentiment: number | null
+  sentiment: Sentiment
   published_at: number
   received_at: number
 }

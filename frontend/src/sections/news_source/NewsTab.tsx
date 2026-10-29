@@ -3,15 +3,12 @@
  * (newest first). Reads GET /api/inspect/news; polls every 5s while mounted.
  */
 import { useEffect } from 'react'
+import { formatSentiment } from '../../lib/sentiment'
 
 import { useNewsInspectStore, type InspectNewsItem } from './inspectStore'
 import { formatRelativeAgo, formatUTC } from './time'
 
 const POLL_MS = 5000
-
-function fmtSentiment(v: number | null): string {
-  return v === null ? '—' : v.toFixed(2)
-}
 
 export function NewsSourceNewsTab() {
   const data = useNewsInspectStore((s) => s.data)
@@ -79,7 +76,7 @@ function NewsRow({ item: n }: { item: InspectNewsItem }) {
           {formatRelativeAgo(n.received_at)}
         </span>
         <span>urgency {n.urgency}</span>
-        <span>sentiment {fmtSentiment(n.sentiment)}</span>
+        <span>sentiment {formatSentiment(n.sentiment)}</span>
       </div>
     </li>
   )

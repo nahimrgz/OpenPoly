@@ -6,13 +6,14 @@
  * drives polling via useEffect so it only runs while visible.
  */
 import { create } from 'zustand'
+import type { Sentiment } from '../../lib/sentiment'
 
 export type InspectNewsItem = {
   id: number
   news_id: string
   content: string
   urgency: string
-  sentiment: number | null
+  sentiment: Sentiment
   published_at: number
   received_at: number
 }
