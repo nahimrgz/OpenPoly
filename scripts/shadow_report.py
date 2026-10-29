@@ -33,11 +33,23 @@ def _from_api(base: str) -> dict[str, Any]:
 
 
 def _from_db(path: str) -> dict[str, Any]:
+    from pathlib import Path
+
+    from sqlalchemy import inspect
+
     from openpoly.analytics.shadow import shadow_report
     from openpoly.db.engine import make_engine, make_session_factory
     from openpoly.portfolio import PortfolioStore
 
-    factory = make_session_factory(make_engine(f"sqlite:///{path}"))
+    if not Path(path).is_file():
+        raise SystemExit(f"no such database file: {path}")
+    engine = make_engine(f"sqlite:///{path}")
+    if "shadow_pick" not in inspect(engine).get_table_names():
+        raise SystemExit(
+            f"{path} has no shadow_pick table yet: start the backend once on it "
+            "so its migrations run"
+        )
+    factory = make_session_factory(engine)
     store = PortfolioStore(factory)
     positions = store.list_positions(5000)
     return shadow_report(

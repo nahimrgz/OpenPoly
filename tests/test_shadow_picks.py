@@ -48,16 +48,32 @@ def test_side_is_the_larger_edge_on_depth_guarded_asks() -> None:
     assert q.edge == pytest.approx(0.10)
 
 
-def test_dust_ask_is_skipped_for_the_first_level_with_size() -> None:
-    # A 1-share YES ask at 0.10 would fake a 0.30 edge; the real YES ask is 0.45.
+def test_level1_ask_is_the_price_like_entry_v1() -> None:
+    # Entry v1 pays the level-1 ask even when it is small (v0 _read_quote).
     q = choose_shadow_side(
         0.40,
-        yes=("y", _book("y", [(0.40, 50)], [(0.10, 1), (0.45, 50)])),
+        yes=("y", _book("y", [(0.09, 50)], [(0.10, 1), (0.45, 50)])),
+        no=("n", _book("n", [(0.54, 50)], [(0.55, 50)])),
+    )
+    assert q.side == "yes"
+    assert q.ask == pytest.approx(0.10)
+    assert q.edge == pytest.approx(0.30)
+
+
+def test_side_without_a_depth_guarded_bid_is_not_quoted() -> None:
+    # YES has the larger edge but only a dust bid: v1 rejects it ("no executable bid").
+    q = choose_shadow_side(
+        0.40,
+        yes=("y", _book("y", [(0.29, 1)], [(0.30, 50)])),
         no=("n", _book("n", [(0.54, 50)], [(0.55, 50)])),
     )
     assert q.side == "no"
-    assert q.ask == pytest.approx(0.55)
-    assert q.edge == pytest.approx(0.05)
+    q = choose_shadow_side(
+        0.40,
+        yes=("y", _book("y", [], [(0.30, 50)])),
+        no=("n", None),
+    )
+    assert q.side is None
 
 
 def test_no_usable_ask_keeps_the_pick_without_a_side() -> None:
@@ -191,7 +207,7 @@ def test_report_marks_horizons_and_groups_by_confidence(factory) -> None:
 
 def test_report_counts_a_horizon_without_snapshot_as_no_data(factory) -> None:
     store = ShadowStore(factory)
-    q = choose_shadow_side(0.6, yes=("y", _book("y", [], [(0.40, 50)])), no=("n", None))
+    q = choose_shadow_side(0.6, yes=("y", _book("y", [(0.39, 50)], [(0.40, 50)])), no=("n", None))
     store.record(ts=_T0, news_id="a", market_id="m", p_model=0.6, confidence="low", quote=q)
     rep = shadow_report(factory, now=_T0 + 100 * _H, positions=[], cost_basis={})
     h6 = rep["shadow"]["low"]["horizons"]["6h"]
@@ -226,7 +242,7 @@ def test_endpoint_serves_the_report(factory) -> None:
     from openpoly.db.engine import get_session_factory
     from openpoly.portfolio import PortfolioStore
 
-    q = choose_shadow_side(0.6, yes=("y", _book("y", [], [(0.40, 50)])), no=("n", None))
+    q = choose_shadow_side(0.6, yes=("y", _book("y", [(0.39, 50)], [(0.40, 50)])), no=("n", None))
     ShadowStore(factory).record(
         ts=_T0, news_id="a", market_id="m", p_model=0.6, confidence="low", quote=q
     )
@@ -250,7 +266,7 @@ def test_script_reads_a_db_file_and_renders(tmp_path, capsys) -> None:
     engine = make_engine(f"sqlite:///{db}")
     init_db(engine)
     f = make_session_factory(engine)
-    q = choose_shadow_side(0.6, yes=("y", _book("y", [], [(0.40, 50)])), no=("n", None))
+    q = choose_shadow_side(0.6, yes=("y", _book("y", [(0.39, 50)], [(0.40, 50)])), no=("n", None))
     ShadowStore(f).record(
         ts=_T0, news_id="a", market_id="m", p_model=0.6, confidence="low", quote=q
     )
@@ -265,3 +281,25 @@ def test_script_reads_a_db_file_and_renders(tmp_path, capsys) -> None:
     out = capsys.readouterr().out
     assert "low: 1 picks" in out
     assert "Real closed positions" in out
+
+
+def test_script_rejects_a_missing_or_unmigrated_db(tmp_path) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "shadow_report.py"
+    spec = importlib.util.spec_from_file_location("shadow_report_cli2", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    missing = tmp_path / "nope.db"
+    with pytest.raises(SystemExit, match="no such database file"):
+        mod.main(["--db", str(missing)])
+    assert not missing.exists()  # no empty file left behind
+    old = tmp_path / "old.db"
+    engine = make_engine(f"sqlite:///{old}")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE t (x INTEGER)"))
+    engine.dispose()
+    with pytest.raises(SystemExit, match="no shadow_pick table"):
+        mod.main(["--db", str(old)])

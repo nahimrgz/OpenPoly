@@ -5,7 +5,8 @@ pick never reaches entry, so the ledger alone cannot say whether the filter
 discards losers or winners. This module keeps that record:
 
 - ``choose_shadow_side`` prices a discarded pick the way entry v1 would:
-  the side with the larger edge (fair − ask), on the depth-guarded ask.
+  the side with the larger edge (fair − ask) among the sides v1 could quote —
+  a level-1 ask above 0 and a depth-guarded bid (``_read_quote``).
 - ``ShadowStore.record`` persists it (``shadow_pick``). The orchestrator calls
   it off the event loop, from the cached books, with no extra fetch.
 - ``shadow_report`` marks each stored pick at fixed horizons against the
@@ -58,25 +59,23 @@ def choose_shadow_side(
 ) -> ShadowQuote:
     """The side with the larger edge, mirroring entry v1's side choice.
 
-    ``yes`` / ``no`` are ``(token_id, cached book)``. A side counts only with
-    a token and a depth-guarded ask (first ask level with ≥ 5 shares); a dust
-    quote is not a price the entry could have paid."""
+    ``yes`` / ``no`` are ``(token_id, cached book)``. A side counts only where
+    entry v1's ``_read_quote`` would quote it: a token, a book with asks and
+    bids, a level-1 ask above 0 (the price v1 pays) and a depth-guarded bid
+    (first bid level with ≥ 5 shares). Ties go to YES, as in v1. Gates that
+    come after the side choice (spread, edge, portfolio) are not applied: the
+    shadow records what the pick was, not whether every gate would pass."""
     best: ShadowQuote | None = None
     for side, (token, book), fair in (("yes", yes, p_yes), ("no", no, 1.0 - p_yes)):
-        if token is None or book is None:
+        if token is None or book is None or not book.asks or not book.bids:
             continue
-        ask = first_level_with_size(book.asks)
-        if ask is None:
+        ask = book.asks[0][0]
+        bid = first_level_with_size(book.bids)
+        if ask <= 0.0 or bid is None:
             continue
         edge = fair - ask
         if best is None or best.edge is None or edge > best.edge:
-            best = ShadowQuote(
-                side=side,
-                token_id=token,
-                ask=ask,
-                bid=first_level_with_size(book.bids),
-                edge=edge,
-            )
+            best = ShadowQuote(side=side, token_id=token, ask=ask, bid=bid, edge=edge)
     return best or ShadowQuote()
 
 

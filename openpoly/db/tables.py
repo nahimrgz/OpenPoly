@@ -195,8 +195,8 @@ class ShadowPickRow(Base):
     later order-book snapshots to measure what the filter turned down.
 
     ``side`` / ``token_id`` / ``ask`` / ``bid`` / ``edge`` are NULL when no
-    side had a usable (depth-guarded) ask in the cached books. Never read by
-    the trading path.
+    side could be quoted the way entry v1 quotes it (level-1 ask above 0 and a
+    depth-guarded bid) from the cached books. Never read by the trading path.
     """
 
     __tablename__ = "shadow_pick"
