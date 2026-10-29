@@ -186,3 +186,29 @@ class LLMUsageRow(Base):
     cache_creation_input_tokens: Mapped[int] = mapped_column(default=0)
     attempts: Mapped[int] = mapped_column(default=1)
     cost_usd: Mapped[float | None]
+
+
+class ShadowPickRow(Base):
+    """An analyzer pick the ``min_confidence`` filter discarded, with the side
+    the entry would have taken and that side's quote at decision time — the
+    record behind ``GET /api/analytics/shadow``, which marks each pick against
+    later order-book snapshots to measure what the filter turned down.
+
+    ``side`` / ``token_id`` / ``ask`` / ``bid`` / ``edge`` are NULL when no
+    side could be quoted the way entry v1 quotes it (level-1 ask above 0 and a
+    depth-guarded bid) from the cached books. Never read by the trading path.
+    """
+
+    __tablename__ = "shadow_pick"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[float] = mapped_column(index=True)  # epoch seconds, UTC
+    news_id: Mapped[str | None]
+    market_id: Mapped[str]
+    p_model: Mapped[float]
+    confidence: Mapped[str]
+    side: Mapped[str | None]
+    token_id: Mapped[str | None]
+    ask: Mapped[float | None]
+    bid: Mapped[float | None]
+    edge: Mapped[float | None]

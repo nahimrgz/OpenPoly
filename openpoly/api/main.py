@@ -38,6 +38,7 @@ from openpoly.db.engine import get_session_factory
 from openpoly.db.manager import DatabaseConfig
 from openpoly.db.manager import manager as database_manager
 from openpoly.llm.usage_store import usage_store
+from openpoly.analytics.shadow import shadow_store
 from openpoly.embedding.manager import manager as embedding_manager
 from openpoly.execution import executor
 from openpoly.markets.manager import MarketSourceConfig
@@ -189,6 +190,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     executor.configure_paper(portfolio)
     # Analyzer token usage — one llm_usage row per LLM call.
     usage_store.configure(get_session_factory())
+    # Analyzer picks discarded by min_confidence — one shadow_pick row each.
+    shadow_store.configure(get_session_factory())
     # Try-build the live executor whether or not we're currently in live
     # mode — pre-construct so a UI flip is cheap. Failure leaves live=None
     # and the dispatcher falls back to live_not_ready.
@@ -265,6 +268,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await database_manager.stop()
     await orch.stop()
     usage_store.configure(None)
+    shadow_store.configure(None)
     news_source_manager.set_pipeline_hook(None)
     await news_source_manager.shutdown()
     await market_source_manager.shutdown()

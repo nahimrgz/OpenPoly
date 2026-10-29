@@ -166,6 +166,16 @@ def _m005_llm_usage_table(conn: Connection) -> None:
     LLMUsageRow.__table__.create(conn, checkfirst=True)  # type: ignore[attr-defined]
 
 
+def _m006_shadow_pick_table(conn: Connection) -> None:
+    """The ``shadow_pick`` table (analyzer picks discarded by
+    ``min_confidence``, with the quote the entry would have used). A no-op when
+    the table is already there (``checkfirst``); its ``ts`` index is part of
+    the table definition."""
+    from openpoly.db.tables import ShadowPickRow
+
+    ShadowPickRow.__table__.create(conn, checkfirst=True)  # type: ignore[attr-defined]
+
+
 # Ordered, append-only. Never renumber or reuse a version: the number recorded
 # in a deployed database is the only thing that says what has run there.
 MIGRATIONS: list[tuple[int, Migration]] = [
@@ -174,6 +184,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (3, _m003_order_book_token_time_index),
     (4, _m004_order_book_recorded_at_index),
     (5, _m005_llm_usage_table),
+    (6, _m006_shadow_pick_table),
 ]
 
 LATEST_VERSION: int = MIGRATIONS[-1][0]

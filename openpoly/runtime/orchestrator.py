@@ -42,6 +42,7 @@ from typing import Any, Literal, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel
 
+from openpoly.analytics.shadow import ShadowQuote, choose_shadow_side, shadow_store
 from openpoly.embedding.models import MarketCandidates
 from openpoly.llm.client import cost_or_none, int_or
 from openpoly.llm.usage_store import usage_store
@@ -420,6 +421,9 @@ class PipelineOrchestrator:
                 self._record_usage(usage, ts=ts, news_id=item.id, verdict=verdict)
             )
 
+        if out is not None and verdict == "skip" and out.reason == _BELOW_MIN_CONFIDENCE:
+            self._record_shadow_pick(pick, ts=ts, news_id=item.id)
+
         # Only forward to entry on ok + valid AR payload.
         if verdict != "ok" or ar is None:
             return None
@@ -436,6 +440,53 @@ class PipelineOrchestrator:
             )
         except Exception:  # noqa: BLE001 — usage logging must not break the pipeline
             logger.exception("orchestrator: recording LLM usage for news_id=%s failed", news_id)
+
+    def _record_shadow_pick(self, pick: dict[str, Any], *, ts: float, news_id: str) -> None:
+        """Persist a pick the analyzer discarded for low confidence, priced on
+        the cached books the way entry would have (``openpoly.analytics.shadow``).
+        Fire-and-forget like the usage row: it never delays or breaks the
+        pipeline, and it never fetches a book."""
+        market_id = pick.get("market_id")
+        p_model = pick.get("p_model")
+        confidence = pick.get("confidence")
+        if not market_id or p_model is None or not confidence:
+            return
+        try:
+            quote = self._shadow_quote(market_id, p_model)
+        except Exception:  # noqa: BLE001 — shadow bookkeeping must not break the pipeline
+            logger.exception("orchestrator: pricing shadow pick for %s failed", market_id)
+            quote = None
+        self._spawn_background(
+            self._persist_shadow_pick(
+                ts=ts,
+                news_id=news_id,
+                market_id=market_id,
+                p_model=p_model,
+                confidence=confidence,
+                quote=quote,
+            )
+        )
+
+    def _shadow_quote(self, market_id: str, p_model: float) -> ShadowQuote | None:
+        source = getattr(self, "_book_source", None)
+        if source is None:
+            return None
+        market = source.store.get(market_id)
+        if market is None:
+            return None
+        sides = {}
+        for side in ("yes", "no"):
+            token = market.token_for(side)
+            sides[side] = (token, source.store.get_order_book(token) if token else None)
+        return choose_shadow_side(p_model, yes=sides["yes"], no=sides["no"])
+
+    async def _persist_shadow_pick(self, **kwargs: Any) -> None:
+        try:
+            await asyncio.to_thread(shadow_store.record, **kwargs)
+        except Exception:  # noqa: BLE001 — shadow bookkeeping must not break the pipeline
+            logger.exception(
+                "orchestrator: recording shadow pick for news_id=%s failed", kwargs.get("news_id")
+            )
 
     def _entry_tokens(self, market: Market) -> list[str]:
         """The tokens whose books the entry decision reads: YES only under the
@@ -616,6 +667,11 @@ def _reasoning(out: SectionOutput | None) -> tuple[str | None, bool]:
     if not isinstance(reasoning, str) or not reasoning:
         return None, False
     return reasoning[:MAX_LOGGED_REASONING_CHARS], len(reasoning) > MAX_LOGGED_REASONING_CHARS
+
+
+# The analyzer's skip reason for a pick below ``min_confidence`` (llm_v0's
+# ``_interpret``, shared by v1).
+_BELOW_MIN_CONFIDENCE = "below min_confidence"
 
 
 def _skipped_pick(out: SectionOutput | None) -> dict[str, Any]:
