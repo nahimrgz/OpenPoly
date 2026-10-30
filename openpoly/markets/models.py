@@ -113,12 +113,26 @@ def parse_iso(value: Any) -> datetime | None:
 def _taker_fee_rate(raw: dict[str, Any]) -> float | None:
     """Provisional taker fee as a rate (fraction).
 
-    Gamma exposes ``takerBaseFee`` in basis points (e.g. 1000 -> 0.10). v8 §0.1
-    the zero-fee rule treats the CLOB ``/fee-rate`` endpoint as the only authority —
-    fetch layer may override this. ``feesEnabled is False`` is a definitive zero.
+    Sources, most authoritative first:
+
+    - ``feesEnabled is False`` is a definitive zero.
+    - ``feeSchedule.rate`` is what the market actually charges. Gamma keeps
+      reporting ``takerBaseFee`` 1000 bps on ``feeType: "zero_fees"`` markets
+      whose schedule rate is 0, so the base fee alone would misreport them as
+      10%-fee markets (and the zero-fee filter would drop them).
+    - ``takerBaseFee`` in basis points (e.g. 1000 -> 0.10) when there is no
+      usable schedule.
+
+    v8 §0.1: the CLOB ``/fee-rate`` endpoint is the final authority — the
+    fetch layer may override this.
     """
     if raw.get("feesEnabled") is False:
         return 0.0
+    schedule = raw.get("feeSchedule")
+    if isinstance(schedule, dict):
+        rate = _to_float(schedule.get("rate"))
+        if rate is not None and rate >= 0.0:
+            return rate
     bps = _to_float(raw.get("takerBaseFee"))
     return None if bps is None else bps / 10_000.0
 
