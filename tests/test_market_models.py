@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from openpoly.markets.models import Market, normalize_gamma_market
 
 
@@ -138,3 +140,39 @@ def test_normalize_parses_neg_risk_false_when_absent() -> None:
     m = normalize_gamma_market(raw, event={"id": "e", "title": "E", "tags": []})
     assert m is not None
     assert m.neg_risk is False
+
+
+def test_zero_fees_schedule_overrides_the_base_fee():
+    # Live Gamma shape (2026-10): feeType "zero_fees" with a 0-rate schedule
+    # still reports takerBaseFee 1000. The schedule is what is charged.
+    m = normalize_gamma_market(
+        _raw(
+            feesEnabled=True,
+            takerBaseFee=1000,
+            feeType="zero_fees",
+            feeSchedule={"exponent": 1, "rate": 0, "takerOnly": True, "rebateRate": 0},
+        )
+    )
+    assert m is not None
+    assert m.taker_fee_rate == 0.0
+
+
+def test_fee_schedule_rate_is_the_taker_rate():
+    m = normalize_gamma_market(
+        _raw(
+            feesEnabled=True,
+            takerBaseFee=1000,
+            feeType="crypto_fees_v2",
+            feeSchedule={"exponent": 1, "rate": 0.07, "takerOnly": True, "rebateRate": 0},
+        )
+    )
+    assert m is not None
+    assert m.taker_fee_rate == pytest.approx(0.07)
+
+
+def test_malformed_fee_schedule_falls_back_to_the_base_fee():
+    m = normalize_gamma_market(
+        _raw(feesEnabled=True, takerBaseFee=1000, feeSchedule={"rate": "n/a"})
+    )
+    assert m is not None
+    assert m.taker_fee_rate == pytest.approx(0.10)
