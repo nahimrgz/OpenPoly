@@ -236,7 +236,13 @@ def test_entry_v1_gates_the_spread_on_the_bid_the_exit_marks_at() -> None:
     )
 
     market = normalize_gamma_market(
-        {"id": "m1", "conditionId": "0xm1", "question": "Q?", "clobTokenIds": '["t1", "t2"]'},
+        {
+            "id": "m1",
+            "conditionId": "0xm1",
+            "question": "Q?",
+            "clobTokenIds": '["t1", "t2"]',
+            "feesEnabled": False,
+        },
         event={"id": "e", "title": "E", "tags": []},
     )
     assert market is not None
@@ -446,7 +452,13 @@ async def test_failed_refresh_on_a_closed_market_holds_for_settlement() -> None:
     from openpoly.markets.store import PollSummary
 
     market = normalize_gamma_market(
-        {"id": "m1", "conditionId": "0xm1", "question": "Q?", "clobTokenIds": '["t1", "t2"]'},
+        {
+            "id": "m1",
+            "conditionId": "0xm1",
+            "question": "Q?",
+            "clobTokenIds": '["t1", "t2"]',
+            "feesEnabled": False,
+        },
         event={"id": "e", "title": "E", "tags": []},
     )
     assert market is not None

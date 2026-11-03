@@ -29,6 +29,11 @@ meaning. v1 changes:
   on the *other* side of the same market is open. Holding YES and NO on one
   market is a guaranteed loss of both spreads, not a hedge.
 * **``same_market_cooldown_minutes`` defaults to 60** (v0: 0, off).
+* **Edge net of the taker fee.** Polymarket charges takers
+  ``rate × p × (1 − p)`` per share (``taker_fee_per_share``), so both the side
+  ranking and ``min_edge`` use ``fair − ask − fee(ask)``. On a zero-fee market
+  this is the gross edge. A market whose fee rate is unknown is not priced
+  (``unknown taker fee``): an edge that cannot be netted is not an edge.
 
 The section itself does no IO for book freshness: the orchestrator refreshes
 stale books *before* calling ``run()`` (``PipelineOrchestrator.
@@ -53,10 +58,10 @@ from pydantic import Field
 from openpoly.execution.sizing import is_dust_qty
 from openpoly.markets.manager import manager as market_source_manager
 from openpoly.markets.models import OrderBook
-from openpoly.markets.pricing import first_level_with_size
+from openpoly.markets.pricing import first_level_with_size, taker_fee_per_share
 from openpoly.sections._base import SectionInput, SectionOutput
 from openpoly.sections.analyzer.llm_v0 import AnalysisResult
-from openpoly.sections.entry._types import FreshBooks, candidate_sides, held_side_probability
+from openpoly.sections.entry._types import FreshBooks, candidate_sides
 from openpoly.sections.entry.edge_threshold_v0 import (
     EdgeThresholdConfig,
     EdgeThresholdEntryV0,
@@ -108,7 +113,7 @@ class EdgeThresholdConfigV1(EdgeThresholdConfig):
 
 class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
     SECTION_TYPE = "entry"
-    SECTION_VERSION = "1.0.0"
+    SECTION_VERSION = "1.1.0"
     REQUIRES = ["order_book", "market_data"]
     Config = EdgeThresholdConfigV1
     # The orchestrator passes ``FreshBooks`` (see the module docstring).
@@ -162,7 +167,7 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
                 skipped[side] = quote.reason or "unpriceable"
                 continue
             quotes[side] = quote
-            edges[side] = held_side_probability(res.p_model, side) - quote[1]
+            edges[side] = self._edge(res, side, quote[1])
         if not edges:
             return SectionOutput(
                 payload=None,
@@ -172,10 +177,23 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
             )
         # max() keeps the first of equal keys; YES is inserted first.
         chosen = max(edges, key=lambda s: edges[s])
-        signals: dict[str, object] = {"side": chosen}
+        signals: dict[str, object] = {"side": chosen, "taker_fee_rate": market.taker_fee_rate}
         for side, edge in edges.items():
             signals[f"edge_{side}"] = round(edge, 4)
         return chosen, signals, quotes[chosen]
+
+    def _read_quote(self, res: AnalysisResult, side: Side) -> Quote | SectionOutput:
+        market = market_source_manager.store.get(res.market_id)
+        if market is not None and market.taker_fee_rate is None:
+            return SectionOutput(payload=None, verdict="skip", reason="unknown taker fee")
+        return super()._read_quote(res, side)
+
+    def _edge(self, res: AnalysisResult, side: Side, held_price: float) -> float:
+        """v0's edge minus the taker fee on one share bought at ``held_price``."""
+        market = market_source_manager.store.get(res.market_id)
+        rate = market.taker_fee_rate if market is not None else None
+        fee = taker_fee_per_share(rate, held_price) if rate else 0.0
+        return super()._edge(res, side, held_price) - fee
 
     def _quote_bid(self, book: OrderBook) -> float | None:
         """The depth-guarded bid — the same price the exit monitor marks a

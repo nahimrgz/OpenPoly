@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from openpoly.db.tables import OrderBookSnapshot, ShadowPickRow
 from openpoly.markets.models import OrderBook
-from openpoly.markets.pricing import first_level_with_size
+from openpoly.markets.pricing import first_level_with_size, taker_fee_per_share
 
 HORIZONS_HOURS: tuple[int, ...] = (6, 24, 48)
 
@@ -56,6 +56,7 @@ def choose_shadow_side(
     *,
     yes: tuple[str | None, OrderBook | None],
     no: tuple[str | None, OrderBook | None],
+    fee_rate: float = 0.0,
 ) -> ShadowQuote:
     """The side with the larger edge, mirroring entry v1's side choice.
 
@@ -64,7 +65,9 @@ def choose_shadow_side(
     bids, a level-1 ask above 0 (the price v1 pays) and a depth-guarded bid
     (first bid level with ≥ 5 shares). Ties go to YES, as in v1. Gates that
     come after the side choice (spread, edge, portfolio) are not applied: the
-    shadow records what the pick was, not whether every gate would pass."""
+    shadow records what the pick was, not whether every gate would pass.
+    ``fee_rate`` is the market's taker fee rate: the edge is net of the fee
+    on one share at the ask, as in v1."""
     best: ShadowQuote | None = None
     for side, (token, book), fair in (("yes", yes, p_yes), ("no", no, 1.0 - p_yes)):
         if token is None or book is None or not book.asks or not book.bids:
@@ -73,7 +76,7 @@ def choose_shadow_side(
         bid = first_level_with_size(book.bids)
         if ask <= 0.0 or bid is None:
             continue
-        edge = fair - ask
+        edge = fair - ask - taker_fee_per_share(fee_rate, ask)
         if best is None or best.edge is None or edge > best.edge:
             best = ShadowQuote(side=side, token_id=token, ask=ask, bid=bid, edge=edge)
     return best or ShadowQuote()

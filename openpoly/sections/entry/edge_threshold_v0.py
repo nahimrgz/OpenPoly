@@ -279,7 +279,7 @@ class EdgeThresholdEntryV0:
         token_id, held_price, best_bid = quote
 
         spread = held_price - best_bid
-        edge = held_side_probability(res.p_model, side) - held_price
+        edge = self._edge(res, side, held_price)
         signals: dict[str, object] = {
             **side_signals,
             "edge": round(edge, 4),
@@ -464,6 +464,11 @@ class EdgeThresholdEntryV0:
         if bid is None:
             return SectionOutput(payload=None, verdict="skip", reason="no executable bid")
         return token_id, held_price, bid
+
+    def _edge(self, res: AnalysisResult, side: Side, held_price: float) -> float:
+        """Expected value per share of buying ``side`` at ``held_price``:
+        the held side's probability minus the price (v0: no fees)."""
+        return held_side_probability(res.p_model, side) - held_price
 
     def _quote_bid(self, book: OrderBook) -> float | None:
         """The bid the spread gate measures against: level 1 in v0. None
