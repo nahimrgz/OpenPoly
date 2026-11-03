@@ -120,7 +120,7 @@ async def _autostart_sources() -> None:
     """Best-effort start of both sources. A failure is logged and surfaced via
     the source's own status snapshot; it never aborts app startup."""
     try:
-        await market_source_manager.start(MarketSourceConfig())
+        await market_source_manager.start(_canvas_config(MarketSourceConfig, "market_source"))
     except Exception:  # noqa: BLE001 — startup must survive a bad source
         logger.exception("market_source autostart failed")
     try:

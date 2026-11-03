@@ -103,3 +103,46 @@ def test_news_autostart_uses_the_canvas_freshness_window(
     assert cfg["freshness_seconds"] == 300
     assert cfg["freshness_seconds"] == _news_max_age_seconds()
     assert cfg["api_key_ref"] == _NEWS_AUTOSTART_KEY_REF
+
+
+async def test_market_autostart_uses_the_canvas_config(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: autostart started the market source with the defaults, so
+    a canvas ``require_zero_fee: false`` was ignored after every restart."""
+    from openpoly.runtime.canvas_store import save_template
+
+    monkeypatch.setenv("OPENPOLY_AUTOSTART_SOURCES", "1")
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    save_template(
+        {
+            "version": 4,
+            "name": "t",
+            "nodes": [
+                {
+                    "id": "m",
+                    "sectionType": "market_source",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"poll_interval_seconds": 600, "filter": {"require_zero_fee": False}},
+                }
+            ],
+            "edges": [],
+        }
+    )
+    market_calls: list[Any] = []
+
+    async def fake_market_start(config: Any) -> None:
+        market_calls.append(config)
+
+    async def fake_news_start(config: Any) -> None:
+        pass
+
+    monkeypatch.setattr(market_manager, "start", fake_market_start)
+    monkeypatch.setattr(news_manager, "start", fake_news_start)
+
+    async with lifespan(app):
+        pass
+
+    (cfg,) = market_calls
+    assert cfg.poll_interval_seconds == 600
+    assert cfg.filter.require_zero_fee is False
