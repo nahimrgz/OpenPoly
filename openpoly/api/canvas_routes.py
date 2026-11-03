@@ -226,6 +226,25 @@ async def _apply_canvas_reload(
         except Exception:  # noqa: BLE001
             logger.exception("canvas reload: failed to apply news freshness window")
 
+    # Market source: the poll loop keeps the config it was started with, so a
+    # changed node (e.g. the discovery filter) restarts it. A source the
+    # operator stopped stays stopped.
+    if _section_config(old_template, "market_source") != _section_config(
+        new_template, "market_source"
+    ):
+        try:
+            from openpoly.markets.manager import MarketSourceConfig
+            from openpoly.markets.manager import manager as market_source_manager
+
+            if market_source_manager.status().state == "running":
+                await market_source_manager.stop()
+                await market_source_manager.start(
+                    orch_mod._canvas_config(MarketSourceConfig, "market_source")
+                )
+                logger.info("canvas reload: restarted market source with its new config")
+        except Exception:  # noqa: BLE001
+            logger.exception("canvas reload: failed to restart the market source")
+
     # Database section: held by DatabaseManager, not the orchestrator, and its
     # one tunable (retention) is re-read by the prune loop each sweep — so a
     # changed value only needs apply_config, no rebuild. Without this the

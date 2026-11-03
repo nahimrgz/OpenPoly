@@ -395,3 +395,83 @@ async def test_canvas_reload_applies_news_freshness_to_the_running_ws_client(
         await news_source_manager.stop()
         news_source_manager._source = None  # noqa: SLF001
         news_source_manager._source_config = None  # noqa: SLF001
+
+
+def _market_template(require_zero_fee: bool, *, news_freshness: int = 1800) -> dict:
+    return {
+        "version": 3,
+        "name": "t",
+        "nodes": [
+            {
+                "id": "market",
+                "sectionType": "market_source",
+                "position": {"x": 0, "y": 0},
+                "config": {"filter": {"require_zero_fee": require_zero_fee}},
+            },
+            {
+                "id": "news",
+                "sectionType": "news_source",
+                "position": {"x": 0, "y": 0},
+                "config": {"freshness_seconds": news_freshness},
+            },
+        ],
+        "edges": [],
+    }
+
+
+async def _reload_market_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old: dict, new: dict, *, state: str
+) -> list:
+    from openpoly.api.canvas_routes import _apply_canvas_reload
+    from openpoly.markets.manager import manager as market_manager
+    from openpoly.runtime.canvas_store import save_template
+
+    monkeypatch.setenv("OPENPOLY_CANVAS_STORE", str(tmp_path / "canvas.json"))
+    save_template(new)
+    calls: list = []
+
+    async def fake_stop() -> None:
+        calls.append("stop")
+
+    async def fake_start(config) -> None:
+        calls.append(config)
+
+    monkeypatch.setattr(market_manager, "stop", fake_stop)
+    monkeypatch.setattr(market_manager, "start", fake_start)
+    monkeypatch.setattr(market_manager, "_state", state)
+    await _apply_canvas_reload(old, new)
+    return calls
+
+
+async def test_canvas_reload_restarts_the_market_source_with_its_new_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the market source config was persisted to the canvas and
+    then ignored — the running poll loop kept its start-time filter."""
+    calls = await _reload_market_source(
+        tmp_path, monkeypatch, _market_template(True), _market_template(False), state="running"
+    )
+    assert calls[0] == "stop"
+    assert calls[1].filter.require_zero_fee is False
+
+
+async def test_canvas_reload_leaves_the_market_source_alone_when_its_config_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = await _reload_market_source(
+        tmp_path,
+        monkeypatch,
+        _market_template(True),
+        _market_template(True, news_freshness=300),
+        state="running",
+    )
+    assert calls == []
+
+
+async def test_canvas_reload_does_not_start_a_stopped_market_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = await _reload_market_source(
+        tmp_path, monkeypatch, _market_template(True), _market_template(False), state="stopped"
+    )
+    assert calls == []
