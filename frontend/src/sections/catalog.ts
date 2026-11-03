@@ -416,7 +416,7 @@ export const ENTRY_V1_COOLDOWN_MINUTES = 60
 const ENTRY_V1: RuntimeCatalogEntry = {
   ...ENTRY_V0,
   name: 'EdgeThresholdEntryV1',
-  version: '1.0.0',
+  version: '1.1.0',
   module: 'openpoly.sections.entry.edge_threshold_v1',
   active: true,
   param_schema: {

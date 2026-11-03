@@ -41,6 +41,8 @@ def _market(market_id: str = "m1", *, clob: str | None = None):
         "conditionId": f"0x{market_id}",
         "question": "Will X happen?",
         "clobTokenIds": clob or f'["yes-{market_id}", "no-{market_id}"]',
+        # Zero-fee market: entry v1 nets the taker fee and refuses an unknown one.
+        "feesEnabled": False,
     }
     m = normalize_gamma_market(raw, event={"id": "e1", "title": "E", "tags": []})
     assert m is not None
