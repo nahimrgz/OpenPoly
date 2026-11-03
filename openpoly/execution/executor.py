@@ -35,7 +35,7 @@ from openpoly.execution.sizing import (
 )
 from openpoly.execution.types import ExecResult
 from openpoly.markets.manager import manager as market_source_manager
-from openpoly.markets.pricing import sweep
+from openpoly.markets.pricing import sweep, taker_fee_per_share
 from openpoly.portfolio import CloseReason, HeldPosition, PortfolioStore
 from openpoly.sections.entry.edge_threshold_v0 import OrderIntent
 
@@ -108,6 +108,7 @@ class PaperExecutor:
             entry_p_model=intent.p_model,
             entry_confidence=intent.confidence,
             entry_edge=intent.edge,
+            fee=qty * taker_fee_per_share(market.taker_fee_rate or 0.0, ask_price),
         )
         logger.info(
             "buy filled: %s %s qty=%.4f @ %.4f (position %d)",
@@ -192,6 +193,12 @@ class PaperExecutor:
         # VWAP of taking ``qty`` best-first (``qty`` never exceeds ``depth``).
         notional, _ = sweep(levels, qty)
         price = notional / qty
+        # The venue charges the taker fee per level taken; p × (1 − p) is
+        # concave, so charging it at the VWAP slightly overstates it across
+        # several levels (fail toward the conservative PnL). A market no longer
+        # in the catalog has no known rate: no fee is charged.
+        market = catalog.get(position.market_id)
+        rate = (market.taker_fee_rate or 0.0) if market is not None else 0.0
 
         self._store.record_sell(
             position.position_id,
@@ -200,6 +207,7 @@ class PaperExecutor:
             ts=ts,
             close_reason=close_reason,
             trigger=trigger,
+            fee=qty * taker_fee_per_share(rate, price),
         )
         logger.info(
             "sell filled: %s %s qty=%.4f @ %.4f vwap over %d level(s) (position %d, %s)",

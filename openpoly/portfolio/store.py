@@ -88,6 +88,17 @@ def _to_fill(row: FillRow) -> Fill:
     )
 
 
+def _buy_fee_per_share(session: Session, position_id: int) -> float:
+    """The taker fee paid per share bought for ``position_id``, from its BUY
+    fill(s); 0 when there is none (reconciled or manually created rows)."""
+    fee, qty = session.execute(
+        select(func.sum(FillRow.fee), func.sum(FillRow.qty))
+        .where(FillRow.action == "buy")
+        .where(FillRow.position_id == position_id)
+    ).one()
+    return float(fee) / float(qty) if fee and qty else 0.0
+
+
 class PortfolioStore:
     """Repository over ``fill`` + ``position``. Construct with a session
     factory; every method opens its own short transaction."""
@@ -111,6 +122,7 @@ class PortfolioStore:
         entry_p_model: float | None = None,
         entry_confidence: str | None = None,
         entry_edge: float | None = None,
+        fee: float = 0.0,
     ) -> HeldPosition:
         """Open a position: insert the position-projection row + its buy fill in
         one transaction. Raises ``IntegrityError`` if an open position for
@@ -120,6 +132,9 @@ class PortfolioStore:
         decision's own inputs, stored on the position so the outcome can later
         be joined to the belief (calibration). They default to None: a manual
         or reconciled open has no entry decision behind it.
+
+        ``fee`` is the taker fee paid on the buy (USDC). It stays on the fill;
+        realized PnL charges it pro rata as the shares are disposed of.
         """
         with self._session_factory() as session:
             pos = PositionRow(
@@ -148,7 +163,7 @@ class PortfolioStore:
                     action="buy",
                     price=price,
                     qty=qty,
-                    fee=0.0,
+                    fee=fee,
                     position_id=pos.id,
                     news_id=news_id,
                     trigger=None,
@@ -181,7 +196,9 @@ class PortfolioStore:
                 raise ValueError(f"position {position_id} not found")
             if pos.status != "open":
                 raise ValueError(f"position {position_id} is {pos.status}, not open")
-            realized = (sell_price - pos.avg_entry_price) * pos.qty  # fee = 0
+            realized = (sell_price - pos.avg_entry_price) * pos.qty - _buy_fee_per_share(
+                session, pos.id
+            ) * pos.qty
             session.add(
                 FillRow(
                     ts=ts,
@@ -218,6 +235,7 @@ class PortfolioStore:
         trigger: str | None = None,
         order_id: str | None = None,
         tx_hash: str | None = None,
+        fee: float = 0.0,
     ) -> PositionRecord:
         """Record a (possibly partial) sell against an open position.
 
@@ -225,7 +243,9 @@ class PortfolioStore:
         qty; a partial fill reduces ``qty`` and leaves the position OPEN so the
         next exit tick sells the remainder — otherwise the unsold tokens are
         stranded on-chain as an orphan (the orphaned-remainder bug). Realized PnL accrues
-        across partials. Raises ``ValueError`` if missing or not open.
+        across partials, net of ``fee`` (the taker fee on this sell, USDC)
+        and of the buy fee's share for the shares sold. Raises
+        ``ValueError`` if missing or not open.
 
         A residual below ``MIN_SELLABLE_QTY`` counts as fully sold: no exit
         tick can ever clear it, so leaving the row open leaves it open
@@ -246,7 +266,7 @@ class PortfolioStore:
                     action="sell",
                     price=sell_price,
                     qty=sold,
-                    fee=0.0,
+                    fee=fee,
                     position_id=pos.id,
                     news_id=None,
                     trigger=trigger,
@@ -254,7 +274,9 @@ class PortfolioStore:
                     tx_hash=tx_hash,
                 )
             )
-            pos.realized_pnl = (pos.realized_pnl or 0.0) + (sell_price - pos.avg_entry_price) * sold
+            gain = (sell_price - pos.avg_entry_price) * sold
+            gain -= fee + _buy_fee_per_share(session, pos.id) * sold
+            pos.realized_pnl = (pos.realized_pnl or 0.0) + gain
             residual = pos.qty - sold
             if residual < MIN_SELLABLE_QTY:
                 # Fully sold, or all that is left is a residue the venue has no
@@ -323,7 +345,7 @@ class PortfolioStore:
 
     def buy_cost_basis(self, position_ids: Sequence[int]) -> dict[int, float]:
         """What was actually paid to open each position — the sum of its BUY
-        fill notional, keyed by position id.
+        fill notional plus the buy fee, keyed by position id.
 
         ``PositionRow.qty`` cannot answer this: ``record_sell`` decrements it,
         so after a partial sell the row carries the *residual* while
@@ -341,7 +363,7 @@ class PortfolioStore:
             rows = session.execute(
                 select(
                     FillRow.position_id,
-                    func.sum(FillRow.price * FillRow.qty),
+                    func.sum(FillRow.price * FillRow.qty + FillRow.fee),
                 )
                 .where(FillRow.action == "buy")
                 .where(FillRow.position_id.in_(list(position_ids)))
