@@ -24,6 +24,7 @@ far back a horizon can still be measured. Clocks are UTC.
 from __future__ import annotations
 
 import json
+import statistics
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -154,6 +155,9 @@ def _summary(returns: list[float]) -> dict[str, Any]:
     return {
         "count": n,
         "mean_return": sum(returns) / n if n else None,
+        # A few long shots (a 0.04 token marked at 0.40 is +900%) dominate the
+        # mean; the median is the typical pick.
+        "median_return": statistics.median(returns) if n else None,
         "win_rate": sum(1 for r in returns if r > 0) / n if n else None,
     }
 
@@ -191,7 +195,8 @@ def shadow_report(
     """Shadow picks marked at each horizon, grouped by confidence, plus the
     real closed positions grouped by entry confidence.
 
-    Per confidence and horizon: ``count`` / ``mean_return`` / ``win_rate`` of
+    Per confidence and horizon: ``count`` / ``mean_return`` /
+    ``median_return`` / ``win_rate`` of
     the picks that could be marked, ``pending`` (horizon not reached yet) and
     ``no_data`` (no quote at decision time, or no snapshot at or after the
     horizon — e.g. pruned, or the market left the catalog). ``latest`` marks

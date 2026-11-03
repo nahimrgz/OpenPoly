@@ -303,3 +303,66 @@ def test_script_rejects_a_missing_or_unmigrated_db(tmp_path) -> None:
     engine.dispose()
     with pytest.raises(SystemExit, match="no shadow_pick table"):
         mod.main(["--db", str(old)])
+
+
+def test_report_gives_the_median_next_to_the_mean(factory) -> None:
+    """One long shot (0.04 → 0.40, +900%) drags the mean far above what the
+    typical pick did; the median shows the typical pick."""
+    store = ShadowStore(factory)
+    picks = [("a", 0.40, 0.30), ("b", 0.40, 0.30), ("c", 0.04, 0.40)]
+    with factory() as s:
+        for token, ask, mark in picks:
+            q = choose_shadow_side(
+                0.9, yes=(token, _book(token, [(ask - 0.01, 50)], [(ask, 50)])), no=("n", None)
+            )
+            store.record(
+                ts=_T0, news_id=token, market_id=token, p_model=0.9, confidence="low", quote=q
+            )
+            _snap(s, token, _T0 + 6 * _H + 30, mark)
+        s.commit()
+    rep = shadow_report(factory, now=_T0 + 7 * _H, positions=[], cost_basis={})
+    h6 = rep["shadow"]["low"]["horizons"]["6h"]
+    assert h6["mean_return"] == pytest.approx((-0.25 - 0.25 + 9.0) / 3)
+    assert h6["median_return"] == pytest.approx(-0.25)
+    assert rep["shadow"]["low"]["horizons"]["48h"]["median_return"] is None
+
+
+def test_real_positions_report_the_median(factory) -> None:
+    from types import SimpleNamespace as NS
+
+    positions = [
+        NS(id=i, status="closed", entry_confidence="low", realized_pnl=pnl)
+        for i, pnl in enumerate([-1.0, -1.0, 8.0, 0.5])
+    ]
+    rep = shadow_report(
+        factory, now=_T0, positions=positions, cost_basis={i: 10.0 for i in range(4)}
+    )
+    # Even count: the mean of the two middle returns (-0.10, +0.05).
+    assert rep["real"]["low"]["median_return"] == pytest.approx(-0.025)
+
+
+def test_script_renders_the_median() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "shadow_report.py"
+    spec = importlib.util.spec_from_file_location("shadow_report_cli", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    h = {"count": 3, "mean_return": 2.83, "median_return": -0.25, "win_rate": 1 / 3}
+    report = {
+        "horizons_hours": [6],
+        "shadow": {
+            "low": {
+                "picks": 3,
+                "horizons": {
+                    "6h": {**h, "pending": 0, "no_data": 0},
+                    "latest": {**h, "pending": 0, "no_data": 0},
+                },
+            }
+        },
+        "real": {"low": h},
+    }
+    out = mod.render(report)
+    assert out.count("median  -25.0%") == 3
