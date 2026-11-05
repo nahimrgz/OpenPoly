@@ -378,3 +378,9 @@ def test_v1_config_effort_defaults_low_and_reaches_the_request(monkeypatch) -> N
     kw = messages.calls[0]
     assert kw["output_config"] == {"effort": "low"}
     assert kw["tools"] == [SUBMIT_ANALYSIS_TOOL_V1]
+
+
+def test_sonnet_5_is_priced_from_the_console_rates() -> None:
+    from openpoly.llm.client import ModelPrice, model_price
+
+    assert model_price("claude-sonnet-5") == ModelPrice(input=2.00, output=10.00)
