@@ -48,7 +48,7 @@ from openpoly.sections._base import SectionInput, SectionOutput
 
 
 Side = Literal["yes", "no"]
-Trigger = Literal["take_profit", "stop_loss", "peak_drawdown"]
+Trigger = Literal["take_profit", "stop_loss", "peak_drawdown", "max_hold"]
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,8 @@ class MarkedPosition:
     # Consecutive prior ticks on which a thin-book hard stop was pending
     # confirmation (read by threshold_v1 only; v0 ignores it).
     thin_streak: int = 0
+    # Hours since the position opened (read by threshold_v1 only; v0 ignores it).
+    held_hours: float | None = None
 
 
 @dataclass(frozen=True)

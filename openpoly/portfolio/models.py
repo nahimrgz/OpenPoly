@@ -20,6 +20,7 @@ Status = Literal["open", "closed"]
 CloseReason = Literal[
     "take_profit",
     "stop_loss",
+    "max_hold",
     "settlement",
     "kill_switch",
     "manual",

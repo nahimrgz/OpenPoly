@@ -451,7 +451,7 @@ const ENTRY_V1: RuntimeCatalogEntry = {
 const EXIT_V1: RuntimeCatalogEntry = {
   ...EXIT_V0,
   name: 'ThresholdExitV1',
-  version: '1.0.0',
+  version: '1.1.0',
   module: 'openpoly.sections.exit.threshold_v1',
   active: true,
   param_schema: {
@@ -467,6 +467,15 @@ const EXIT_V1: RuntimeCatalogEntry = {
         default: 0.3,
         minimum: 0,
         maximum: 1,
+      },
+      max_hold_hours: {
+        type: 'number',
+        title: 'Max Hold Hours',
+        description:
+          'Close a position still open after this many hours, at the bid, even within every price threshold. 0 disables it.',
+        default: 0,
+        minimum: 0,
+        maximum: 8760,
       },
     },
   },
