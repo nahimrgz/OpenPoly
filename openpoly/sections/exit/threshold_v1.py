@@ -72,6 +72,12 @@ The trailing distance's spread floor is capped at ``pct_trail + 2 ticks``: an
 uncapped floor let one wide (or dust-inflated) spread push the trailing
 distance past any realistic retrace, disabling the lock.
 
+``max_hold_hours`` (0, off, by default) closes a position still open after that
+many hours, at the depth-guarded bid, as ``max_hold``. News alpha decays in
+hours while the first 12 paper positions held for days: 8 of them ended on a
+stop-loss. It runs only when no price rule fired, so those keep precedence, and
+never on a thin mark: age is no reason to sell into dust.
+
 v1 subclasses v0 and overrides the stop-loss test and the trailing distance;
 ``MarkedPosition`` / ``CloseIntent`` are v0's (the exit monitor type-checks
 against them), so v1 is a drop-in swap.
@@ -105,6 +111,15 @@ class ThresholdExitConfigV1(ThresholdExitConfig):
             "or dust ask."
         ),
     )
+    max_hold_hours: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=8760.0,
+        description=(
+            "Close a position still open after this many hours, at the bid, even "
+            "within every price threshold. 0 disables it."
+        ),
+    )
 
 
 # The trailing distance's spread floor may exceed the percentage trail by at
@@ -134,7 +149,7 @@ def _stop_mark(pos: MarkedPosition) -> float:
 
 class ThresholdExitV1(ThresholdExitV0):
     SECTION_TYPE = "exit"
-    SECTION_VERSION = "1.0.0"
+    SECTION_VERSION = "1.1.0"
     REQUIRES = ["market_data", "portfolio"]
     Config = ThresholdExitConfigV1
     # Run me on the raw best bid when no bid level has real size (see the
@@ -213,7 +228,25 @@ class ThresholdExitV1(ThresholdExitV0):
         out = super().run(input)
         if isinstance(pos, MarkedPosition) and pos.avg_entry_price > 0:
             out.signals["stop_return_pct"] = round(self._stop_return_pct(pos), 4)
+            if out.verdict == "skip":
+                return self._max_hold_decision(pos, out)
         return out
+
+    def _max_hold_decision(self, pos: MarkedPosition, held: SectionOutput) -> SectionOutput:
+        """``held`` (no price rule fired), or a close once the position has
+        reached ``max_hold_hours``."""
+        limit = self.config.max_hold_hours
+        if limit <= 0 or pos.held_hours is None or pos.held_hours < limit:
+            return held
+        intent = CloseIntent(
+            market_id=pos.market_id,
+            side=pos.side,
+            price=pos.current_price,
+            qty=pos.qty,
+            trigger="max_hold",
+        )
+        signals = {**held.signals, "trigger": "max_hold", "held_hours": round(pos.held_hours, 2)}
+        return SectionOutput(payload=intent, verdict="ok", reason="max_hold", signals=signals)
 
     @staticmethod
     def CONTRACT_TEST() -> None:

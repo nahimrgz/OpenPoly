@@ -47,7 +47,7 @@ _BUCKET_ROUND_DIGITS = 9
 # (see ``ReconciliationMonitor``) — so scoring it counts a trade whose result
 # is unknown as a loss, and a run of them reads as a miscalibrated model
 # rather than as missing data. Every other reason (``settlement``,
-# ``take_profit``, ``stop_loss``, ``peak_drawdown``, manual) closed at a price
+# ``take_profit``, ``stop_loss``, ``peak_drawdown``, ``max_hold``, manual) closed at a price
 # that actually happened and is counted.
 UNMEASURED_CLOSE_REASONS: frozenset[str] = frozenset({"reconciled"})
 

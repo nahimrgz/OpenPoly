@@ -675,6 +675,7 @@ class ExitMonitor(TickLoopMonitor):
             tick_size=None,
             thin=thin,
             thin_streak=_prior_thin_streak(state, stamp) if thin else 0,
+            held_hours=(time.time() - held.opened_at) / 3600.0,
         )
         out = self._exit.run(SectionInput(tick_type="hard", payload=marked))
         return _Decision(out=out, peak_price=peak_price, best_bid=best_bid, thin=thin, stamp=stamp)

@@ -50,7 +50,7 @@ def test_v1_in_default_catalog_next_to_v0() -> None:
     names = {e.name: e for e in scan() if e.type == "exit"}
     assert "ThresholdExitV0" in names
     assert "ThresholdExitV1" in names
-    assert names["ThresholdExitV1"].version == "1.0.0"
+    assert names["ThresholdExitV1"].version == "1.1.0"
 
 
 def test_exit_monitor_runs_v1_by_default() -> None:
