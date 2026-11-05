@@ -194,6 +194,7 @@ _CACHE_WRITE_MULTIPLIER = 1.25
 MODEL_PRICING: dict[tuple[str, int, int], ModelPrice] = {
     ("haiku", 4, 5): ModelPrice(input=1.00, output=5.00),
     ("haiku", 5, 5): ModelPrice(input=0.10, output=0.50),
+    ("sonnet", 5, 0): ModelPrice(input=2.00, output=10.00),
 }
 
 
