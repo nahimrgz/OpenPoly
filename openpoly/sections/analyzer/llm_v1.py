@@ -27,6 +27,12 @@ output, so v1 defaults to ``low``. The default model stays
 ``claude-haiku-4-5``; ``claude-haiku-5-5`` is a supported choice. What each
 model accepts (temperature, forced tool choice, effort) is decided by
 ``openpoly.llm.client.model_capabilities``.
+
+``p_yes`` is an absolute level, and the model never sees the price, so the
+level alone cannot say which way the news moved the odds. v1 therefore also
+asks for ``news_direction`` (``raises_yes`` / ``lowers_yes`` / ``unclear``),
+placed before ``p_yes`` in the schema, and carries it on ``AnalysisResult``;
+entry v1's ``require_news_direction`` uses it. An invalid value becomes None.
 """
 
 from __future__ import annotations
@@ -118,6 +124,11 @@ comes first and must be written before you decide any number.
   selected_index — the 1-based index of the ONE market the news materially
                    moves, or 0 if none. Abstaining is expected; do not force
                    a pick.
+  news_direction — which way THIS news pushes the odds of YES compared with
+                   before it: raises_yes, lowers_yes, or unclear. Judge the
+                   push, not the level: a market can stay unlikely and still
+                   be raised by the news. Use unclear when the news cuts both
+                   ways or no market is selected.
   p_yes          — YOUR probability (0-1) that the selected market resolves
                    YES, in light of the news and your reasoning.
   confidence     — HIGH only with primary-source confirmation; LOW for stale
@@ -153,6 +164,11 @@ SUBMIT_ANALYSIS_TOOL_V1: ToolDefinition = {
                 "type": "integer",
                 "description": "1-based index of the moved market, or 0 if none.",
             },
+            "news_direction": {
+                "type": "string",
+                "enum": ["raises_yes", "lowers_yes", "unclear"],
+                "description": "Which way this news pushes the odds of YES.",
+            },
             "p_yes": {
                 "type": "number",
                 "description": "Probability (0-1) the selected market resolves YES.",
@@ -166,7 +182,14 @@ SUBMIT_ANALYSIS_TOOL_V1: ToolDefinition = {
                 "description": "One or two sentences.",
             },
         },
-        "required": ["reasoning", "selected_index", "p_yes", "confidence", "rationale"],
+        "required": [
+            "reasoning",
+            "selected_index",
+            "news_direction",
+            "p_yes",
+            "confidence",
+            "rationale",
+        ],
     },
 }
 
@@ -176,7 +199,7 @@ class LLMAnalyzerV1(LLMAnalyzerV0):
     the prompt, tool schema and ``run`` are v1's own."""
 
     SECTION_TYPE = "analyzer"
-    SECTION_VERSION = "1.1.0"
+    SECTION_VERSION = "1.2.0"
     REQUIRES = ["llm", "market_data"]
     Config = LLMAnalyzerConfigV1
 

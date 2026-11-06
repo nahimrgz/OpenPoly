@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 Confidence = Literal["low", "medium", "high"]
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+NewsDirection = Literal["raises_yes", "lowers_yes", "unclear"]
+_NEWS_DIRECTIONS = ("raises_yes", "lowers_yes", "unclear")
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class AnalysisResult:
     p_model: float
     confidence: Confidence
     rationale: str = ""
+    # Which way the news pushes YES. None: the analyzer did not report one.
+    news_direction: NewsDirection | None = None
 
 
 class LLMAnalyzerConfig(BaseModel):
@@ -293,11 +297,14 @@ def _interpret(
         )
 
     market = cands[idx - 1].market
+    direction = result.get("news_direction")
+    news_direction = direction if direction in _NEWS_DIRECTIONS else None
     ar = AnalysisResult(
         market_id=market.market_id,
         p_model=float(p_yes),
         confidence=confidence,  # type: ignore[arg-type]
         rationale=str(result.get("rationale", "")),
+        news_direction=news_direction,
     )
     return SectionOutput(
         payload=ar,
@@ -307,6 +314,7 @@ def _interpret(
             "news_id": candidates.news.id,
             "selected_index": idx,
             "confidence": confidence,
+            "news_direction": news_direction,
             "candidate_count": len(cands),
         },
     )
