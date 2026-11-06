@@ -176,6 +176,20 @@ def _m006_shadow_pick_table(conn: Connection) -> None:
     ShadowPickRow.__table__.create(conn, checkfirst=True)  # type: ignore[attr-defined]
 
 
+def _m007_entry_rationale_and_fee_columns(conn: Connection) -> None:
+    """Analyzer rationale and news direction, frozen on the position, and the
+    taker fee rate of each shadow pick."""
+    _add_missing_columns(
+        conn,
+        "position",
+        (
+            ("entry_rationale", "VARCHAR"),
+            ("entry_news_direction", "VARCHAR"),
+        ),
+    )
+    _add_missing_columns(conn, "shadow_pick", (("taker_fee_rate", "FLOAT"),))
+
+
 # Ordered, append-only. Never renumber or reuse a version: the number recorded
 # in a deployed database is the only thing that says what has run there.
 MIGRATIONS: list[tuple[int, Migration]] = [
@@ -185,6 +199,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (4, _m004_order_book_recorded_at_index),
     (5, _m005_llm_usage_table),
     (6, _m006_shadow_pick_table),
+    (7, _m007_entry_rationale_and_fee_columns),
 ]
 
 LATEST_VERSION: int = MIGRATIONS[-1][0]

@@ -75,7 +75,7 @@ def render(report: dict[str, Any]) -> str:
             win = "  —" if h["win_rate"] is None else f"{h['win_rate'] * 100:3.0f}%"
             lines.append(
                 f"    {k:>6}  n={h['count']:<4} mean {_pct(h['mean_return'])}  "
-                f"median {_pct(h.get('median_return'))}  "
+                f"median {_pct(h['median_return'])}  "
                 f"win {win}  pending {h['pending']}  no data {h['no_data']}"
             )
     lines.append("Real closed positions by entry confidence (realized / cost)")
@@ -85,7 +85,7 @@ def render(report: dict[str, Any]) -> str:
         win = "  —" if r["win_rate"] is None else f"{r['win_rate'] * 100:3.0f}%"
         lines.append(
             f"  {conf:>8}  n={r['count']:<4} mean {_pct(r['mean_return'])}  "
-            f"median {_pct(r.get('median_return'))}  win {win}"
+            f"median {_pct(r['median_return'])}  win {win}"
         )
     return "\n".join(lines)
 

@@ -23,6 +23,8 @@ class ExecResult:
     qty: float | None = None
     position_id: int | None = None
     resting_order_id: str | None = None
+    # Taker fee (USDC) booked on this fill.
+    fee: float = 0.0
 
     @classmethod
     def skip(cls, reason: str, *, resting_order_id: str | None = None) -> "ExecResult":
@@ -36,6 +38,7 @@ class ExecResult:
         qty: float,
         position_id: int,
         resting_order_id: str | None = None,
+        fee: float = 0.0,
     ) -> "ExecResult":
         return cls(
             filled=True,
@@ -43,4 +46,5 @@ class ExecResult:
             qty=qty,
             position_id=position_id,
             resting_order_id=resting_order_id,
+            fee=fee,
         )

@@ -33,13 +33,14 @@ def first_level_with_size(
     return None
 
 
-def taker_fee_per_share(rate: float, price: float) -> float:
+def taker_fee_per_share(rate: float | None, price: float) -> float:
     """USDC fee a taker pays per share traded at ``price``.
 
     Polymarket charges ``shares × rate × p × (1 − p)``
     (docs.polymarket.com/trading/fees): symmetric around 0.50, where it
-    peaks. Makers pay nothing; ``rate`` is the market's ``taker_fee_rate``."""
-    return rate * price * (1.0 - price)
+    peaks. Makers pay nothing; ``rate`` is the market's ``taker_fee_rate``,
+    and an unknown rate (None) charges nothing."""
+    return (rate or 0.0) * price * (1.0 - price)
 
 
 def sweep(levels: list[tuple[float, float]], qty: float) -> tuple[float, float]:

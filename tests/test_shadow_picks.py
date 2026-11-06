@@ -90,9 +90,9 @@ def test_migration_6_creates_the_table_on_an_existing_db(tmp_path) -> None:
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE shadow_pick"))
         conn.execute(text("UPDATE schema_version SET version = 5"))
-    assert run_migrations(engine) == LATEST_VERSION == 6
+    assert run_migrations(engine) == LATEST_VERSION
     assert "shadow_pick" in inspect(engine).get_table_names()
-    assert run_migrations(engine) == 6  # re-run is a no-op
+    assert run_migrations(engine) == LATEST_VERSION  # re-run is a no-op
     engine.dispose()
 
 

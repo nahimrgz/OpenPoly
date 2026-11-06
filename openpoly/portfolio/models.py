@@ -67,8 +67,9 @@ class PositionRecord:
     """Full position projection (open + closed) — for the read API.
 
     ``realized_pnl`` is a materialized derived value: it equals
-    ``(sell_price - avg_entry_price) * qty`` from the two fills and is
-    recomputable from the ledger, not an authoritative mutable field.
+    ``(sell_price - avg_entry_price) * qty`` minus the taker fees on those
+    shares, from the fills, and is recomputable from the ledger, not an
+    authoritative mutable field.
 
     ``entry_*`` are the entry decision's own inputs, frozen at open time: the
     analyzer's ``p_model`` and ``confidence`` and the entry section's ``edge``
@@ -93,3 +94,5 @@ class PositionRecord:
     entry_p_model: float | None = None
     entry_confidence: str | None = None
     entry_edge: float | None = None
+    entry_rationale: str | None = None
+    entry_news_direction: str | None = None

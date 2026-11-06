@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 Confidence = Literal["low", "medium", "high"]
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 NewsDirection = Literal["raises_yes", "lowers_yes", "unclear"]
-_NEWS_DIRECTIONS = ("raises_yes", "lowers_yes", "unclear")
+_NEWS_DIRECTIONS: tuple[str, ...] = get_args(NewsDirection)
 
 
 @dataclass(frozen=True)

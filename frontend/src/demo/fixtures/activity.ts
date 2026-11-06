@@ -115,6 +115,7 @@ const positions: PositionRecord[] = [
     closed_at: NOW - 6 * HOUR,
     close_reason: 'take_profit',
     realized_pnl: 9.5,
+    exit_price: 0.968,
     market_question: 'Will headline CPI come in below consensus?',
     analyzer_decisions: analyzerDecisionsFor(
       0.71,
@@ -136,6 +137,7 @@ const positions: PositionRecord[] = [
     closed_at: NOW - 18 * HOUR,
     close_reason: 'stop_loss',
     realized_pnl: -2.3,
+    exit_price: 0.396,
     market_question: 'Will nonfarm payrolls beat expectations?',
     analyzer_decisions: analyzerDecisionsFor(
       0.4,

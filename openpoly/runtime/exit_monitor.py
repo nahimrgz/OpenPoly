@@ -757,6 +757,18 @@ class ExitMonitor(TickLoopMonitor):
             )
         return confirmed
 
+    def _realized(self, held: HeldPosition, price: float, qty: float, fee: float) -> float:
+        """This leg's PnL as the store booked it, net of fees. The sell already
+        happened, so a failed read degrades the log line to the gross PnL and
+        never skips the bookkeeping after it."""
+        try:
+            return self._portfolio.realized_gain(  # type: ignore[union-attr]
+                held.position_id, price, qty, fee
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("exit monitor: net PnL unavailable for %d", held.position_id)
+            return (price - held.avg_entry_price) * qty
+
     def _still_open(self, position_id: int) -> bool:
         """Fresh read of one position's status — synchronous by design, so the
         caller can claim the position without yielding the loop in between."""
@@ -813,7 +825,7 @@ class ExitMonitor(TickLoopMonitor):
             # sellable. Realizing against ``held.qty`` therefore booked the
             # gain on shares that were never sold.
             sold_qty = result.qty if result.qty is not None else held.qty
-            realized = (result.price - held.avg_entry_price) * sold_qty
+            realized = self._realized(held, result.price, sold_qty, result.fee)
             # "Still open" is the authoritative test for a partial, not
             # ``sold_qty < held.qty``: a sell leaving a sub-0.01 residue is a
             # *full* close (see ``PortfolioStore.record_sell``), and treating

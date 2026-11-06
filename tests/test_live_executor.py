@@ -1343,6 +1343,8 @@ def test_live_buy_persists_the_entry_signals_from_the_intent(store) -> None:
         p_model=0.61,
         confidence="medium",
         edge=0.11,
+        rationale="Filing confirms it.",
+        news_direction="raises_yes",
     )
     le = LiveExecutor(portfolio=store, clob_client=clob)
     r = le.execute_buy(intent, news_id="n1", ts=100.0)
@@ -1352,6 +1354,8 @@ def test_live_buy_persists_the_entry_signals_from_the_intent(store) -> None:
     assert rec.entry_p_model == 0.61
     assert rec.entry_confidence == "medium"
     assert rec.entry_edge == 0.11
+    assert rec.entry_rationale == "Filing confirms it."
+    assert rec.entry_news_direction == "raises_yes"
 
 
 def test_buy_refuses_when_the_ctf_balance_is_unparseable(store) -> None:

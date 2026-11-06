@@ -83,9 +83,9 @@ export function AnalyzerRationaleBlock({
       <div className="rounded border border-neutral-800/70 bg-neutral-950 p-3 text-[11px] text-neutral-500 leading-relaxed">
         <div className="text-neutral-400 mb-0.5">Analyzer rationale</div>
         <div>
-          Unavailable — the LLM call that opened this position has been evicted
-          from the in-memory analyzer log (retains only the most recent ~200
-          analyzer calls; persist-to-DB is a planned follow-up).
+          Unavailable — this position has no stored rationale, and its LLM call
+          is no longer in the in-memory analyzer log, which a restart clears
+          and which keeps only the most recent ~200 calls.
         </div>
       </div>
     )

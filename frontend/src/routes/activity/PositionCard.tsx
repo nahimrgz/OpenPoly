@@ -9,7 +9,7 @@
  * ("Show N earlier attempts", per-group expand toggles) — nesting
  * buttons inside an anchor is invalid HTML and would intercept clicks.
  *
- * SELL block math: exit_price = avg_entry_price + realized_pnl / qty.
+ * SELL block: exit_price is the volume-weighted price of the sell fills.
  * Same formula PositionDetail uses (single source of truth lives there;
  * we mirror it here so the card is self-contained).
  */
@@ -56,10 +56,7 @@ function StatusBadge({
 }
 
 export function PositionCard({ p }: { p: PositionRecord }) {
-  const exitPrice =
-    p.closed_at !== null && p.realized_pnl !== null
-      ? p.avg_entry_price + p.realized_pnl / p.qty
-      : null
+  const exitPrice = p.exit_price ?? null
   const cost = p.qty * p.avg_entry_price
   const sideTone = p.side === 'yes' ? 'text-emerald-300' : 'text-sky-300'
 

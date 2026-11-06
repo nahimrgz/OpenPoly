@@ -31,6 +31,7 @@ export type PositionRecord = {
   // for tolerance — older test fixtures or partial mocks may omit them.
   market_question?: string | null
   analyzer_decisions?: AnalyzerDecision[]
+  exit_price?: number | null
 }
 
 export type Fill = {

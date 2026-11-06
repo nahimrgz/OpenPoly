@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from openpoly.db.tables import OrderBookSnapshot, PositionRow
+from openpoly.db.tables import FillRow, OrderBookSnapshot, PositionRow
 
 # Budget for snapshot-derived points in the curve (events are added on top),
 # shared evenly across positions. Each position keeps at least one point, so the
@@ -81,6 +81,15 @@ def build_equity_curve(session_factory: sessionmaker[Session]) -> EquityCurve:
         if not positions:
             return EquityCurve((), 0.0, 0.0, 0.0, 0)
 
+        # Buy fee per share: already paid, so it counts against an open
+        # position; realized PnL charges it once the shares are disposed of.
+        buy_fees = session.execute(
+            select(FillRow.position_id, func.sum(FillRow.fee) / func.sum(FillRow.qty))
+            .where(FillRow.action == "buy")
+            .group_by(FillRow.position_id)
+        ).all()
+        fee_per_share = {pid: float(fee or 0.0) for pid, fee in buy_fees}
+
         # Per-token level-1 bid series as parallel (timestamps, bids) lists,
         # ascending by recorded_at. Empty books yield NULL and are dropped.
         best_bid = func.json_extract(OrderBookSnapshot.bids_json, "$[0][0]")
@@ -119,7 +128,8 @@ def build_equity_curve(session_factory: sessionmaker[Session]) -> EquityCurve:
                 mark = _mark_at(marks.get(p.token_id, ([], [])), t)
                 if mark is None:
                     mark = p.avg_entry_price
-                unrealized += (mark - p.avg_entry_price) * p.qty
+                paid = fee_per_share.get(p.id, 0.0)
+                unrealized += (mark - p.avg_entry_price - paid) * p.qty
         points.append(
             EquityPoint(
                 ts=t, equity=realized + unrealized, realized=realized, unrealized=unrealized

@@ -887,6 +887,14 @@ async def test_closing_flag_is_cleared_when_the_sell_raises(tmp_path) -> None:
     assert not is_closing(held.position_id)
 
 
+async def _until_closing(position_id: int, timeout: float = 5.0) -> None:
+    """Wait for the tick to enter the sell. A fixed sleep loses this race when
+    the full suite keeps the event loop busy."""
+    async with asyncio.timeout(timeout):
+        while not is_closing(position_id):
+            await asyncio.sleep(0.005)
+
+
 async def test_reconciliation_does_not_close_a_position_being_sold(tmp_path) -> None:
     # The race this prevents: the exit monitor yields the loop inside
     # to_thread, reconciliation sees the (empty) on-chain holdings, closes the
@@ -907,7 +915,7 @@ async def test_reconciliation_does_not_close_a_position_being_sold(tmp_path) -> 
     rm.configure(pf)
 
     tick = asyncio.create_task(m._tick_once())
-    await asyncio.sleep(0.05)
+    await _until_closing(held.position_id)
     await rm._tick_once()
     record = pf.get_position(held.position_id)
     assert record is not None
@@ -928,8 +936,7 @@ async def test_stop_waits_for_an_in_flight_sell_to_record_its_close() -> None:
     )
     m.configure(_FakePortfolio([_held(1, "t1", avg=0.40)]))  # type: ignore[arg-type]
     await m.start()
-    await asyncio.sleep(0.05)  # the tick is inside the sell
-    assert is_closing(1)
+    await _until_closing(1)  # the tick is inside the sell
 
     await m.stop()
     assert m.state == "stopped"

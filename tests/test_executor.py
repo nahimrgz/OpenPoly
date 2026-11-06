@@ -224,6 +224,8 @@ def test_buy_persists_the_entry_signals_from_the_intent(store) -> None:
         p_model=0.68,
         confidence="high",
         edge=0.26,
+        rationale="Filing confirms it.",
+        news_direction="raises_yes",
     )
     r = Executor(store).execute_buy(intent, news_id="n1", ts=1.0)
     assert r.filled
@@ -232,6 +234,8 @@ def test_buy_persists_the_entry_signals_from_the_intent(store) -> None:
     assert rec.entry_p_model == 0.68
     assert rec.entry_confidence == "high"
     assert rec.entry_edge == 0.26
+    assert rec.entry_rationale == "Filing confirms it."
+    assert rec.entry_news_direction == "raises_yes"
 
 
 def test_buy_without_signals_leaves_them_null(store) -> None:
