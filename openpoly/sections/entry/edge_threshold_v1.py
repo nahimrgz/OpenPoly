@@ -34,6 +34,12 @@ meaning. v1 changes:
   ranking and ``min_edge`` use ``fair − ask − fee(ask)``. On a zero-fee market
   this is the gross edge. A market whose fee rate is unknown is not priced
   (``unknown taker fee``): an edge that cannot be netted is not an edge.
+* **``require_news_direction``** (off by default) — the analyzer does not see
+  the price, so a low ``p_model`` can put the edge on NO right after news that
+  made YES more likely. That bets the model's prior against the market, not
+  the news. With the gate on, the side chosen by edge must be the side the
+  news pushes; otherwise the entry is skipped, not swapped. A missing or
+  ``unclear`` direction is skipped too.
 
 The section itself does no IO for book freshness: the orchestrator refreshes
 stale books *before* calling ``run()`` (``PipelineOrchestrator.
@@ -75,6 +81,9 @@ from openpoly.sections.entry.edge_threshold_v0 import (
 
 __all__ = ["EdgeThresholdConfigV1", "EdgeThresholdEntryV1", "FreshBooks", "OrderIntent"]
 
+# The side each news direction pushes.
+_NEWS_SIDE: dict[str, Side] = {"raises_yes": "yes", "lowers_yes": "no"}
+
 
 class EdgeThresholdConfigV1(EdgeThresholdConfig):
     same_market_cooldown_minutes: int = Field(
@@ -109,11 +118,20 @@ class EdgeThresholdConfigV1(EdgeThresholdConfig):
             "both spreads as a loss."
         ),
     )
+    require_news_direction: bool = Field(
+        default=False,
+        description=(
+            "Skip the entry unless the side chosen by edge is the side the "
+            "news pushes, as reported by the analyzer's news_direction. A "
+            "missing or unclear direction is skipped too, so this needs an "
+            "analyzer that reports it (LLMAnalyzerV1 1.2.0+)."
+        ),
+    )
 
 
 class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
     SECTION_TYPE = "entry"
-    SECTION_VERSION = "1.1.0"
+    SECTION_VERSION = "1.2.0"
     REQUIRES = ["order_book", "market_data"]
     Config = EdgeThresholdConfigV1
     # The orchestrator passes ``FreshBooks`` (see the module docstring).
@@ -180,6 +198,23 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
         signals: dict[str, object] = {"side": chosen, "taker_fee_rate": market.taker_fee_rate}
         for side, edge in edges.items():
             signals[f"edge_{side}"] = round(edge, 4)
+        if self.config.require_news_direction:
+            signals["news_direction"] = res.news_direction
+            news_side = _NEWS_SIDE.get(res.news_direction or "")
+            if news_side is None:
+                return SectionOutput(
+                    payload=None,
+                    verdict="skip",
+                    reason="unclear news direction",
+                    signals=signals,
+                )
+            if chosen != news_side:
+                return SectionOutput(
+                    payload=None,
+                    verdict="skip",
+                    reason="against news direction",
+                    signals=signals,
+                )
         return chosen, signals, quotes[chosen]
 
     def _read_quote(self, res: AnalysisResult, side: Side) -> Quote | SectionOutput:

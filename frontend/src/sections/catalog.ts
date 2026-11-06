@@ -377,7 +377,7 @@ const ANALYZER_V0_PROPS = ANALYZER_V0.param_schema.properties as Record<string, 
 const ANALYZER_V1: RuntimeCatalogEntry = {
   ...ANALYZER_V0,
   name: 'LLMAnalyzerV1',
-  version: '1.1.0',
+  version: '1.2.0',
   module: 'openpoly.sections.analyzer.llm_v1',
   active: true,
   param_schema: {
@@ -416,7 +416,7 @@ export const ENTRY_V1_COOLDOWN_MINUTES = 60
 const ENTRY_V1: RuntimeCatalogEntry = {
   ...ENTRY_V0,
   name: 'EdgeThresholdEntryV1',
-  version: '1.1.0',
+  version: '1.2.0',
   module: 'openpoly.sections.entry.edge_threshold_v1',
   active: true,
   param_schema: {
@@ -443,6 +443,13 @@ const ENTRY_V1: RuntimeCatalogEntry = {
         description:
           'Skip the entry if a position on the OTHER side of the same market is currently open.',
         default: true,
+      },
+      require_news_direction: {
+        type: 'boolean',
+        title: 'Require News Direction',
+        description:
+          "Skip the entry unless the side chosen by edge is the side the news pushes, as reported by the analyzer's news_direction. A missing or unclear direction is skipped too, so this needs an analyzer that reports it (LLMAnalyzerV1 1.2.0+).",
+        default: false,
       },
     },
   },

@@ -54,7 +54,7 @@ def test_v1_in_default_catalog_next_to_v0() -> None:
     names = {e.name: e for e in scan() if e.type == "analyzer"}
     assert "LLMAnalyzerV0" in names
     assert "LLMAnalyzerV1" in names
-    assert names["LLMAnalyzerV1"].version == "1.1.0"
+    assert names["LLMAnalyzerV1"].version == "1.2.0"
 
 
 def test_reasoning_is_the_first_required_tool_property() -> None:
