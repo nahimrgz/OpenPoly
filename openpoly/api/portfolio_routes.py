@@ -25,7 +25,7 @@ from openpoly.analytics.calibration import calibration_summary
 from openpoly.analytics.shadow import shadow_report
 from openpoly.db.engine import get_session_factory
 from openpoly.execution import executor
-from openpoly.portfolio import PortfolioStore
+from openpoly.portfolio import PortfolioStore, PositionRecord
 from openpoly.portfolio.equity import build_equity_curve
 from openpoly.runtime.closing_registry import clear_closing, is_closing, mark_closing
 
@@ -65,12 +65,14 @@ def list_positions(
     without fanning out to /positions/{id} per row.
     """
     rows = store.list_positions(_clamp(limit))
+    exit_prices = store.exit_prices([r.id for r in rows])
     positions: list[dict[str, Any]] = []
     for record in rows:
         body = asdict(record)
+        body["exit_price"] = exit_prices.get(record.id)
         body["market_question"] = _lookup_market_question(record.condition_id)
         news_id = store.news_id_for_position(record.id)
-        body["analyzer_decisions"] = _lookup_analyzer_decisions(news_id)
+        body["analyzer_decisions"] = _position_decisions(record, news_id)
         positions.append(body)
     return {"positions": positions}
 
@@ -265,19 +267,21 @@ def get_position_by_id(
       falls back to displaying the condition_id.
     - ``analyzer_decisions``: list (newest-first) of every ``verdict=ok``
       analyzer call whose ``news_id`` matches this position's news_id.
-      Each element carries rationale / p_model / confidence / ts. Empty
-      list when the analyzer_log ring has evicted the original call
-      (common for positions older than ~200 news events).
+      Each element carries rationale / p_model / confidence / ts. When the
+      ring no longer holds the call (a restart, or more than ~200 calls
+      since), it is the rationale stored on the position; empty when the
+      position has none.
     """
     record = store.get_position(position_id)
     if record is None:
         raise HTTPException(status_code=404, detail="position not found")
     body = asdict(record)
+    body["exit_price"] = store.exit_prices([position_id]).get(position_id)
     body["market_question"] = _lookup_market_question(record.condition_id)
     # PositionRecord doesn't carry news_id (it lives on the BUY fill row).
     # Look it up via the store + then scan analyzer_log.
     news_id = store.news_id_for_position(position_id)
-    body["analyzer_decisions"] = _lookup_analyzer_decisions(news_id)
+    body["analyzer_decisions"] = _position_decisions(record, news_id)
     return body
 
 
@@ -290,6 +294,21 @@ def _lookup_market_question(condition_id: str) -> str | None:
 
     market = market_source_manager.store.get_by_condition(condition_id)
     return market.question if market is not None else None
+
+
+def _position_decisions(record: PositionRecord, news_id: str | None) -> list[dict[str, Any]]:
+    """The ring's calls for this position, else the rationale stored on it."""
+    decisions = _lookup_analyzer_decisions(news_id)
+    if decisions or record.entry_rationale is None:
+        return decisions
+    return [
+        {
+            "rationale": record.entry_rationale,
+            "p_model": record.entry_p_model,
+            "confidence": record.entry_confidence,
+            "ts": record.opened_at,
+        }
+    ]
 
 
 def _lookup_analyzer_decisions(news_id: str | None) -> list[dict[str, Any]]:

@@ -38,7 +38,7 @@ entry v1's ``require_news_direction`` uses it. An invalid value becomes None.
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from pydantic import Field
 
@@ -50,6 +50,7 @@ from openpoly.sections.analyzer.llm_v0 import (
     AnalysisResult,
     LLMAnalyzerConfig,
     LLMAnalyzerV0,
+    NewsDirection,
     _build_system,
     _build_user,
     _interpret,
@@ -166,7 +167,7 @@ SUBMIT_ANALYSIS_TOOL_V1: ToolDefinition = {
             },
             "news_direction": {
                 "type": "string",
-                "enum": ["raises_yes", "lowers_yes", "unclear"],
+                "enum": list(get_args(NewsDirection)),
                 "description": "Which way this news pushes the odds of YES.",
             },
             "p_yes": {

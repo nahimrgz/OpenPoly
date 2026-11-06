@@ -67,6 +67,8 @@ def _to_record(row: PositionRow) -> PositionRecord:
         entry_p_model=row.entry_p_model,
         entry_confidence=row.entry_confidence,
         entry_edge=row.entry_edge,
+        entry_rationale=row.entry_rationale,
+        entry_news_direction=row.entry_news_direction,
     )
 
 
@@ -99,6 +101,15 @@ def _buy_fee_per_share(session: Session, position_id: int) -> float:
     return float(fee) / float(qty) if fee and qty else 0.0
 
 
+def _realized_gain(
+    session: Session, pos: PositionRow, price: float, qty: float, fee: float = 0.0
+) -> float:
+    """PnL of disposing of ``qty`` shares at ``price``, net of ``fee`` on the
+    disposal and of the buy fee on those shares."""
+    gross = (price - pos.avg_entry_price) * qty
+    return gross - fee - _buy_fee_per_share(session, pos.id) * qty
+
+
 class PortfolioStore:
     """Repository over ``fill`` + ``position``. Construct with a session
     factory; every method opens its own short transaction."""
@@ -122,6 +133,8 @@ class PortfolioStore:
         entry_p_model: float | None = None,
         entry_confidence: str | None = None,
         entry_edge: float | None = None,
+        entry_rationale: str | None = None,
+        entry_news_direction: str | None = None,
         fee: float = 0.0,
     ) -> HeldPosition:
         """Open a position: insert the position-projection row + its buy fill in
@@ -130,8 +143,10 @@ class PortfolioStore:
 
         ``entry_p_model`` / ``entry_confidence`` / ``entry_edge`` are the entry
         decision's own inputs, stored on the position so the outcome can later
-        be joined to the belief (calibration). They default to None: a manual
-        or reconciled open has no entry decision behind it.
+        be joined to the belief (calibration). ``entry_rationale`` /
+        ``entry_news_direction`` keep the analyzer's reason, which the
+        in-memory log loses on restart. They default to None: a manual or
+        reconciled open has no entry decision behind it.
 
         ``fee`` is the taker fee paid on the buy (USDC). It stays on the fill;
         realized PnL charges it pro rata as the shares are disposed of.
@@ -152,6 +167,8 @@ class PortfolioStore:
                 entry_p_model=entry_p_model,
                 entry_confidence=entry_confidence,
                 entry_edge=entry_edge,
+                entry_rationale=entry_rationale,
+                entry_news_direction=entry_news_direction,
             )
             session.add(pos)
             session.flush()  # populate pos.id for the fill's position_id
@@ -196,9 +213,7 @@ class PortfolioStore:
                 raise ValueError(f"position {position_id} not found")
             if pos.status != "open":
                 raise ValueError(f"position {position_id} is {pos.status}, not open")
-            realized = (sell_price - pos.avg_entry_price) * pos.qty - _buy_fee_per_share(
-                session, pos.id
-            ) * pos.qty
+            realized = _realized_gain(session, pos, sell_price, pos.qty)
             session.add(
                 FillRow(
                     ts=ts,
@@ -274,8 +289,7 @@ class PortfolioStore:
                     tx_hash=tx_hash,
                 )
             )
-            gain = (sell_price - pos.avg_entry_price) * sold
-            gain -= fee + _buy_fee_per_share(session, pos.id) * sold
+            gain = _realized_gain(session, pos, sell_price, sold, fee)
             pos.realized_pnl = (pos.realized_pnl or 0.0) + gain
             residual = pos.qty - sold
             if residual < MIN_SELLABLE_QTY:
@@ -294,6 +308,15 @@ class PortfolioStore:
                 pos.qty = residual
             session.commit()
             return _to_record(pos)
+
+    def realized_gain(self, position_id: int, price: float, qty: float, fee: float = 0.0) -> float:
+        """PnL of disposing of ``qty`` shares of this position at ``price``:
+        the amount ``record_sell`` / ``close_position`` book for that leg."""
+        with self._session_factory() as session:
+            pos = session.get(PositionRow, position_id)
+            if pos is None:
+                raise ValueError(f"position {position_id} not found")
+            return _realized_gain(session, pos, price, qty, fee)
 
     def get_open_position(self, market_id: str, side: Side) -> HeldPosition | None:
         """The open position for (market_id, side), or None."""
@@ -342,6 +365,24 @@ class PortfolioStore:
                 .all()
             )
             return [_to_fill(r) for r in rows]
+
+    def exit_prices(self, position_ids: Sequence[int]) -> dict[int, float]:
+        """The volume-weighted price of each position's SELL fills, keyed by
+        position id. Positions with no sell are absent from the mapping."""
+        if not position_ids:
+            return {}
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    FillRow.position_id,
+                    func.sum(FillRow.price * FillRow.qty),
+                    func.sum(FillRow.qty),
+                )
+                .where(FillRow.action == "sell")
+                .where(FillRow.position_id.in_(position_ids))
+                .group_by(FillRow.position_id)
+            ).all()
+        return {int(pid): float(n) / float(q) for pid, n, q in rows if pid is not None and q}
 
     def buy_cost_basis(self, position_ids: Sequence[int]) -> dict[int, float]:
         """What was actually paid to open each position — the sum of its BUY

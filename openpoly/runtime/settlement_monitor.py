@@ -213,7 +213,9 @@ class SettlementMonitor(TickLoopMonitor):
                     error=f"close_failed: {type(exc).__name__}: {str(exc)[:160]}",
                 )
                 continue
-            realized = (final_price - held.avg_entry_price) * held.qty
+            realized = self._portfolio.realized_gain(  # type: ignore[union-attr]
+                held.position_id, final_price, held.qty
+            )
             self._log(
                 held,
                 ts,

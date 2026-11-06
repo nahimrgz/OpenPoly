@@ -66,10 +66,7 @@ export function PositionDetail() {
 
   const p = data.position
   const snapshots = data.history?.snapshots ?? []
-  const exitPrice =
-    p.closed_at !== null && p.realized_pnl !== null
-      ? p.avg_entry_price + p.realized_pnl / p.qty
-      : null
+  const exitPrice = p.exit_price ?? null
 
   return (
     <div className="px-6 pb-6 flex flex-col gap-4">

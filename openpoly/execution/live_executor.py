@@ -1113,6 +1113,8 @@ class LiveExecutor:
                     entry_p_model=intent.p_model,
                     entry_confidence=intent.confidence,
                     entry_edge=intent.edge,
+                    entry_rationale=intent.rationale,
+                    entry_news_direction=intent.news_direction,
                 ),
                 what=f"open_position {intent.market_id} {intent.side}",
             )

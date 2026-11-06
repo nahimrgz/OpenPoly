@@ -14,9 +14,11 @@ discards losers or winners. This module keeps that record:
   the real closed positions grouped by their entry confidence. It backs
   ``GET /api/analytics/shadow`` and ``scripts/shadow_report.py``.
 
-The return of a pick at a horizon is ``(bid − ask) / ask``: buy at the ask the
-entry would have paid, mark at the depth-guarded bid of the first snapshot
-taken at or after the horizon. It is a mark-to-market, not a settled outcome.
+The return of a pick at a horizon buys at the ask the entry would have paid and
+marks at the depth-guarded bid of the first snapshot taken at or after the
+horizon, net of the taker fee both ways, like the real positions next to it
+(picks stored without a fee rate stay gross). It is a mark-to-market, not a
+settled outcome.
 Snapshot retention (``order_book_retention_days``, 7 by default) bounds how
 far back a horizon can still be measured. Clocks are UTC.
 """
@@ -50,6 +52,7 @@ class ShadowQuote:
     ask: float | None = None
     bid: float | None = None
     edge: float | None = None
+    fee_rate: float | None = None
 
 
 def choose_shadow_side(
@@ -57,7 +60,7 @@ def choose_shadow_side(
     *,
     yes: tuple[str | None, OrderBook | None],
     no: tuple[str | None, OrderBook | None],
-    fee_rate: float = 0.0,
+    fee_rate: float | None = 0.0,
 ) -> ShadowQuote:
     """The side with the larger edge, mirroring entry v1's side choice.
 
@@ -79,7 +82,9 @@ def choose_shadow_side(
             continue
         edge = fair - ask - taker_fee_per_share(fee_rate, ask)
         if best is None or best.edge is None or edge > best.edge:
-            best = ShadowQuote(side=side, token_id=token, ask=ask, bid=bid, edge=edge)
+            best = ShadowQuote(
+                side=side, token_id=token, ask=ask, bid=bid, edge=edge, fee_rate=fee_rate
+            )
     return best or ShadowQuote()
 
 
@@ -118,6 +123,7 @@ class ShadowStore:
             ask=q.ask,
             bid=q.bid,
             edge=q.edge,
+            taker_fee_rate=q.fee_rate,
         )
         with self._factory() as session:
             session.add(row)
@@ -148,6 +154,13 @@ def _bid_of(bids_json: str) -> float | None:
     except (ValueError, TypeError):
         return None
     return first_level_with_size(levels)
+
+
+def _net_return(ask: float, mark: float, rate: float | None) -> float:
+    """Return of buying at ``ask`` and selling at ``mark``, both as a taker."""
+    cost = ask + taker_fee_per_share(rate, ask)
+    proceeds = mark - taker_fee_per_share(rate, mark)
+    return (proceeds - cost) / cost
 
 
 def _summary(returns: list[float]) -> dict[str, Any]:
@@ -232,12 +245,12 @@ def shadow_report(
                 if mark is None:
                     g["_n"][k] += 1
                 else:
-                    g["_r"][k].append((mark - pick.ask) / pick.ask)
+                    g["_r"][k].append(_net_return(pick.ask, mark, pick.taker_fee_rate))
             latest = _latest_mark(session, pick.token_id, pick.ts)
             if latest is None:
                 g["_n"]["latest"] += 1
             else:
-                g["_r"]["latest"].append((latest - pick.ask) / pick.ask)
+                g["_r"]["latest"].append(_net_return(pick.ask, latest, pick.taker_fee_rate))
 
     shadow = {
         conf: {

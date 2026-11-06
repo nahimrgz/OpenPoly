@@ -97,7 +97,8 @@ class OrderIntent:
     ``price`` is the level-1 ask the section saw; the executor re-reads the live
     book at fill time and is authoritative on the actual fill price / qty.
 
-    ``p_model`` / ``confidence`` / ``edge`` are the belief behind the decision.
+    ``p_model`` / ``confidence`` / ``edge`` / ``rationale`` /
+    ``news_direction`` are the belief behind the decision.
     They are carried here purely so the executor can freeze them onto the
     position row: the analyzer_log ring evicts a call within a few hundred news
     events, long before the position it opened closes, so without this the
@@ -112,6 +113,8 @@ class OrderIntent:
     p_model: float | None = None
     confidence: str | None = None
     edge: float | None = None
+    rationale: str | None = None
+    news_direction: str | None = None
 
 
 class EdgeThresholdConfig(BaseModel):
@@ -324,6 +327,8 @@ class EdgeThresholdEntryV0:
             p_model=res.p_model,
             confidence=res.confidence,
             edge=edge,
+            rationale=res.rationale or None,
+            news_direction=res.news_direction,
         )
         return SectionOutput(payload=intent, verdict="ok", signals=signals)
 

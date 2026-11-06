@@ -82,7 +82,7 @@ from openpoly.sections.entry.edge_threshold_v0 import (
 __all__ = ["EdgeThresholdConfigV1", "EdgeThresholdEntryV1", "FreshBooks", "OrderIntent"]
 
 # The side each news direction pushes.
-_NEWS_SIDE: dict[str, Side] = {"raises_yes": "yes", "lowers_yes": "no"}
+_NEWS_SIDE: dict[str | None, Side] = {"raises_yes": "yes", "lowers_yes": "no"}
 
 
 class EdgeThresholdConfigV1(EdgeThresholdConfig):
@@ -200,21 +200,10 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
             signals[f"edge_{side}"] = round(edge, 4)
         if self.config.require_news_direction:
             signals["news_direction"] = res.news_direction
-            news_side = _NEWS_SIDE.get(res.news_direction or "")
-            if news_side is None:
-                return SectionOutput(
-                    payload=None,
-                    verdict="skip",
-                    reason="unclear news direction",
-                    signals=signals,
-                )
+            news_side = _NEWS_SIDE.get(res.news_direction)
             if chosen != news_side:
-                return SectionOutput(
-                    payload=None,
-                    verdict="skip",
-                    reason="against news direction",
-                    signals=signals,
-                )
+                reason = "unclear news direction" if news_side is None else "against news direction"
+                return SectionOutput(payload=None, verdict="skip", reason=reason, signals=signals)
         return chosen, signals, quotes[chosen]
 
     def _read_quote(self, res: AnalysisResult, side: Side) -> Quote | SectionOutput:
@@ -227,8 +216,7 @@ class EdgeThresholdEntryV1(EdgeThresholdEntryV0):
         """v0's edge minus the taker fee on one share bought at ``held_price``."""
         market = market_source_manager.store.get(res.market_id)
         rate = market.taker_fee_rate if market is not None else None
-        fee = taker_fee_per_share(rate, held_price) if rate else 0.0
-        return super()._edge(res, side, held_price) - fee
+        return super()._edge(res, side, held_price) - taker_fee_per_share(rate, held_price)
 
     def _quote_bid(self, book: OrderBook) -> float | None:
         """The depth-guarded bid — the same price the exit monitor marks a

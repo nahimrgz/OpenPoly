@@ -160,6 +160,10 @@ class PositionRow(Base):
     entry_p_model: Mapped[float | None] = mapped_column(default=None)
     entry_confidence: Mapped[str | None] = mapped_column(default=None)
     entry_edge: Mapped[float | None] = mapped_column(default=None)
+    # The analyzer's stated reason and news direction. The ring is in memory,
+    # so a restart would otherwise lose the reason behind every open position.
+    entry_rationale: Mapped[str | None] = mapped_column(default=None)
+    entry_news_direction: Mapped[str | None] = mapped_column(default=None)
 
 
 class LLMUsageRow(Base):
@@ -210,5 +214,7 @@ class ShadowPickRow(Base):
     side: Mapped[str | None]
     token_id: Mapped[str | None]
     ask: Mapped[float | None]
+    # The market's taker fee rate at the pick; NULL on picks that predate it.
+    taker_fee_rate: Mapped[float | None] = mapped_column(default=None)
     bid: Mapped[float | None]
     edge: Mapped[float | None]

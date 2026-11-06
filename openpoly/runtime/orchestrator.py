@@ -479,7 +479,7 @@ class PipelineOrchestrator:
             token = market.token_for(side)
             sides[side] = (token, source.store.get_order_book(token) if token else None)
         return choose_shadow_side(
-            p_model, yes=sides["yes"], no=sides["no"], fee_rate=market.taker_fee_rate or 0.0
+            p_model, yes=sides["yes"], no=sides["no"], fee_rate=market.taker_fee_rate
         )
 
     async def _persist_shadow_pick(self, **kwargs: Any) -> None:
